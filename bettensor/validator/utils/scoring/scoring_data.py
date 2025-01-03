@@ -445,13 +445,34 @@ class ScoringData:
                 coldkey = self.validator.metagraph.coldkeys[miner_uid]
                 updates.append((miner_uid, hotkey, coldkey))
 
-            # Batch update with proper column names
+            # First clear any existing hotkey/coldkey mappings that might conflict
+            await self.db_manager.execute_query(
+                """UPDATE miner_stats 
+                   SET miner_hotkey = NULL, miner_coldkey = NULL 
+                   WHERE miner_hotkey IN (
+                       SELECT miner_hotkey 
+                       FROM miner_stats 
+                       GROUP BY miner_hotkey 
+                       HAVING COUNT(*) > 1
+                   )"""
+            )
+
+            # Then do the batch update with proper column names
             await self.db_manager.executemany(
                 """INSERT INTO miner_stats (miner_uid, miner_hotkey, miner_coldkey)
                    VALUES (?, ?, ?)
                    ON CONFLICT(miner_uid) DO UPDATE SET
                    miner_hotkey = EXCLUDED.miner_hotkey,
-                   miner_coldkey = EXCLUDED.miner_coldkey""",
+                   miner_coldkey = EXCLUDED.miner_coldkey
+                   WHERE (
+                       miner_hotkey IS NULL 
+                       OR miner_hotkey = EXCLUDED.miner_hotkey
+                       OR NOT EXISTS (
+                           SELECT 1 FROM miner_stats 
+                           WHERE miner_hotkey = EXCLUDED.miner_hotkey 
+                           AND miner_uid != EXCLUDED.miner_uid
+                       )
+                   )""",
                 updates,
                 column_names=column_names
             )
@@ -496,76 +517,184 @@ class ScoringData:
             current_day (int): The current day index.
             tiers_dict (Dict[int, int]): Mapping of miner_uid to current_tier.
         """
-        bt.logging.info(f"Updating current daily scores for miners for day {current_day}...")
+        session = None
+        try:
+            bt.logging.info(f"Updating current daily scores for miners for day {current_day}...")
 
-        # Fetch current day's scores from the 'scores' table
-        fetch_scores_query = """
-            SELECT miner_uid, score_type, clv_score, roi_score, sortino_score, entropy_score, composite_score
-            FROM scores
-            WHERE day_id = :day_id
-        """
-        scores = await self.db_manager.fetch_all(fetch_scores_query, {"day_id": current_day})
+            # Get the actual number of miners from metagraph
+            num_miners = len(self.validator.metagraph.incentive)
+            bt.logging.debug(f"Number of miners in metagraph: {num_miners}")
 
-        # Organize scores by miner_uid and score_type
-        miner_scores = defaultdict(lambda: defaultdict(dict))
-        for score in scores:
-            miner_uid = score["miner_uid"]
-            score_type = score["score_type"]
-            miner_scores[miner_uid][score_type] = {
-                "clv_score": score["clv_score"],
-                "roi_score": score["roi_score"],
-                "sortino_score": score["sortino_score"],
-                "entropy_score": score["entropy_score"],
-                "composite_score": score["composite_score"]
-            }
+            # Fetch current day's scores from the 'scores' table
+            fetch_scores_query = """
+                SELECT miner_uid, score_type, clv_score, roi_score, sortino_score, entropy_score, composite_score
+                FROM scores
+                WHERE day_id = :day_id
+            """
+            scores = await self.db_manager.fetch_all(fetch_scores_query, {"day_id": current_day})
+            bt.logging.debug(f"Fetched {len(scores)} score records for day {current_day}")
 
-        # Prepare update records
-        update_current_scores_query = """
-            UPDATE miner_stats
-            SET
-                miner_current_clv_avg = ?,
-                miner_current_roi = ?,
-                miner_current_sortino_ratio = ?,
-                miner_current_entropy_score = ?,
-                miner_current_composite_score = ?
-            WHERE miner_uid = ?
-        """
-        update_records = []
+            # Organize scores by miner_uid and score_type
+            miner_scores = defaultdict(lambda: defaultdict(dict))
+            for score in scores:
+                miner_uid = int(score["miner_uid"])  # Ensure miner_uid is an integer
+                score_type = score["score_type"]
+                miner_scores[miner_uid][score_type] = {
+                    "clv_score": score["clv_score"],
+                    "roi_score": score["roi_score"],
+                    "sortino_score": score["sortino_score"],
+                    "entropy_score": score["entropy_score"],
+                    "composite_score": score["composite_score"]
+                }
 
-        for miner_uid, current_tier in tiers_dict.items():
-            # Get daily scores for component metrics
-            daily_scores = miner_scores[miner_uid].get('daily', {})
-            
-            # Get tier-specific scores
-            tier_scores = miner_scores[miner_uid].get(f'tier_{current_tier}', {})
-            
-            # Use component scores from daily calculation
-            clv_avg = daily_scores.get('clv_score')
-            roi = daily_scores.get('roi_score')
-            sortino = daily_scores.get('sortino_score')
-            entropy = daily_scores.get('entropy_score')
-            
-            # Use composite score from tier-specific calculation
-            composite_score = tier_scores.get('composite_score')
+            bt.logging.debug(f"Processed scores for {len(miner_scores)} miners")
 
-            update_records.append((clv_avg, roi, sortino, entropy, composite_score, miner_uid))
+            # Use long-running session for batch updates
+            async with self.db_manager.get_long_running_session() as session:
+                update_current_scores_query = text("""
+                    UPDATE miner_stats 
+                    SET 
+                        miner_current_tier = :tier,
+                        miner_current_scoring_window = :window,
+                        miner_current_composite_score = :composite_score,
+                        miner_current_sharpe_ratio = :sharpe_ratio,
+                        miner_current_sortino_ratio = :sortino_ratio,
+                        miner_current_roi = :roi,
+                        miner_current_clv_avg = :clv_avg,
+                        miner_current_incentive = :incentive
+                    WHERE miner_uid = :miner_uid
+                """)
 
-        # Execute batch update
-        await self.db_manager.executemany(update_current_scores_query, update_records)
-        bt.logging.debug("Current daily scores updated for all miners.")
+                # Process each miner's scores, but only for valid UIDs
+                updates_processed = 0
+                for miner_uid, current_tier in tiers_dict.items():
+                    try:
+                        # Ensure miner_uid is an integer and check bounds
+                        miner_uid = int(miner_uid)
+                        if miner_uid >= num_miners:
+                            continue
 
-        # Log some statistics
-        composite_scores = [record[4] for record in update_records if record[4] is not None]
-        if composite_scores:
-            bt.logging.info(f"Tier-specific composite score stats - min: {min(composite_scores):.4f}, "
-                          f"max: {max(composite_scores):.4f}, "
-                          f"mean: {sum(composite_scores) / len(composite_scores):.4f}")
-        else:
-            bt.logging.warning("No valid composite scores found.")
+                        # Get daily scores for component metrics
+                        daily_scores = miner_scores[miner_uid].get('daily', {})
+                        
+                        # Get tier-specific scores
+                        tier_scores = miner_scores[miner_uid].get(f'tier_{current_tier}', {})
+                        
+                        # Use component scores from daily calculation with proper defaults
+                        clv_avg = float(daily_scores.get('clv_score', 0.0) or 0.0)
+                        roi = float(daily_scores.get('roi_score', 0.0) or 0.0)
+                        sortino = float(daily_scores.get('sortino_score', 0.0) or 0.0)
+                        entropy = float(daily_scores.get('entropy_score', 0.0) or 0.0)
+                        
+                        # Use composite score from tier-specific calculation
+                        composite_score = float(tier_scores.get('composite_score', 0.0) or 0.0)
 
-        # Log the number of miners with non-zero scores
-        non_zero_scores = sum(1 for record in update_records if any(record[:5]))
-        bt.logging.info(f"Number of miners with non-zero scores: {non_zero_scores}")
+                        # Log score details for debugging
+                        bt.logging.debug(f"Miner {miner_uid} (Tier {current_tier}) scores: "
+                                    f"composite={self.safe_format(composite_score)}, "
+                                    f"clv={self.safe_format(clv_avg)}, "
+                                    f"roi={self.safe_format(roi)}, "
+                                    f"sortino={self.safe_format(sortino)}, "
+                                    f"entropy={self.safe_format(entropy)}")
+                        
+                        # Calculate incentive (safely get from metagraph)
+                        incentive = float(self.validator.metagraph.incentive[miner_uid])
+
+                        # Prepare update record
+                        update_record = {
+                            'miner_uid': miner_uid,
+                            'tier': current_tier,
+                            'window': current_day,
+                            'composite_score': composite_score,
+                            'sharpe_ratio': entropy,  # Using entropy score for sharpe ratio
+                            'sortino_ratio': sortino,
+                            'roi': roi,
+                            'clv_avg': clv_avg,
+                            'incentive': incentive
+                        }
+
+                        try:
+                            # Execute update for this miner with timeout
+                            async with async_timeout.timeout(5):  # 5 second timeout per update
+                                await session.execute(update_current_scores_query, update_record)
+                                updates_processed += 1
+                        except asyncio.TimeoutError:
+                            bt.logging.warning(f"Update timeout for miner {miner_uid}")
+                            continue
+                        except asyncio.CancelledError:
+                            bt.logging.warning("Update operation cancelled")
+                            if session.in_transaction():
+                                await session.rollback()
+                            raise
+                        except Exception as e:
+                            bt.logging.error(f"Error processing miner {miner_uid}: {str(e)}")
+                            continue
+
+                    except Exception as e:
+                        bt.logging.error(f"Error processing miner {miner_uid}: {str(e)}")
+                        continue
+
+                try:
+                    # Commit all updates with timeout
+                    async with async_timeout.timeout(10):  # 10 second timeout for commit
+                        await session.commit()
+                        bt.logging.info(f"Successfully processed updates for {updates_processed} miners")
+                except asyncio.TimeoutError:
+                    bt.logging.error("Commit timeout, rolling back")
+                    if session.in_transaction():
+                        await session.rollback()
+                    raise
+                except asyncio.CancelledError:
+                    bt.logging.warning("Commit operation cancelled")
+                    if session.in_transaction():
+                        await session.rollback()
+                    raise
+
+                # Log some statistics for valid miners only
+                valid_scores = {
+                    miner_uid: scores for miner_uid, scores in miner_scores.items()
+                    if isinstance(miner_uid, int) and miner_uid < num_miners
+                }
+                
+                # Calculate statistics only for tier-specific scores
+                composite_scores = []
+                for miner_uid, scores in valid_scores.items():
+                    current_tier = tiers_dict.get(str(miner_uid))  # Get tier from tiers_dict
+                    if current_tier:
+                        # Look for both daily and tier-specific scores
+                        daily_score = scores.get('daily', {}).get('composite_score', 0.0)
+                        tier_score = scores.get(f'tier_{current_tier}', {}).get('composite_score', 0.0)
+                        
+                        # Use the tier-specific score if available, otherwise use daily score
+                        score_to_use = float(tier_score or daily_score or 0.0)
+                        if score_to_use > 0:
+                            composite_scores.append(score_to_use)
+                            bt.logging.debug(f"Miner {miner_uid} (Tier {current_tier}) composite score: {score_to_use:.4f}")
+
+                if composite_scores:
+                    bt.logging.info(f"Tier-specific composite score stats - min: {min(composite_scores):.4f}, "
+                                f"max: {max(composite_scores):.4f}, "
+                                f"mean: {sum(composite_scores) / len(composite_scores):.4f}")
+                    bt.logging.info(f"Found {len(composite_scores)} valid composite scores")
+                else:
+                    bt.logging.warning("No valid composite scores found.")
+                    bt.logging.debug("Score types available in miner_scores:")
+                    for miner_uid, scores in valid_scores.items():
+                        bt.logging.debug(f"Miner {miner_uid} score types: {list(scores.keys())}")
+
+                # Log the number of miners with non-zero scores
+                non_zero_scores = sum(1 for scores in valid_scores.values() 
+                                if any(s.get('composite_score', 0.0) > 0 
+                                        for s in scores.values()))
+                bt.logging.info(f"Number of miners with non-zero scores: {non_zero_scores}")
+
+        except asyncio.CancelledError:
+            bt.logging.warning("Update operation cancelled, performing cleanup")
+            raise
+        except Exception as e:
+            bt.logging.error(f"Error updating current daily scores: {str(e)}")
+            bt.logging.error(traceback.format_exc())
+            raise
 
     async def _update_additional_fields(self):
         """

@@ -38,33 +38,37 @@ class DatabaseManager:
 
     def __init__(self, database_path: str):
         """Initialize the database manager with WAL mode and optimized concurrency settings"""
-        self.database_path = database_path
-        self._shutting_down = False
-        self._active_sessions = set()
-        self._cleanup_event = asyncio.Event()
-        self._cleanup_task = None
-        self._connection_attempts = 0
-        self._max_connection_attempts = 50
-        self._connection_attempt_reset = time.time()
-        self._connection_reset_interval = 60
-        self.default_timeout = 30
-        
-        # Initialize engine with WAL mode and optimized settings
-        self.engine = create_async_engine(
-            f"sqlite+aiosqlite:///{database_path}",
-            echo=False,
-            connect_args={
-                "timeout": 30,  # SQLite busy timeout
-                "check_same_thread": False,
-                "isolation_level": None,  # Let SQLAlchemy handle transactions
-            }
-        )
-        
-        self.async_session = sessionmaker(
-            bind=self.engine,
-            class_=AsyncSession,
-            expire_on_commit=False
-        )
+        if not self._initialized:
+            self.database_path = database_path
+            self.db_path = database_path  # Add this for compatibility
+            self._shutting_down = False
+            self._active_sessions = set()
+            self._cleanup_event = asyncio.Event()
+            self._cleanup_task = None
+            self._connection_attempts = 0
+            self._max_connection_attempts = 50
+            self._connection_attempt_reset = time.time()
+            self._connection_reset_interval = 60
+            self.default_timeout = 30
+            
+            # Initialize engine with WAL mode and optimized settings
+            self.engine = create_async_engine(
+                f"sqlite+aiosqlite:///{database_path}",
+                echo=False,
+                connect_args={
+                    "timeout": 30,  # SQLite busy timeout
+                    "check_same_thread": False,
+                    "isolation_level": None,  # Let SQLAlchemy handle transactions
+                }
+            )
+            
+            self.async_session = sessionmaker(
+                bind=self.engine,
+                class_=AsyncSession,
+                expire_on_commit=False
+            )
+            
+            self._initialized = True
 
     async def _initialize_connection(self, connection):
         """Initialize connection with WAL mode and optimized settings"""
@@ -102,14 +106,24 @@ class DatabaseManager:
             session.created_at = time.time()
             self._active_sessions.add(session)
             
-            # Set pragmas for this session with shorter timeout
-            async with async_timeout.timeout(2):  # Reduced from 5s to 2s
-                await session.execute(text("PRAGMA journal_mode = WAL"))
-                await session.execute(text("PRAGMA synchronous = NORMAL"))
-                await session.execute(text("PRAGMA busy_timeout = 30000"))
-                await session.execute(text("PRAGMA temp_store = MEMORY"))
-                await session.execute(text("PRAGMA cache_size = -2000"))
-                
+            # Set pragmas for this session with longer timeout and retries
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with async_timeout.timeout(10):  # Increased from 2s to 10s
+                        await session.execute(text("PRAGMA journal_mode = WAL"))
+                        await session.execute(text("PRAGMA synchronous = NORMAL"))
+                        await session.execute(text("PRAGMA busy_timeout = 30000"))
+                        await session.execute(text("PRAGMA temp_store = MEMORY"))
+                        await session.execute(text("PRAGMA cache_size = -2000"))
+                        break
+                except (asyncio.TimeoutError, SQLAlchemyError) as e:
+                    if attempt == max_retries - 1:
+                        bt.logging.error(f"Failed to set PRAGMA statements after {max_retries} attempts")
+                        raise
+                    await asyncio.sleep(1)  # Wait before retry
+                    continue
+
             yield session
             
             # Commit any pending changes if no error occurred
@@ -297,43 +311,61 @@ class DatabaseManager:
                 bt.logging.debug(f"Error closing connection: {e}")
 
     async def cleanup(self):
-        """Clean shutdown of database connections"""
+        """Cleanup database resources"""
         try:
             self._shutting_down = True
             
-            # Close all active sessions with a short timeout
-            for session in list(self._active_sessions):
+            # Set cleanup event to prevent new sessions
+            self._cleanup_event.set()
+            
+            # Wait briefly for any in-progress operations
+            await asyncio.sleep(0.5)
+            
+            # Close active sessions with retries
+            retry_count = 3
+            for attempt in range(retry_count):
                 try:
-                    async with async_timeout.timeout(1):
-                        await self._safe_close_session(session)
-                except asyncio.TimeoutError:
-                    bt.logging.debug(f"Session cleanup timed out, forcing cleanup")
+                    # Close all active sessions
+                    for session in list(self._active_sessions):
+                        try:
+                            if not session.is_closed:
+                                await session.close()
+                        except Exception as e:
+                            bt.logging.debug(f"Session close error (attempt {attempt+1}): {e}")
+                    self._active_sessions.clear()
+                    break
                 except Exception as e:
-                    bt.logging.error(f"Error closing session during cleanup: {e}")
-            self._active_sessions.clear()
+                    if attempt == retry_count - 1:
+                        bt.logging.error(f"Failed to close sessions after {retry_count} attempts: {e}")
+                    await asyncio.sleep(0.5)
             
-            # Final WAL cleanup and engine disposal
-            try:
-                async with async_timeout.timeout(5):
-                    async with self.get_session() as session:
-                        await session.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
-            except asyncio.TimeoutError:
-                bt.logging.warning("WAL cleanup timed out")
-            except Exception as e:
-                bt.logging.error(f"Error during WAL cleanup: {e}")
-            
-            try:
-                async with async_timeout.timeout(5):
-                    await self.engine.dispose()
-            except asyncio.TimeoutError:
-                bt.logging.warning("Engine disposal timed out")
-            except Exception as e:
-                bt.logging.error(f"Error disposing engine: {e}")
+            # Dispose engine with retries
+            if hasattr(self, 'engine'):
+                for attempt in range(retry_count):
+                    try:
+                        await self.engine.dispose()
+                        break
+                    except Exception as e:
+                        if attempt == retry_count - 1:
+                            bt.logging.error(f"Failed to dispose engine after {retry_count} attempts: {e}")
+                        await asyncio.sleep(0.5)
+                
+            bt.logging.debug("Database cleanup completed")
             
         except Exception as e:
             bt.logging.error(f"Error during database cleanup: {e}")
-        finally:
-            self._shutting_down = False
+            if not isinstance(e, asyncio.CancelledError):
+                bt.logging.error(traceback.format_exc())
+
+    async def close_session(self, session):
+        """Safely close a database session"""
+        try:
+            if session in self._active_sessions:
+                await session.close()
+                self._active_sessions.remove(session)
+        except Exception as e:
+            bt.logging.error(f"Error during session cleanup: {e}")
+            bt.logging.error(traceback.format_exc())
 
     async def _cleanup_sessions(self):
         """Background task to cleanup stale sessions and connections"""
@@ -967,9 +999,14 @@ class DatabaseManager:
                 await asyncio.sleep(0.1)
 
     async def initialize(self, force=False):
-        """Initialize database with optimized settings"""
+        """Initialize database tables and settings
+        
+        Args:
+            force (bool): If True, forces a WAL checkpoint after initialization
+        """
         try:
-            async with self.get_session() as session:
+            # First set all PRAGMA settings
+            async with self.async_session() as session:
                 # Set optimized pragmas
                 await session.execute(text("PRAGMA journal_mode = WAL"))
                 await session.execute(text("PRAGMA synchronous = NORMAL"))
@@ -979,16 +1016,36 @@ class DatabaseManager:
                 await session.execute(text("PRAGMA page_size = 4096"))
                 await session.execute(text("PRAGMA mmap_size = 268435456"))
                 await session.execute(text("PRAGMA wal_autocheckpoint = 1000"))
+                await session.execute(text("PRAGMA read_uncommitted = 1"))
+                await session.commit()
+            
+            # Then create/update tables
+            statements = initialize_database()
+            async with self.async_session() as session:
+                for statement in statements:
+                    try:
+                        await session.execute(text(statement))
+                    except Exception as e:
+                        bt.logging.error(f"Error executing initialization statement: {e}")
+                        bt.logging.error(f"Failed statement: {statement}")
+                        raise
                 await session.commit()
                 
                 if force:
-                    # Force a checkpoint if requested
+                    # Force a WAL checkpoint if requested
+                    bt.logging.debug("Forcing WAL checkpoint...")
                     await session.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
                     await session.commit()
                 
-                bt.logging.info("Database initialized with optimized settings")
+            # Initialize connection settings for future connections
+            async with self.engine.begin() as connection:
+                await self._initialize_connection(connection)
+                
+            bt.logging.info("Database initialized successfully with optimized settings")
+            
         except Exception as e:
-            bt.logging.error(f"Error initializing database: {e}")
+            bt.logging.error(f"Database initialization failed: {e}")
+            bt.logging.error(traceback.format_exc())
             raise
 
     @asynccontextmanager

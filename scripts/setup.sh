@@ -229,5 +229,4 @@ pip install redis psycopg2-binary
 python -c "import bittensor; print(bittensor.__version__)"
 
 echo "Bettensor setup complete!"
-echo "Please ensure you are running Bittensor v6.9.3 as required for the current Beta version."
 echo "You can now start mining or validating on the Bettensor subnet, after registering your miner/validator with the subnet."

@@ -48,12 +48,20 @@ def initialize_database():
         )
     """)
     
-    # Add most_recent_weight column to miner_stats
+    # Add most_recent_weight column to miner_stats if it doesn't exist
     statements.append("""
-        ALTER TABLE miner_stats ADD COLUMN most_recent_weight REAL DEFAULT 0.0;
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='most_recent_weight'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats ADD COLUMN most_recent_weight REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
     """)
-
-
+    
     # 3. Create backup table
     statements.append("""
         CREATE TABLE IF NOT EXISTS miner_stats_backup (
@@ -83,10 +91,19 @@ def initialize_database():
             most_recent_weight REAL DEFAULT 0.0
         )
     """)
-
-        # Add most_recent_weight column to miner_stats_backup
+    
+    # Add most_recent_weight column to miner_stats_backup if it doesn't exist
     statements.append("""
-        ALTER TABLE miner_stats_backup ADD COLUMN most_recent_weight REAL DEFAULT 0.0;
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='most_recent_weight'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN most_recent_weight REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
     """)
     
     # 4. Backup existing data with proper casting

@@ -12,11 +12,11 @@ import numpy as np
 import requests
 import bittensor as bt
 import concurrent.futures
+import argparse
 from os import path, rename
 from copy import deepcopy
 from pathlib import Path
 from dotenv import load_dotenv
-from argparse import ArgumentParser
 from typing import Dict, Tuple
 from datetime import datetime, timedelta, timezone
 from bettensor.base.neuron import BaseNeuron
@@ -31,6 +31,8 @@ from bettensor.validator.utils.io.miner_data import MinerDataMixin
 from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
 from bettensor.validator.utils.io.base_api_client import BaseAPIClient
 from bettensor.validator.utils.scoring.watchdog import Watchdog
+from bettensor import __spec_version__
+from types import SimpleNamespace
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -42,63 +44,62 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
     Contains top-level methods for validator operations.
     """
 
-    def __init__(self, parser: ArgumentParser):
-        super().__init__(parser=parser, profile="validator")
+    @classmethod
+    def add_args(cls, parser):
+        """Add validator specific arguments to the parser."""
+        super().add_args(parser)
         parser.add_argument(
             "--db",
             type=str,
             default=DEFAULT_DB_PATH,
-            help="Path to the validator database",
+            help="Path to the validator database"
         )
-        # Check if the arguments are already defined before adding them
-        if not any(arg.dest == "subtensor.network" for arg in parser._actions):
-            parser.add_argument(
-                "--subtensor.network",
-                type=str,
-                help="The subtensor network to connect to",
-            )
-        if not any(arg.dest == "netuid" for arg in parser._actions):
-            parser.add_argument("--netuid", type=int, help="The network UID")
-        if not any(arg.dest == "wallet.name" for arg in parser._actions):
-            parser.add_argument(
-                "--wallet.name", type=str, help="The name of the wallet to use"
-            )
-        if not any(arg.dest == "wallet.hotkey" for arg in parser._actions):
-            parser.add_argument(
-                "--wallet.hotkey", type=str, help="The hotkey of the wallet to use"
-            )
-        if not any(arg.dest == "logging.trace" for arg in parser._actions):
-            parser.add_argument(
-                "--logging.trace", action="store_true", help="Enable trace logging"
-            )
-        if not any(arg.dest == "logging.debug" for arg in parser._actions):
-            parser.add_argument(
-                "--logging.debug", action="store_true", help="Enable debug logging"
-            )
-        if not any(arg.dest == "logging.info" for arg in parser._actions):
-            parser.add_argument(
-                "--logging.info", action="store_true", help="Enable info logging"
-            )
-        if not any(arg.dest == "subtensor.chain_endpoint" for arg in parser._actions):
-            parser.add_argument(
-                "--subtensor.chain_endpoint", type=str, help="subtensor endpoint"
-            )
+        parser.add_argument(
+            "--load_state",
+            type=str,
+            default="True",
+            help="WARNING: Setting this value to False clears the old state."
+        )
+        parser.add_argument(
+            "--max_targets",
+            type=int,
+            default=256,
+            help="Sets the value for the number of targets to query - set to 256 to ensure all miners are queried"
+        )
+        parser.add_argument(
+            "--alpha",
+            type=float,
+            default=0.9,
+            help="The alpha value for the validator."
+        )
 
-        args = parser.parse_args()
+    @classmethod
+    def config(cls):
+        """Get config from the argument parser."""
+        parser = argparse.ArgumentParser()
+        bt.wallet.add_args(parser)
+        bt.subtensor.add_args(parser)
+        bt.logging.add_args(parser)
+        bt.axon.add_args(parser)
+        cls.add_args(parser)
+        return bt.config(parser)
 
+    def __init__(self, config=None):
+        """Initialize the validator."""
+        super().__init__(config)
+        
+        # Initialize neuron_config with alpha from config
+        self.neuron_config = SimpleNamespace(alpha=getattr(config, 'alpha', 0.9))
+        
+        # Initialize validator-specific attributes
         self.timeout = 20
-        self.parser = parser  # Save parser for later use
-        self.args = args
-
-        # Initialize other synchronous attributes
-        self.neuron_config = None
         self.wallet = None
         self.dendrite = None
         self.metagraph = None
         self.scores = None
         self.hotkeys = None
         self.subtensor = None
-        self.axon_port = getattr(args, "axon.port", None)
+        self.axon_port = getattr(self.config, "axon.port", None)
         self.base_path = "./bettensor/validator/"
         self.max_targets = None
         self.target_group = None
@@ -112,6 +113,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.last_api_call = datetime.now(timezone.utc) - timedelta(days=15)
         self.is_primary = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.determine_max_workers())
+        self.subnet_version = str(__spec_version__)  # Convert to string
 
         self.last_queried_block = 0
         self.last_sent_data_to_website = 0
@@ -122,27 +124,22 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
         self.is_initialized = False
 
-
     @classmethod
-    async def create(cls, parser: ArgumentParser):
-        self = cls(parser)
-        self.apply_config(bt_classes=[bt.subtensor, bt.wallet, bt.logging])
-
-        # Initialize asynchronous components
+    async def create(cls):
+        """Create a new validator instance."""
+        self = cls(config=cls.config())
         await self.initialize_neuron()
         return self
-
-    def determine_max_workers(self):
-        num_cores = os.cpu_count()
-        if num_cores <= 4:
-            return max(1, num_cores - 1)
-        else:
-            return max(1, num_cores - 2)
 
     def apply_config(self, bt_classes) -> bool:
         """Applies the configuration to specified bittensor classes"""
         try:
+            # Apply configuration
             self.neuron_config = self.config(bt_classes=bt_classes)
+            
+            # Parse arguments after configuration
+            self.args = self.parser.parse_args()
+            
         except AttributeError as e:
             bt.logging.error(f"Unable to apply validator configuration: {e}")
             raise AttributeError from e
@@ -152,13 +149,20 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
         return True
 
+    def determine_max_workers(self):
+        num_cores = os.cpu_count()
+        if num_cores <= 4:
+            return max(1, num_cores - 1)
+        else:
+            return max(1, num_cores - 2)
+
     def initialize_connection(self):
         max_retries = 5
         retry_delay = 10
         for attempt in range(max_retries):
             try:
-                self.subtensor = bt.subtensor(config=self.neuron_config)
-                bt.logging.info(f"Connected to {self.neuron_config.subtensor.network} network")
+                self.subtensor = bt.subtensor(config=self.config)
+                bt.logging.info(f"Connected to {self.config.subtensor.network} network")
                 return self.subtensor
             except Exception as e:
                 bt.logging.error(f"Failed to initialize subtensor (attempt {attempt+1}/{max_retries}): {str(e)}")
@@ -197,14 +201,14 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         return True
 
     def setup_bittensor_objects(
-        self, neuron_config
+        self, config
     ) -> Tuple[bt.wallet, bt.subtensor, bt.dendrite, bt.metagraph]:
         """sets up the bittensor objects"""
         try:
-            wallet = bt.wallet(config=neuron_config)
-            subtensor = bt.subtensor(config=neuron_config)
+            wallet = bt.wallet(config=config)
+            subtensor = bt.subtensor(config=config)
             dendrite = bt.dendrite(wallet=wallet)
-            metagraph = subtensor.metagraph(neuron_config.netuid)
+            metagraph = subtensor.metagraph(config.netuid)
         except AttributeError as e:
             bt.logging.error(f"unable to setup bittensor objects: {e}")
             raise AttributeError from e
@@ -219,17 +223,17 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
         self.axon = bt.axon(wallet=self.wallet)
 
-        self.axon.serve(netuid=self.neuron_config.netuid, subtensor=self.subtensor)
+        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
 
     async def initialize_neuron(self):
-        bt.logging(config=self.neuron_config, logging_dir=self.neuron_config.full_path)
+        bt.logging(config=self.config, logging_dir=self.config.full_path)
         bt.logging.info(
-            f"Initializing validator for subnet: {self.neuron_config.netuid} on network: {self.neuron_config.subtensor.chain_endpoint} with config: {self.neuron_config}"
+            f"Initializing validator for subnet: {self.config.netuid} on network: {self.config.subtensor.chain_endpoint} with config: {self.config}"
         )
 
         # Setup the bittensor objects
         self.wallet, self.subtensor, self.dendrite, self.metagraph = self.setup_bittensor_objects(
-            self.neuron_config
+            self.config
         )
 
         bt.logging.info(
@@ -249,23 +253,16 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         if self.metagraph is not None:
             self.scores = torch.zeros(len(self.metagraph.uids), dtype=torch.float32)
 
-        # Parse arguments
-        args = self.args
+        # Handle load_state configuration
+        load_state_str = getattr(self.config, 'load_state', 'True')
+        self.load_validator_state = load_state_str.lower() != "false" if isinstance(load_state_str, str) else True
 
-        if args:
-            self.load_validator_state = args.load_state.lower() != "false"
-
-            if self.load_validator_state:
-                await self.load_state()
-            else:
-                self.init_default_scores()
-
-            self.max_targets = args.max_targets or 256
+        if self.load_validator_state:
+            await self.load_state()
         else:
-            # Setup initial scoring weights
             self.init_default_scores()
-            self.max_targets = 256
 
+        self.max_targets = getattr(self.config, 'max_targets', 256)
         self.target_group = 0
 
         # Initialize the database manager
@@ -298,7 +295,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             metagraph=self.metagraph,
             wallet=self.wallet,
             subtensor=self.subtensor,
-            neuron_config=self.neuron_config,
+            neuron_config=self.config,
             db_path=self.db_path,
         )
 
@@ -437,27 +434,24 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         if path.exists(state_path):
             try:
                 bt.logging.info("Loading validator state")
-                state = torch.load(state_path)
+                # Remove weights_only since we trust our own state file
+                state = torch.load(state_path, map_location='cpu')
                 bt.logging.debug(f"Loaded the following state from file: {state}")
-                self.step = state["step"]
-                self.scores = state["scores"]
-                self.hotkeys = state["hotkeys"]
-                self.last_updated_block = state["last_updated_block"]
-                if "blacklisted_miner_hotkeys" in state.keys():
-                    self.blacklisted_miner_hotkeys = state["blacklisted_miner_hotkeys"]
+                
+                # Safely load each state component
+                self.step = int(state.get("step", 0))
+                self.scores = state.get("scores", torch.zeros(1, dtype=torch.float32))
+                self.hotkeys = state.get("hotkeys", [])
+                self.last_updated_block = int(state.get("last_updated_block", 0))
+                self.blacklisted_miner_hotkeys = state.get("blacklisted_miner_hotkeys", [])
 
                 # Convert timestamps back to datetime
-                last_api_call = state["last_api_call"]
+                last_api_call = state.get("last_api_call")
                 if last_api_call is None:
-                    self.last_api_call = datetime.now(timezone.utc) - timedelta(
-                        minutes=30
-                    )
+                    self.last_api_call = datetime.now(timezone.utc) - timedelta(minutes=30)
                 else:
                     try:
-                        self.last_api_call = datetime.fromtimestamp(
-                            last_api_call, tz=timezone.utc
-                        )
-
+                        self.last_api_call = datetime.fromtimestamp(last_api_call, tz=timezone.utc)
                     except (ValueError, TypeError, OverflowError) as e:
                         bt.logging.warning(
                             f"Invalid last_api_call timestamp: {last_api_call}. Using current time. Error: {e}"
@@ -468,7 +462,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 bt.logging.error(
                     f"Validator state reset because an exception occurred: {e}"
                 )
-                self.reset_validator_state(state_path=state_path)
+                await self.reset_validator_state(state_path=state_path)
         else:
             self.init_default_scores()
 
@@ -686,15 +680,19 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             # Wait briefly for tasks to complete
             await asyncio.sleep(1)
             
+            # Save state before database cleanup
+            try:
+                await self.save_state()
+            except Exception as e:
+                bt.logging.error(f"Error saving state during shutdown: {e}")
+            
             # Cleanup database connections
             if hasattr(self, 'db_manager'):
                 bt.logging.info("Cleaning up database connections...")
-                await self.db_manager.cleanup()
-                
-            # Save state before exit
-            if hasattr(self, 'save_state'):
-                bt.logging.info("Saving validator state...")
-                await self.save_state()
+                try:
+                    await self.db_manager.cleanup()
+                except Exception as e:
+                    bt.logging.error(f"Error cleaning up database: {e}")
                 
             bt.logging.info("Shutdown completed successfully")
             sys.exit(0)

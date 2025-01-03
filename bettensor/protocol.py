@@ -27,134 +27,87 @@ import sqlite3
 
 class MinerStats(BaseModel):
     """
-    This class defines the miner stats object.
+    Data class for miner stats
     """
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "allow"
+    }
 
-    # Identifier Stats
-    miner_hotkey: str = Field(..., description="Hotkey of the miner")
-    miner_coldkey: str = Field(..., description="Coldkey of the miner")
-    miner_uid: str = Field(..., description="Current UID of the miner")
-    miner_rank: int = Field(..., description="Current rank of the miner")
-    miner_status: str = Field(..., description="Status of the miner (Active/Inactive)")
-
-    # Current Scoring Stats
-    miner_cash: float = Field(..., description="Current cash of the miner")
-    miner_current_incentive: float = Field(
-        ..., description="Current incentive of the miner"
-    )
-    miner_current_tier: int = Field(..., description="Current tier of the miner")
-    miner_current_scoring_window: int = Field(
-        ..., description="Current scoring window of the miner"
-    )
-    miner_current_composite_score: float = Field(
-        ...,
-        description="Current composite score of the miner, as calculated over the current scoring window",
-    )
-    miner_current_sharpe_ratio: float = Field(
-        ...,
-        description="Current sharpe ratio of the miner, as calculated over the current scoring window",
-    )
-    miner_current_sortino_ratio: float = Field(
-        ...,
-        description="Current sortino ratio of the miner, as calculated over the current scoring window",
-    )
-    miner_current_roi: float = Field(
-        ...,
-        description="Current roi of the miner, as calculated over the current scoring window",
-    )
-    miner_current_clv_avg: float = Field(
-        ...,
-        description="Current clv avg of the miner, as calculated over the current scoring window",
-    )
-
-    # Lifetime Stats
-    miner_last_prediction_date: Optional[str] = Field(
-        None, description="Date of the last prediction of the miner"
-    )
-    miner_lifetime_earnings: float = Field(
-        ..., description="Lifetime earnings of the miner"
-    )
-    miner_lifetime_wager_amount: float = Field(
-        ..., description="Lifetime wager amount of the miner"
-    )
-    miner_lifetime_roi: float = Field(
-        ..., description="Lifetime roi of the miner"
-    )
-    miner_lifetime_predictions: int = Field(
-        ..., description="Lifetime predictions of the miner"
-    )
-    miner_lifetime_wins: int = Field(..., description="Lifetime wins of the miner")
-    miner_lifetime_losses: int = Field(..., description="Lifetime losses of the miner")
-    miner_win_loss_ratio: float = Field(..., description="Win loss ratio of the miner")
+    miner_hotkey: str = Field(..., description="Miner hotkey")
+    miner_coldkey: str = Field(..., description="Miner coldkey")
+    miner_uid: str = Field(..., description="Miner UID")
+    miner_rank: str = Field(..., description="Miner rank")
+    miner_status: str = Field(..., description="Miner status")
+    miner_cash: str = Field(..., description="Miner cash")
+    miner_current_incentive: str = Field(..., description="Miner current incentive")
+    miner_current_tier: str = Field(..., description="Miner current tier")
+    miner_current_scoring_window: str = Field(..., description="Miner current scoring window")
+    miner_current_composite_score: str = Field(..., description="Miner current composite score")
+    miner_current_sharpe_ratio: str = Field(..., description="Miner current sharpe ratio")
+    miner_current_sortino_ratio: str = Field(..., description="Miner current sortino ratio")
+    miner_current_roi: str = Field(..., description="Miner current ROI")
+    miner_current_clv_avg: str = Field(..., description="Miner current CLV average")
+    miner_last_prediction_date: Optional[str] = Field(None, description="Miner last prediction date")
+    miner_lifetime_earnings: str = Field(..., description="Miner lifetime earnings")
+    miner_lifetime_wager_amount: str = Field(..., description="Miner lifetime wager amount")
+    miner_lifetime_roi: str = Field(..., description="Miner lifetime ROI")
+    miner_lifetime_predictions: str = Field(..., description="Miner lifetime predictions")
+    miner_lifetime_wins: str = Field(..., description="Miner lifetime wins")
+    miner_lifetime_losses: str = Field(..., description="Miner lifetime losses")
+    miner_win_loss_ratio: str = Field(..., description="Miner win/loss ratio")
+    most_recent_weight: Optional[str] = Field(None, description="Most recent weight")
 
     @classmethod
     def create(cls, row):
         """
         takes a row from the miner_stats table and returns a MinerStats object
         """
-        miner_hotkey = row[0]
-        miner_coldkey = row[1]
-        miner_uid = row[2]
-        miner_rank = row[3]
-        miner_status = row[4]
-        miner_cash = row[5]
-        miner_current_incentive = row[6]
-        miner_current_tier = row[7]
-        miner_current_scoring_window = row[8]
-        miner_current_composite_score = row[9]
-        miner_current_sharpe_ratio = row[10]
-        miner_current_sortino_ratio = row[11]
-        miner_current_roi = row[12]
-        miner_current_clv_avg = row[13]
-        miner_last_prediction_date = row[14]
-        miner_lifetime_earnings = row[15]
-        miner_lifetime_wager_amount = row[16]
-        miner_lifetime_roi  = row[17]
-        miner_lifetime_predictions = row[18]
-        miner_lifetime_wins = row[19]
-        miner_lifetime_losses = row[20]
-        miner_win_loss_ratio = row[21]
         return cls(
-            miner_hotkey=miner_hotkey,
-            miner_coldkey=miner_coldkey,
-            miner_uid=miner_uid,
-            miner_rank=miner_rank,
-            miner_status=miner_status,
-            miner_cash=miner_cash,
-            miner_current_incentive=miner_current_incentive,
-            miner_current_tier=miner_current_tier,
-            miner_current_scoring_window=miner_current_scoring_window,
-            miner_current_composite_score=miner_current_composite_score,
-            miner_current_sharpe_ratio=miner_current_sharpe_ratio,
-            miner_current_sortino_ratio=miner_current_sortino_ratio,
-            miner_current_roi=miner_current_roi,
-            miner_current_clv_avg=miner_current_clv_avg,
-            miner_last_prediction_date=miner_last_prediction_date,
-            miner_lifetime_earnings=miner_lifetime_earnings,
-            miner_lifetime_wager_amount=miner_lifetime_wager_amount,
-            miner_lifetime_roi=miner_lifetime_roi,
-            miner_lifetime_predictions=miner_lifetime_predictions,
-            miner_lifetime_wins=miner_lifetime_wins,
-            miner_lifetime_losses=miner_lifetime_losses,
-            miner_win_loss_ratio=miner_win_loss_ratio,
+            miner_hotkey=str(row[0]),
+            miner_coldkey=str(row[1]),
+            miner_uid=str(row[2]),
+            miner_rank=str(row[3]),
+            miner_status=str(row[4]),
+            miner_cash=str(row[5]),
+            miner_current_incentive=str(row[6]),
+            miner_current_tier=str(row[7]),
+            miner_current_scoring_window=str(row[8]),
+            miner_current_composite_score=str(row[9]),
+            miner_current_sharpe_ratio=str(row[10]),
+            miner_current_sortino_ratio=str(row[11]),
+            miner_current_roi=str(row[12]),
+            miner_current_clv_avg=str(row[13]),
+            miner_last_prediction_date=str(row[14]) if row[14] is not None else None,
+            miner_lifetime_earnings=str(row[15]),
+            miner_lifetime_wager_amount=str(row[16]),
+            miner_lifetime_roi=str(row[17]),
+            miner_lifetime_predictions=str(row[18]),
+            miner_lifetime_wins=str(row[19]),
+            miner_lifetime_losses=str(row[20]),
+            miner_win_loss_ratio=str(row[21]),
+            most_recent_weight=str(row[22]) if len(row) > 22 and row[22] is not None else None
         )
 
 
 class Metadata(BaseModel):
     """Synapse Metadata class, add more fields if needed"""
 
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "allow"
+    }
+
     synapse_id: str = Field(..., description="UUID of the synapse")
     neuron_uid: str = Field(..., description="UUID of the serving neuron")
     timestamp: str = Field(..., description="Timestamp of the synapse")
-    subnet_version: str = Field(
-        ..., description="Subnet version of the neuron sending the synapse"
-    )
-    synapse_type: str = Field(
-        ..., description="Type of the synapse | 'prediction' or 'game_data'"
-    )
+    subnet_version: str = Field(..., description="Subnet version of the neuron sending the synapse")
+    synapse_type: str = Field(..., description="Type of the synapse | 'prediction' or 'game_data'")
 
     @classmethod
-    def create(cls,subnet_version, neuron_uid, synapse_type):
+    def create(cls, subnet_version, neuron_uid, synapse_type):
         """
         Creates a new metadata object
         Args:
@@ -170,9 +123,9 @@ class Metadata(BaseModel):
         )
         return Metadata(
             synapse_id=synapse_id,
-            neuron_uid=neuron_uid,
+            neuron_uid=str(neuron_uid),  # Ensure neuron_uid is a string
             timestamp=timestamp,
-            subnet_version=subnet_version,
+            subnet_version=str(subnet_version),  # Ensure subnet_version is a string
             synapse_type=synapse_type,
         )
 
@@ -242,12 +195,17 @@ class GameData(bt.Synapse):
     """
     This class defines the synapse object for game data, consisting of a dictionary of TeamGame objects with a UUID as key.
     """
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "allow"
+    }
 
-    metadata: Optional[Metadata]
-    gamedata_dict: Optional[Dict[str, TeamGame]]
-    prediction_dict: Optional[Dict[str, TeamGamePrediction]]
-    confirmation_dict: Optional[Dict[str, Dict[str, str]]]
-    error: Optional[str]
+    metadata: Optional[Metadata] = Field(default=None)
+    gamedata_dict: Optional[Dict[str, TeamGame]] = Field(default=None)
+    prediction_dict: Optional[Dict[str, TeamGamePrediction]] = Field(default=None)
+    confirmation_dict: Optional[Dict[str, Dict[str, str]]] = Field(default=None)
+    error: Optional[str] = Field(default=None)
 
     @classmethod
     def create(
@@ -275,13 +233,10 @@ class GameData(bt.Synapse):
         elif synapse_type == "confirmation":
             gamedata_dict = None
             prediction_dict = None
-            
         else: # error type
             gamedata_dict = None
             prediction_dict = None
             confirmation_dict = None
-
-
 
         return cls(
             metadata=metadata,
@@ -289,6 +244,7 @@ class GameData(bt.Synapse):
             prediction_dict=prediction_dict,
             confirmation_dict=confirmation_dict,
             synapse_type=synapse_type,
+            name="GameData"
         )
 
     def deserialize(self):

@@ -8,10 +8,10 @@ import traceback
 import torch
 import sqlite3
 import bittensor as bt
+import argparse
 from uuid import UUID
 from dotenv import load_dotenv
 from copy import deepcopy
-from argparse import ArgumentParser
 from datetime import datetime, timezone, timedelta
 import asyncio
 import websocket
@@ -825,7 +825,7 @@ async def scoring_run(validator, current_time):
     """
     calls the scoring system to update miner scores before setting weights
     """
-    bt.logging.info("\n--------------------------------Scoring run--------------------------------\n")
+    bt.logging.trace("\n--------------------------------Scoring run--------------------------------\n")
     validator.last_scoring_block = validator.subtensor.block
     
     try:
@@ -844,8 +844,7 @@ async def scoring_run(validator, current_time):
         validator.scores = await validator.scoring_system.scoring_run(
             current_time, invalid_uids, valid_uids
         )
-        bt.logging.info("Scores updated successfully")
-        bt.logging.info(f"Scores: {validator.scores}")
+        bt.logging.trace(f"Scoring run completed")
 
         for uid in blacklisted_uids:
             if uid is not None:
@@ -877,7 +876,6 @@ async def scoring_run(validator, current_time):
                 bt.logging.trace(
                     f"Set score for not queried UID: {uid}. New score: {validator.scores[uid]}"
                 )
-        bt.logging.info(f"Scoring run completed")
 
     except Exception as e:
         bt.logging.error(f"Error in scoring_run: {str(e)}")
@@ -959,51 +957,10 @@ def cleanup_pycache():
 
 # The main function parses the configuration and runs the validator.
 async def main():
+    """Main function for running the validator."""
     # Add cleanup at the start of main
     cleanup_pycache()
     
-    parser = ArgumentParser()
-
-    parser.add_argument(
-        "--subtensor.network", type=str, help="The subtensor network to connect to"
-    )
-    parser.add_argument(
-        "--subtensor.chain_endpoint",
-        type=str,
-        help="The subtensor network to connect to",
-    )
-    parser.add_argument("--wallet.name", type=str, help="The name of the wallet to use")
-    parser.add_argument(
-        "--wallet.hotkey", type=str, help="The hotkey of the wallet to use"
-    )
-    parser.add_argument(
-        "--logging.trace", action="store_true", help="Enable trace logging"
-    )
-    parser.add_argument(
-        "--logging.debug", action="store_true", help="Enable debug logging"
-    )
-
-    parser.add_argument(
-        "--alpha", type=float, default=0.9, help="The alpha value for the validator."
-    )
-    parser.add_argument("--netuid", type=int, default=30, help="The chain subnet uid.")
-    parser.add_argument(
-        "--axon.port", type=int, help="The port this axon endpoint is serving on."
-    )
-    parser.add_argument(
-        "--max_targets",
-        type=int,
-        default=256,
-        help="Sets the value for the number of targets to query - set to 256 to ensure all miners are queried, it is now batched",
-    )
-    parser.add_argument(
-        "--load_state",
-        type=str,
-        default="True",
-        help="WARNING: Setting this value to False clears the old state.",
-    )
-    args = parser.parse_args()
-    print("Parsed arguments:", args)
     validator = None
 
     def signal_handler(signum, frame):
@@ -1023,12 +980,9 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        validator = await BettensorValidator.create(parser)
+        # Create validator instance with config
+        validator = await BettensorValidator.create()
         
-        if not validator.apply_config(bt_classes=[bt.subtensor, bt.logging, bt.wallet]):
-            bt.logging.error("Unable to initialize Validator. Exiting.")
-            sys.exit(1)
-
         # Run the validator
         await run(validator)
         

@@ -318,10 +318,16 @@ class MinerDataMixin:
             miner_uid: the uid of the miner
             predictions: a dictionary with uids as keys and TeamGamePrediction objects as values
         """
-        confirmation_dict = {
-            str(pred_id): {"success": success, "message": message}
-            for pred_id, (success, message) in predictions.items()
-        }
+        # Convert success/message tuples to string values
+        confirmation_dict = {}
+        for pred_id, (success, message) in predictions.items():
+            # Ensure values are properly converted to strings
+            success_str = str(success) if success is not None else "False"
+            message_str = str(message) if message is not None else ""
+            confirmation_dict[str(pred_id)] = {
+                "success": success_str,
+                "message": message_str
+            }
 
         # Get miner stats for uid asynchronously
         miner_stats = await self.db_manager.fetch_one(
@@ -332,37 +338,68 @@ class MinerDataMixin:
             bt.logging.warning(f"No miner_stats found for miner_uid: {miner_uid}")
             confirmation_dict['miner_stats'] = {}
         else:
-            # Handle None values in miner_stats
+            # Convert all miner_stats values to strings, properly handling binary data
+            miner_stats_str = {}
             for key, value in miner_stats.items():
-                if value is None:
-                    miner_stats[key] = 0
-            confirmation_dict['miner_stats'] = miner_stats
-
-        synapse = GameData.create(
-            db_path=self.db_path,
-            wallet=self.wallet,
-            subnet_version=self.subnet_version,
-            neuron_uid=miner_uid,
-            synapse_type="confirmation",
-            confirmation_dict=confirmation_dict,
-        )
+                if isinstance(value, bytes):
+                    try:
+                        # Try to decode bytes to int first
+                        value = int.from_bytes(value, byteorder='little')
+                    except (ValueError, TypeError):
+                        try:
+                            # If that fails, try to decode as string
+                            value = value.decode('utf-8')
+                        except UnicodeDecodeError:
+                            # If all else fails, use a default value
+                            value = 0
+                
+                # Convert the value to string, handling special cases
+                if key == 'miner_current_tier':
+                    # Ensure tier is a valid integer string
+                    try:
+                        value = str(int(value)) if value is not None else "1"
+                    except (ValueError, TypeError):
+                        value = "1"
+                elif isinstance(value, (float, int)):
+                    value = str(value)
+                elif value is None:
+                    value = "0"
+                else:
+                    value = str(value)
+                
+                miner_stats_str[key] = value
+            
+            # Log the converted stats for debugging
+            bt.logging.debug(f"Converted miner stats for miner {miner_uid}: {miner_stats_str}")
+            confirmation_dict['miner_stats'] = miner_stats_str
 
         # Convert miner_uid to integer for indexing
         miner_uid_int = int(miner_uid)
         axon = self.metagraph.axons[miner_uid_int]
 
+        # Create synapse with confirmation data
+        synapse = GameData.create(
+            db_path=self.db_path,
+            wallet=self.wallet,
+            subnet_version=self.subnet_version,
+            neuron_uid=miner_uid_int,
+            synapse_type="confirmation",
+            confirmation_dict=confirmation_dict,
+        )
+
         bt.logging.info(f"Sending confirmation synapse to miner {miner_uid}, axon: {axon}")
         try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                self.dendrite.query,
-                axon,
-                synapse,
-                self.timeout,
-                True,
+            # Ensure all parameters are properly set for the query
+            response = await self.dendrite.query(
+                axons=axon,
+                synapse=synapse,
+                timeout=self.timeout,
+                deserialize=True,
             )
+            
             bt.logging.info(f"Confirmation synapse sent to miner {miner_uid}")
+            return response
+            
         except Exception as e:
             bt.logging.error(f"An error occurred while sending confirmation synapse: {e}")
             bt.logging.error(f"Traceback: {traceback.format_exc()}")
@@ -543,19 +580,18 @@ class MinerDataMixin:
             return [0.0, 0.0, 0.0]  # Return default values in case of database error
 
     async def fetch_local_game_data(self, current_time):
-        """Fetch game data from local database."""
+        """Fetch game data from the local database."""
         try:
-            # Ensure current_time is a datetime object
-            if isinstance(current_time, str):
-                current_time = datetime.fromisoformat(current_time.replace('Z', '+00:00'))
+            # Calculate the date range for fetching games
+            current_datetime = datetime.fromisoformat(current_time)
+            start_date = current_datetime - timedelta(days=4)
+            end_date = current_datetime + timedelta(days=8)
             
-            # Calculate time window
-            start_time = current_time - timedelta(hours=36) # 1.5 days in the past
-            end_time = current_time + timedelta(hours=168) # 7 days in the future
+            bt.logging.debug(f"Querying games between {start_date} and {end_date}")
             
+            # Query to fetch game data
             query = """
                 SELECT 
-                    game_id,
                     external_id,
                     event_start_date,
                     team_a,
@@ -564,24 +600,22 @@ class MinerDataMixin:
                     team_b_odds,
                     tie_odds,
                     outcome,
-                    can_tie,
                     sport,
                     league,
                     create_date,
                     last_update_date,
-                    active
+                    active,
+                    can_tie
                 FROM game_data
-                WHERE event_start_date >= :start_date
-                AND event_start_date <= :end_date
+                WHERE event_start_date BETWEEN :start_date AND :end_date
+                ORDER BY event_start_date ASC
             """
             
-            # Pass parameters as a dictionary
             params = {
-                "start_date": start_time.isoformat(),
-                "end_date": end_time.isoformat()
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat()
             }
             
-            bt.logging.debug(f"Querying games between {start_time} and {end_time}")
             rows = await self.db_manager.fetch_all(query, params)
             
             if not rows:
@@ -590,17 +624,17 @@ class MinerDataMixin:
             # Process the results into a dictionary
             gamedata_dict = {}
             for row in rows:
-                game_id = row['external_id']
+                game_id = str(row['external_id'])  # Convert to string
                 gamedata_dict[game_id] = {
-                    'game_id': game_id,
-                    'external_id': game_id,
+                    'game_id': game_id,  # Use string game_id
+                    'external_id': game_id,  # Use string external_id
                     'event_start_date': row['event_start_date'],
                     'team_a': row['team_a'],
                     'team_b': row['team_b'],
                     'team_a_odds': row['team_a_odds'],
                     'team_b_odds': row['team_b_odds'],
                     'tie_odds': row['tie_odds'],
-                    'outcome': row['outcome'],
+                    'outcome': str(row['outcome']),  # Convert outcome to string
                     'sport': row['sport'],
                     'league': row['league'],
                     'create_date': row['create_date'],

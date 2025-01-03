@@ -422,23 +422,23 @@ class ScoringSystem:
         active_days = np.count_nonzero(~np.isnan(window_scores))
         
         # Log tier configuration
-        bt.logging.info(f"\nChecking tier {tier-1} requirements for miner {miner}:")
-        bt.logging.info(f"  Window size: {window} days")
-        bt.logging.info(f"  Minimum wager required: {min_wager}")
-        bt.logging.info(f"  Minimum active days required: {min_days_required} ({min_active_days_ratio*100:.0f}% of window)")
+        bt.logging.trace(f"Checking tier {tier-1} requirements for miner {miner}:")
+        bt.logging.trace(f"Window size: {window} days")
+        bt.logging.trace(f"Minimum wager required: {min_wager}")
+        bt.logging.trace(f"Minimum active days required: {min_days_required} ({min_active_days_ratio*100:.0f}% of window)")
         
         # Log wager details
-        bt.logging.info(f"\nWager details:")
-        bt.logging.info(f"  Cumulative wager: {cumulative_wager:.2f}/{min_wager}")
-        bt.logging.info(f"  Days with wagers: {active_wager_days}/{window}")
+        bt.logging.trace("Wager details:")
+        bt.logging.trace(f"Cumulative wager: {cumulative_wager:.2f}/{min_wager}")
+        bt.logging.trace(f"Days with wagers: {active_wager_days}/{window}")
         if active_wager_days > 0:
-            bt.logging.info(f"  Average daily wager: {cumulative_wager/active_wager_days:.2f}")
-            bt.logging.info(f"  Daily wagers: {[f'{float(w):.2f}' for w in window_wagers]}")
-        
+            bt.logging.trace(f"Average daily wager: {cumulative_wager/active_wager_days:.2f}")
+            bt.logging.trace(f"Daily wagers: {[f'{float(w):.2f}' for w in window_wagers]}")
+
         # Log activity details
-        bt.logging.info(f"\nActivity details:")
-        bt.logging.info(f"  Days with scores: {active_days}/{window}")
-        bt.logging.info(f"  Required active days: {min_days_required}")
+        bt.logging.trace("Activity details:")
+        bt.logging.trace(f"Days with scores: {active_days}/{window}")
+        bt.logging.trace(f"Required active days: {min_days_required}")
         if active_days > 0:
             # Convert scores to float and handle NaN values
             score_strs = []
@@ -452,20 +452,20 @@ class ScoringSystem:
                     score_strs.append("NaN")
                 else:
                     score_strs.append(f"{s_val:.4f}")
-            bt.logging.info(f"  Daily scores: {score_strs}")
+            bt.logging.trace(f"Daily scores: {score_strs}")
         
         meets_wager = cumulative_wager >= min_wager
         has_history = active_days >= min_days_required
         meets_requirement = meets_wager and has_history
         
         # Log eligibility result with specific reasons
-        bt.logging.info(f"\nEligibility result:")
-        bt.logging.info(f"  Meets wager requirement: {meets_wager}")
+        bt.logging.trace("Eligibility result:")
+        bt.logging.trace(f"Meets wager requirement: {meets_wager}")
         if not meets_wager:
-            bt.logging.info(f"    - Needs {min_wager - cumulative_wager:.2f} more in wagers")
-        bt.logging.info(f"  Meets history requirement: {has_history}")
+            bt.logging.trace(f"- Needs {min_wager - cumulative_wager:.2f} more in wagers")
+        bt.logging.trace(f"Meets history requirement: {has_history}")
         if not has_history:
-            bt.logging.info(f"    - Needs {min_days_required - active_days} more active days")
+            bt.logging.trace(f"- Needs {min_days_required - active_days} more active days")
         
         return meets_requirement
 
@@ -1188,7 +1188,7 @@ class ScoringSystem:
                                 bt.logging.error(traceback.format_exc())
                                 raise
 
-                        bt.logging.info("ScoringSystem state saved to database, including amount_wagered and tiers.")
+                        bt.logging.trace("ScoringSystem state saved to database, including amount_wagered and tiers.")
                         return
 
             except (asyncio.TimeoutError, SQLAlchemyError) as e:
@@ -1576,7 +1576,7 @@ class ScoringSystem:
         """
         Perform a full reset of the scoring system, clearing all state and history.
         """
-        bt.logging.info("Performing full reset of scoring system...")
+        bt.logging.trace("Performing full reset of scoring system...")
 
         # Reset all score arrays
         self.clv_scores.fill(0)
@@ -1606,7 +1606,7 @@ class ScoringSystem:
         # Repopulate amount_wagered from historical data
         await self.populate_amount_wagered()
 
-        bt.logging.info("Scoring system full reset completed.")
+        bt.logging.trace("Scoring system full reset completed.")
 
     async def _clear_database_state(self):
         """
@@ -2400,3 +2400,51 @@ class ScoringSystem:
     def tier_capacities(self):
         """Get the capacity for each tier."""
         return [config["capacity"] for config in self.tier_configs]
+
+    def check_tier_requirements(self, miner_uid, tier, window_size, min_wager, min_active_days_pct):
+        """Check if a miner meets the requirements for a specific tier"""
+        min_active_days = int(window_size * min_active_days_pct)
+        
+        bt.logging.trace(f"Checking tier {tier} requirements for miner {miner_uid}:")
+        bt.logging.trace(f"Window size: {window_size} days")
+        bt.logging.trace(f"Minimum wager required: {min_wager}")
+        bt.logging.trace(f"Minimum active days required: {min_active_days} ({min_active_days_pct*100}% of window)")
+
+        # Get wager details
+        cumulative_wager, daily_wagers = self.get_wager_details(miner_uid, window_size)
+        avg_daily_wager = cumulative_wager / window_size if window_size > 0 else 0
+        days_with_wagers = sum(1 for wager in daily_wagers if wager > 0)
+
+        bt.logging.trace("Wager details:")
+        bt.logging.trace(f"Cumulative wager: {cumulative_wager:.2f}/{min_wager}")
+        bt.logging.trace(f"Days with wagers: {days_with_wagers}/{window_size}")
+        bt.logging.trace(f"Average daily wager: {avg_daily_wager:.2f}")
+        bt.logging.trace(f"Daily wagers: {[f'{w:.2f}' for w in daily_wagers]}")
+
+        # Get activity details
+        days_with_scores, daily_scores = self.get_activity_details(miner_uid, window_size)
+        
+        bt.logging.trace("Activity details:")
+        bt.logging.trace(f"Days with scores: {days_with_scores}/{window_size}")
+        bt.logging.trace(f"Required active days: {min_active_days}")
+        bt.logging.trace(f"Daily scores: {[f'{s:.4f}' for s in daily_scores]}")
+
+        # Check requirements
+        meets_wager = cumulative_wager >= min_wager
+        meets_history = days_with_scores >= min_active_days
+
+        bt.logging.trace("Eligibility result:")
+        bt.logging.trace(f"Meets wager requirement: {meets_wager}")
+        bt.logging.trace(f"Meets history requirement: {meets_history}")
+
+        return meets_wager and meets_history
+
+    async def run_scoring(self, date=None):
+        """Run scoring for a specific date or today"""
+        date = date or datetime.now(timezone.utc).date()
+        bt.logging.trace(f"=== Starting scoring run for date: {date} ===")
+        
+        # ... rest of the method ...
+        
+        date_str = date.strftime("%Y-%m-%d")
+        bt.logging.trace(f"=== Completed scoring run for date: {date_str} ===")

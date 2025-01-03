@@ -238,7 +238,7 @@ def main(miner: BettensorMiner):
 
 # This is the main function, which runs the miner.
 if __name__ == "__main__":
-    # Parse command line arguments
+    # Parse command line arguments and create config
     parser = ArgumentParser()
     parser.add_argument("--netuid", type=int, default=14, help="The chain subnet uid")
     parser.add_argument(
@@ -260,12 +260,43 @@ if __name__ == "__main__":
         help="Determine the minimum stake the validator should have to accept requests",
     )
     parser.add_argument(
-        "--REDIS_HOST", type=str, default="localhost", help="Redis host"
+        "--db_name", type=str, default="bettensor", help="PostgreSQL database name"
     )
-    parser.add_argument("--REDIS_PORT", type=int, default=6379, help="Redis port")
+    parser.add_argument(
+        "--db_user", type=str, default="root", help="PostgreSQL user"
+    )
+    parser.add_argument(
+        "--db_password",
+        type=str,
+        default="bettensor_password",
+        help="PostgreSQL password",
+    )
+    parser.add_argument(
+        "--db_host", type=str, default="localhost", help="PostgreSQL host"
+    )
+    parser.add_argument("--db_port", type=int, default=5432, help="PostgreSQL port")
+    parser.add_argument(
+        "--max_connections",
+        type=int,
+        default=10,
+        help="Maximum number of database connections",
+    )
+    parser.add_argument(
+        "--redis_host", type=str, default="localhost", help="Redis server host"
+    )
+    parser.add_argument("--redis_port", type=int, default=6379, help="Redis server port")
 
-    # Create a miner based on the Class definitions
-    subnet_miner = BettensorMiner(parser=parser)
+    # Add bittensor specific args
+    bt.subtensor.add_args(parser)
+    bt.logging.add_args(parser)
+    bt.wallet.add_args(parser)
+    bt.axon.add_args(parser)
+
+    # Parse config
+    config = bt.config(parser)
+
+    # Create a miner with the config
+    subnet_miner = BettensorMiner(config=config)
     subnet_miner.start()
 
     main(subnet_miner)

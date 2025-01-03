@@ -13,6 +13,11 @@ import bittensor as bt
 import time
 import joblib
 import scipy.sparse
+import warnings
+from pathlib import Path
+
+# Filter out scikit-learn version warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 
 @dataclass

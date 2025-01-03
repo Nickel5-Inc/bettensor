@@ -25,71 +25,23 @@ from datetime import datetime, timezone
 from bittensor import Synapse
 from bettensor.miner.utils.health_check import run_health_check
 import asyncio
+from bettensor import __spec_version__
 
 
 class BettensorMiner(BaseNeuron):
-    def __init__(self, parser: ArgumentParser):
+    def __init__(self, config=None):
         bt.logging.info("Initializing BettensorMiner")
-        super().__init__(parser=parser, profile="miner")
+        super().__init__(config=config)
 
-        bt.logging.info("Adding custom arguments")
-
-        # Add PostgreSQL connection parameters with defaults
-        parser.add_argument(
-            "--db_name", type=str, default="bettensor", help="PostgreSQL database name"
-        )
-        parser.add_argument(
-            "--db_user", type=str, default="root", help="PostgreSQL user"
-        )
-        parser.add_argument(
-            "--db_password",
-            type=str,
-            default="bettensor_password",
-            help="PostgreSQL password",
-        )
-        parser.add_argument(
-            "--db_host", type=str, default="localhost", help="PostgreSQL host"
-        )
-        parser.add_argument("--db_port", type=int, default=5432, help="PostgreSQL port")
-        parser.add_argument(
-            "--max_connections",
-            type=int,
-            default=10,
-            help="Maximum number of database connections",
-        )
-
-        if not any(action.dest == "validator_min_stake" for action in parser._actions):
-            parser.add_argument(
-                "--validator_min_stake",
-                type=float,
-                default=1000.0,
-                help="Minimum stake required for validators",
-            )
-
-        if not any(action.dest == "redis_host" for action in parser._actions):
-            parser.add_argument(
-                "--redis_host", type=str, default="localhost", help="Redis server host"
-            )
-
-        if not any(action.dest == "redis_port" for action in parser._actions):
-            parser.add_argument(
-                "--redis_port", type=int, default=6379, help="Redis server port"
-            )
-
-        bt.logging.info("Parsing arguments and setting up configuration")
-        try:
-            self.neuron_config = self.config(
-                bt_classes=[bt.subtensor, bt.logging, bt.wallet, bt.axon]
-            )
-            if self.neuron_config is None:
-                raise ValueError("self.config() returned None")
-        except Exception as e:
-            bt.logging.error(f"Error in self.config(): {e}")
-            raise
+        bt.logging.info("Setting up configuration")
+        if not config:
+            config = self.config()
+        self.neuron_config = config
 
         bt.logging.info(f"Neuron config: {self.neuron_config}")
 
         self.args = self.neuron_config
+        self.subnet_version = str(__spec_version__)
 
         bt.logging.info("Setting up wallet, subtensor, and metagraph")
         try:

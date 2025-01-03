@@ -14,11 +14,11 @@ from bettensor import __spec_version__
 class WeightSetter:
     def __init__(
         self,
-        metagraph,
-        wallet,
-        subtensor,
-        neuron_config,
-        db_path,
+        metagraph: "bt.metagraph",
+        wallet: "bt.wallet",
+        subtensor: "bt.subtensor",
+        neuron_config: "bt.config",
+        db_path: str,
     ):
         self.metagraph = metagraph
         self.wallet = wallet
