@@ -62,6 +62,46 @@ def initialize_database():
         END;
     """)
     
+    # Add new ROI tracking columns if they don't exist
+    statements.append("""
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='miner_15_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats ADD COLUMN miner_15_day_roi REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
+    """)
+    
+    statements.append("""
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='miner_30_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats ADD COLUMN miner_30_day_roi REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
+    """)
+    
+    statements.append("""
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='miner_45_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats ADD COLUMN miner_45_day_roi REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
+    """)
+    
     # 3. Create backup table
     statements.append("""
         CREATE TABLE IF NOT EXISTS miner_stats_backup (
@@ -88,19 +128,48 @@ def initialize_database():
             miner_lifetime_wins INTEGER,
             miner_lifetime_losses INTEGER,
             miner_win_loss_ratio REAL,
-            most_recent_weight REAL DEFAULT 0.0
+            most_recent_weight REAL DEFAULT 0.0,
+            miner_15_day_roi REAL DEFAULT 0.0,
+            miner_30_day_roi REAL DEFAULT 0.0,
+            miner_45_day_roi REAL DEFAULT 0.0
         )
     """)
     
-    # Add most_recent_weight column to miner_stats_backup if it doesn't exist
+    # Add new ROI tracking columns to miner_stats_backup if they don't exist
     statements.append("""
         SELECT CASE 
             WHEN NOT EXISTS(
-                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='most_recent_weight'
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_15_day_roi'
             )
         THEN (
             SELECT sql FROM (
-                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN most_recent_weight REAL DEFAULT 0.0;' as sql
+                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN miner_15_day_roi REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
+    """)
+    
+    statements.append("""
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_30_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN miner_30_day_roi REAL DEFAULT 0.0;' as sql
+            )
+        )
+        END;
+    """)
+    
+    statements.append("""
+        SELECT CASE 
+            WHEN NOT EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_45_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN miner_45_day_roi REAL DEFAULT 0.0;' as sql
             )
         )
         END;
@@ -133,7 +202,10 @@ def initialize_database():
             CAST(COALESCE(miner_lifetime_wins, 0) AS INTEGER),
             CAST(COALESCE(miner_lifetime_losses, 0) AS INTEGER),
             CAST(COALESCE(miner_win_loss_ratio, 0.0) AS REAL),
-            CAST(COALESCE(most_recent_weight, 0.0) AS REAL)
+            CAST(COALESCE(most_recent_weight, 0.0) AS REAL),
+            CAST(COALESCE(miner_15_day_roi, 0.0) AS REAL),
+            CAST(COALESCE(miner_30_day_roi, 0.0) AS REAL),
+            CAST(COALESCE(miner_45_day_roi, 0.0) AS REAL)
         FROM miner_stats WHERE EXISTS (SELECT 1 FROM miner_stats)
     """)
     
@@ -164,7 +236,10 @@ def initialize_database():
             CAST(COALESCE(miner_lifetime_wins, 0) AS INTEGER) as miner_lifetime_wins,
             CAST(COALESCE(miner_lifetime_losses, 0) AS INTEGER) as miner_lifetime_losses,
             CAST(COALESCE(miner_win_loss_ratio, 0.0) AS REAL) as miner_win_loss_ratio,
-            CAST(COALESCE(most_recent_weight, 0.0) AS REAL) as most_recent_weight
+            CAST(COALESCE(most_recent_weight, 0.0) AS REAL) as most_recent_weight,
+            CAST(COALESCE(miner_15_day_roi, 0.0) AS REAL) as miner_15_day_roi,
+            CAST(COALESCE(miner_30_day_roi, 0.0) AS REAL) as miner_30_day_roi,
+            CAST(COALESCE(miner_45_day_roi, 0.0) AS REAL) as miner_45_day_roi
         FROM miner_stats_backup 
         WHERE EXISTS (SELECT 1 FROM miner_stats_backup)
     """)
@@ -338,3 +413,4 @@ def initialize_database():
     )
     
     return statements
+

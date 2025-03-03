@@ -12,25 +12,29 @@ Outputs:
 """
 
 
-from collections import defaultdict
+import os
+from datetime import datetime, timezone, timedelta, date
 import json
 import numpy as np
-import bittensor as bt
-from datetime import datetime, timezone, timedelta, date
-from typing import List, Dict
 import time
 import traceback
-import asyncio
-import requests
-from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
-import async_timeout
-import random
 import copy
+import asyncio
+import async_timeout
+import warnings
+import math
+import bittensor as bt
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
-from .scoring_data import ScoringData
-from .entropy_system import EntropySystem
+from pydantic import BaseModel, field_validator, validator
+from typing import List, Dict, Optional, Any, Tuple, Union, Set
+from enum import Enum
+
+from bettensor.validator.utils.scoring.scoring_data import ScoringData
+from bettensor.validator.utils.entropy_system import EntropySystem
+from bettensor.validator.utils.database.database_init import initialize_database
+
+# Global reference to active scoring system
+_ACTIVE_SCORING_SYSTEM = None
 
 class ScoringSystem:
     def __init__(
@@ -154,6 +158,10 @@ class ScoringSystem:
         self.last_update_date = None  # Will store the last day processed as a date object (no time)
 
         self.scoring_data = ScoringData(self)
+
+        # Register as the active scoring system
+        global _ACTIVE_SCORING_SYSTEM
+        _ACTIVE_SCORING_SYSTEM = self
 
 
 
@@ -421,6 +429,36 @@ class ScoringSystem:
             ])
         active_days = np.count_nonzero(~np.isnan(window_scores))
         
+        # For tiers 3 and above, check ROI requirement (must be non-negative)
+        roi_requirement = True
+        if tier >= 3:  # Tiers 3, 4, 5, 6
+            # Get ROI scores over a 15-day window
+            roi_window = 15  # days
+            roi_start_idx = (self.current_day - roi_window + 1) % self.max_days
+            
+            if roi_start_idx <= self.current_day:
+                window_roi = self.roi_scores[miner, roi_start_idx:self.current_day + 1]
+            else:
+                window_roi = np.concatenate([
+                    self.roi_scores[miner, roi_start_idx:],
+                    self.roi_scores[miner, :self.current_day + 1]
+                ])
+            
+            # Filter out zero entries (no activity)
+            active_roi = window_roi[window_roi != 0]
+            
+            # Only apply ROI requirement if miner has sufficient ROI history
+            if len(active_roi) >= 5:  # At least 5 days of ROI data
+                avg_roi = np.mean(active_roi)
+                roi_requirement = avg_roi >= 0
+                
+                bt.logging.trace(f"ROI requirement for tier {tier-1}:")
+                bt.logging.trace(f"  15-day average ROI: {avg_roi:.4f}")
+                bt.logging.trace(f"  Requirement met: {roi_requirement}")
+                
+                if not roi_requirement:
+                    bt.logging.info(f"Miner {miner} failed ROI requirement for tier {tier-1} with avg ROI {avg_roi:.4f}")
+        
         # Log tier configuration
         bt.logging.trace(f"Checking tier {tier-1} requirements for miner {miner}:")
         bt.logging.trace(f"Window size: {window} days")
@@ -456,7 +494,7 @@ class ScoringSystem:
         
         meets_wager = cumulative_wager >= min_wager
         has_history = active_days >= min_days_required
-        meets_requirement = meets_wager and has_history
+        meets_requirement = meets_wager and has_history and roi_requirement
         
         # Log eligibility result with specific reasons
         bt.logging.trace("Eligibility result:")
@@ -758,6 +796,10 @@ class ScoringSystem:
         """Calculate weights with smooth transitions and increased spread within tiers."""
         bt.logging.info("Calculating weights with enhanced score separation")
         
+        # Hardcoded UID for recycling tier 1 and 2 incentives
+        # This UID will receive all remaining incentives from tiers 1 and 2
+        RECYCLING_UID = 42  # Replace with the actual UID to use
+        
         weights = np.zeros(self.num_miners)
         if day is None:
             day = self.current_day
@@ -788,6 +830,10 @@ class ScoringSystem:
             empty_tier_incentives = 0
             total_populated_incentive = 0
             
+            # Track tier 1 and 2 incentives for recycling
+            tier1_incentive = 0
+            tier2_incentive = 0
+            
             for tier in range(2, self.num_tiers):
                 tier_miners = valid_miners[current_tiers[valid_miners] == tier]
                 config = self.tier_configs[tier]
@@ -802,6 +848,21 @@ class ScoringSystem:
                     empty_tier_incentives += config["capacity"] * config["incentive"]
                     bt.logging.debug(f"Tier {tier-1} is empty, redistributing {config['capacity'] * config['incentive']:.4f} incentive")
 
+            # Capture incentives from tier 1 and 2
+            # We're redirecting these to the recycling UID instead of distributing them
+            for tier in [1, 2]:
+                config = self.tier_configs[tier]
+                tier_incentive = config["capacity"] * config["incentive"]
+                if tier == 1:
+                    tier1_incentive = tier_incentive
+                    bt.logging.info(f"Redirecting tier 1 incentive of {tier1_incentive:.4f} to recycling UID {RECYCLING_UID}")
+                else:
+                    tier2_incentive = tier_incentive
+                    bt.logging.info(f"Redirecting tier 2 incentive of {tier2_incentive:.4f} to recycling UID {RECYCLING_UID}")
+                
+            # Total recycled incentive
+            recycled_incentive = tier1_incentive + tier2_incentive
+            
             # Redistribute empty tier incentives proportionally
             if empty_tier_incentives > 0 and total_populated_incentive > 0:
                 for tier_data in populated_tiers.values():
@@ -868,13 +929,22 @@ class ScoringSystem:
                     tier_weights = np.array([allocation['center']])
 
                 weights[tier_miners] = tier_weights
+            
+            # Assign recycled incentive to the recycling UID if it exists in our miners list
+            if 0 <= RECYCLING_UID < self.num_miners:
+                # We'll set a fixed weight that represents the recycled incentive
+                # Use 1.0 as a starting value before normalization
+                weights[RECYCLING_UID] = recycled_incentive if weights[RECYCLING_UID] == 0 else weights[RECYCLING_UID] + recycled_incentive
+                bt.logging.info(f"Assigned recycled incentive of {recycled_incentive:.4f} to UID {RECYCLING_UID}")
+            else:
+                bt.logging.warning(f"Recycling UID {RECYCLING_UID} is out of range (0-{self.num_miners-1}). Incentive not recycled.")
 
             # Normalize final weights
             total_weight = weights.sum()
             if total_weight > 0:
                 weights /= total_weight
                 
-                # Verification logging remains the same
+                # Verification logging
                 for tier in populated_tiers:
                     tier_miners = np.where((current_tiers == tier) & (weights > 0))[0]
                     if len(tier_miners) > 0:
@@ -884,6 +954,10 @@ class ScoringSystem:
                         bt.logging.info(f"  Weight range: {weights[tier_miners].min():.6f} - {weights[tier_miners].max():.6f}")
                         bt.logging.info(f"  Weight spread: {tier_spread:.6f}")
                         bt.logging.info(f"  Total weight: {tier_sum:.4f}")
+                
+                # Log the weight assigned to recycling UID
+                if 0 <= RECYCLING_UID < self.num_miners and weights[RECYCLING_UID] > 0:
+                    bt.logging.info(f"Recycling UID {RECYCLING_UID} final weight: {weights[RECYCLING_UID]:.6f}")
 
             final_sum = weights.sum()
             bt.logging.info(f"Final weight sum: {final_sum:.6f}")
@@ -989,6 +1063,9 @@ class ScoringSystem:
                 await self.db_manager.executemany(update_weights_query, weight_updates)
                 bt.logging.info("Updated most_recent_weights in miner_stats table")
 
+                # Update ROI statistics after scores have been calculated
+                await self.update_miner_roi_stats()
+
             else:
                 bt.logging.warning(
                     f"No predictions for date {date_str}. Using previous day's weights."
@@ -1000,59 +1077,38 @@ class ScoringSystem:
                     weights = self.calculate_weights(day=previous_day)
                     bt.logging.info(f"Using weights from previous day: {previous_day}")
                     
-                    # Update most_recent_weight in miner_stats table using the specialized method
+                    # Update most_recent_weight with previous day's weights
+                    update_weights_query = """
+                        UPDATE miner_stats 
+                        SET most_recent_weight = ? 
+                        WHERE miner_uid = ?
+                    """
                     weight_updates = [(float(weights[i]), i) for i in range(self.num_miners)]
-                    await self.db_manager.update_miner_weights(weight_updates)
-                    bt.logging.info("Updated most_recent_weights in miner_stats table using previous day's weights")
-
-                except Exception as e:
-                    bt.logging.error(
-                        f"Failed to retrieve weights from previous day: {e}. Assigning equal weights."
-                    )
-                    weights = np.zeros(self.num_miners)
-                    weights[list(self.valid_uids)] = 1 / len(self.valid_uids)
+                    await self.db_manager.executemany(update_weights_query, weight_updates)
+                    bt.logging.info("Updated most_recent_weights with previous day's weights")
                     
-                    # Update most_recent_weight with equal weights using the specialized method
-                    weight_updates = [(float(weights[i]), i) for i in range(self.num_miners)]
-                    await self.db_manager.update_miner_weights(weight_updates)
-                    bt.logging.info("Updated most_recent_weights in miner_stats table with equal weights")
+                    # Still update ROI statistics even when using previous day's weights
+                    await self.update_miner_roi_stats()
+                    
+                except Exception as e:
+                    bt.logging.error(f"Error calculating previous day's weights: {e}")
+                    weights = np.zeros(self.num_miners)
 
-            # Assign invalid UIDs to tier 0
-            weights[list(self.invalid_uids)] = 0
-
-            # Renormalize weights
-            if weights.sum() > 0:
-                weights /= weights.sum()
-            else:
-                bt.logging.warning("Total weight is zero. Distributing weights equally among valid miners.")
-                weights[list(self.valid_uids)] = 1 / len(self.valid_uids)
-
-            bt.logging.info(f"Weight sum: {weights.sum():.6f}")
-            bt.logging.info(
-                f"Min weight: {weights.min():.6f}, Max weight: {weights.max():.6f}"
-            )
-            bt.logging.info(f"Weights: {weights}")
-
-            # Log final tier distribution
-            self.log_score_summary()
-
-            bt.logging.info(f"=== Completed scoring run for date: {date_str} ===")
-
-            # Save state at the end of each run
+            # Save updated scores to database
+            await self.save_scores()
+            
+            # Save state to database
             await self.save_state()
-            await self.scoring_data.update_miner_stats(self.current_day)
-
-            # check that weights are length 256. 
-            if len(weights) != 256:
-                bt.logging.error(f"Weights are not length 256. They are length {len(weights)}")
-                return None
+            
+            # Log summary of scores
+            self.log_score_summary()
 
             return weights
 
         except Exception as e:
             bt.logging.error(f"Error in scoring run: {e}")
             bt.logging.error(f"Traceback: {traceback.format_exc()}")
-            raise
+            return np.zeros(self.num_miners)
 
     def reset_date(self, new_date):
         """
@@ -1610,25 +1666,49 @@ class ScoringSystem:
 
     async def _clear_database_state(self):
         """
-        Clear all scoring-related state from the database. 
+        Clear all data from the tables related to the scoring system.
         """
-        try:
-            # Clear score_state table
-            await self.db_manager.execute_query("DELETE FROM score_state", None)
+        # List of tables to clear
+        tables = [
+            "tier_stats",
+            "miner_stats",
+            "daily_scores",
+            "component_scores"
+        ]
+        
+        for table in tables:
+            await self.db_manager.execute_query(f"DELETE FROM {table}")
+            bt.logging.info(f"Cleared data from {table} table")
 
-            # Clear scores table
-            await  self.db_manager.execute_query("DELETE FROM scores", None)
-
-            #Clear score state table
-            await self.db_manager.execute_query("DELETE FROM score_state", None)
-
-            # Clear miner_stats table
-            await self.db_manager.execute_query("DELETE FROM miner_stats", None)
-
-            bt.logging.info("Database state cleared successfully.")
-        except Exception as e:
-            bt.logging.error(f"Error clearing database state: {e}")
-            raise
+    async def _migrate_miner_stats_roi_columns(self):
+        """
+        Add new ROI columns to the miner_stats table if they don't exist.
+        This allows dynamic addition of new columns without recreating the table.
+        """
+        bt.logging.info("Checking and migrating ROI columns in miner_stats table")
+        
+        # Check if columns exist first to avoid errors
+        table_info_query = "PRAGMA table_info(miner_stats)"
+        columns = await self.db_manager.fetch_all(table_info_query)
+        
+        # Extract existing column names
+        existing_columns = [col['name'] for col in columns]
+        
+        # Define new columns to add
+        new_columns = {
+            "miner_15_day_roi": "REAL DEFAULT 0",
+            "miner_30_day_roi": "REAL DEFAULT 0",
+            "miner_45_day_roi": "REAL DEFAULT 0"
+        }
+        
+        # Add missing columns
+        for column_name, column_type in new_columns.items():
+            if column_name not in existing_columns:
+                alter_query = f"ALTER TABLE miner_stats ADD COLUMN {column_name} {column_type}"
+                await self.db_manager.execute_query(alter_query)
+                bt.logging.info(f"Added column {column_name} to miner_stats table")
+        
+        bt.logging.info("ROI column migration completed")
 
     def _calculate_clv_scores(self, predictions, closing_line_odds):
         """
@@ -1961,24 +2041,46 @@ class ScoringSystem:
             bt.logging.error(traceback.format_exc())
 
     async def initialize(self):
-        """Async initialization method to be called after constructor"""
-        max_retries = 3
-        retry_delay = 1  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                self.init = await self.load_state()
-                await self.scoring_data.initialize()
-                self.advance_day(self.current_date.date())
-                await self.populate_amount_wagered()
-                return
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    bt.logging.warning(f"Initialization attempt {attempt + 1} failed, retrying in {retry_delay}s: {e}")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    bt.logging.error(f"Failed to initialize after {max_retries} attempts")
-                    raise
+        """Initialize the scoring system."""
+        try:
+            # Initialize database connection if needed
+            if not self.db_manager:
+                bt.logging.warning("No database manager provided. Scoring system won't be able to save/load state.")
+                return False
+
+            await self.db_manager.initialize()
+            
+            # Run database migrations to ensure all required columns exist
+            db_init_statements = initialize_database()
+            for statement in db_init_statements:
+                try:
+                    await self.db_manager.execute_query(statement)
+                except Exception as e:
+                    bt.logging.warning(f"Error executing initialization statement: {e}")
+                    # Continue to next statement if one fails (column might already exist)
+                    
+            bt.logging.info("Database migrations completed")
+
+            # Try to load existing state
+            await self.load_state()
+            await self.load_scores()
+
+            # Initialize with default values if no state exists
+            if self.current_day is None:
+                bt.logging.warning("No existing state found. Initializing with default values.")
+                self.current_day = 0
+                self.current_date = self.reference_date
+                self.last_update_date = datetime.now(timezone.utc)
+                self.tiers = np.ones((self.num_miners, self.max_days), dtype=np.int32)
+                self.amount_wagered = np.zeros((self.num_miners, self.max_days), dtype=np.float32)
+                self.init = True
+
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error initializing scoring system: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
 
     async def rebuild_historical_scores(self):
         """Rebuilds historical scores for the past 45 days using existing prediction and game data."""
@@ -2448,3 +2550,157 @@ class ScoringSystem:
         
         date_str = date.strftime("%Y-%m-%d")
         bt.logging.trace(f"=== Completed scoring run for date: {date_str} ===")
+
+    async def update_miner_roi_stats(self):
+        """
+        Update the miner_stats table with current ROI values, including:
+        - miner_lifetime_roi: Calculate ROI across all predictions for each miner
+        - miner_15_day_roi: Calculate ROI over the last 15 days
+        - miner_30_day_roi: Calculate ROI over the last 30 days
+        - miner_45_day_roi: Calculate ROI over the last 45 days
+        
+        This method should be called after scores have been updated in scoring_run.
+        """
+        bt.logging.info("Updating miner ROI statistics...")
+        
+        # Prepare data for all miners
+        roi_updates = []
+        current_day = self.current_day
+        
+        for miner in range(self.num_miners):
+            # Get window indices for each time period, handling wraparound
+            # 15-day window
+            start_15_day = (current_day - 14) % self.max_days
+            roi_15_day = self._calculate_window_roi(miner, start_15_day, current_day)
+            
+            # 30-day window
+            start_30_day = (current_day - 29) % self.max_days
+            roi_30_day = self._calculate_window_roi(miner, start_30_day, current_day)
+            
+            # 45-day window (or maximum available)
+            start_45_day = (current_day - min(44, self.max_days - 1)) % self.max_days
+            roi_45_day = self._calculate_window_roi(miner, start_45_day, current_day)
+            
+            # Calculate lifetime ROI from prediction data
+            lifetime_roi = await self._calculate_lifetime_roi(miner)
+            
+            # Log ROI values for debugging
+            bt.logging.debug(f"Miner {miner} ROI values:")
+            bt.logging.debug(f"  15-day ROI: {roi_15_day:.4f}")
+            bt.logging.debug(f"  30-day ROI: {roi_30_day:.4f}")
+            bt.logging.debug(f"  45-day ROI: {roi_45_day:.4f}")
+            bt.logging.debug(f"  Lifetime ROI: {lifetime_roi:.4f}")
+            
+            # Create update record
+            roi_updates.append((
+                float(roi_15_day) if not np.isnan(roi_15_day) else 0.0,
+                float(roi_30_day) if not np.isnan(roi_30_day) else 0.0,
+                float(roi_45_day) if not np.isnan(roi_45_day) else 0.0,
+                float(lifetime_roi) if not np.isnan(lifetime_roi) else 0.0,
+                # Also update miner_current_roi with the 15-day value for consistency
+                float(roi_15_day) if not np.isnan(roi_15_day) else 0.0,
+                miner
+            ))
+        
+        # Update miner_stats with ROI values
+        update_query = """
+            UPDATE miner_stats
+            SET 
+                miner_15_day_roi = ?,
+                miner_30_day_roi = ?,
+                miner_45_day_roi = ?,
+                miner_lifetime_roi = ?,
+                miner_current_roi = ?
+            WHERE miner_uid = ?
+        """
+        
+        # Use try-except with retries for database operations
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                await self.db_manager.executemany(
+                    update_query,
+                    roi_updates,
+                    column_names=[
+                        'miner_15_day_roi', 
+                        'miner_30_day_roi', 
+                        'miner_45_day_roi', 
+                        'miner_lifetime_roi',
+                        'miner_current_roi',
+                        'miner_uid'
+                    ]
+                )
+                bt.logging.info(f"Updated ROI statistics for {len(roi_updates)} miners")
+                break
+            except Exception as e:
+                bt.logging.error(f"Error updating ROI statistics (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    bt.logging.error(f"Failed to update ROI statistics after {max_retries} attempts")
+                else:
+                    await asyncio.sleep(1)  # Wait before retry
+    
+    def _calculate_window_roi(self, miner, start_day, end_day):
+        """
+        Calculate the ROI for a miner over a specific window of days.
+        
+        Args:
+            miner (int): The miner's UID
+            start_day (int): Start day index (inclusive)
+            end_day (int): End day index (inclusive)
+            
+        Returns:
+            float: Average ROI over the window, or NaN if no data
+        """
+        if start_day <= end_day:
+            window_roi = self.roi_scores[miner, start_day:end_day + 1]
+        else:
+            # Handle wraparound case
+            window_roi = np.concatenate([
+                self.roi_scores[miner, start_day:],
+                self.roi_scores[miner, :end_day + 1]
+            ])
+        
+        # Filter out zeros (no activity) and calculate average
+        active_roi = window_roi[window_roi != 0]
+        if len(active_roi) > 0:
+            return np.mean(active_roi)
+        else:
+            return np.nan
+    
+    async def _calculate_lifetime_roi(self, miner):
+        """
+        Calculate lifetime ROI for a miner from prediction data in the database.
+        
+        Args:
+            miner (int): The miner's UID
+            
+        Returns:
+            float: Lifetime ROI, or NaN if no predictions
+        """
+        # Query to get total wager and payout for all predictions by this miner
+        query = """
+            SELECT 
+                SUM(wager) as total_wager,
+                SUM(payout) as total_payout
+            FROM predictions
+            WHERE miner_uid = ? AND wager > 0
+        """
+        
+        result = await self.db_manager.fetch_one(query, (miner,))
+        
+        if result and result['total_wager'] and result['total_wager'] > 0:
+            total_wager = result['total_wager']
+            total_payout = result['total_payout'] or 0
+            lifetime_roi = (total_payout - total_wager) / total_wager
+            return lifetime_roi
+        else:
+            return np.nan
+
+def get_active_scoring_system():
+    """
+    Returns the currently active scoring system instance.
+    
+    Returns:
+        ScoringSystem: The active scoring system instance, or None if not initialized.
+    """
+    return _ACTIVE_SCORING_SYSTEM
