@@ -4,6 +4,8 @@ This module provides a comprehensive stake tracking and vesting system for Bitte
 
 ## Overview
 
+The vesting system rewards miners who hold their stake rather than immediately selling it. Miners who maintain or increase their stake over time receive multipliers to their scores, enhancing their rewards.
+
 The vesting system consists of the following components:
 
 1. **Stake Tracking**: Monitors and records changes in stake balances for validators and miners
@@ -12,123 +14,168 @@ The vesting system consists of the following components:
 4. **Vesting Schedules**: Creates and manages vesting schedules for earned rewards
 5. **Vesting Payments**: Processes scheduled vesting payments to miners
 
+## Directory Structure
+
+```
+bettensor/validator/utils/vesting/
+├── __init__.py                 # Public exports
+├── system.py                   # Main VestingSystem class
+├── core/                       # Core components
+│   ├── __init__.py
+│   ├── multipliers.py          # Vesting multiplier calculations
+│   ├── stake_tracker.py        # Stake tracking and history
+│   └── vesting_scheduler.py    # Vesting schedule management
+├── blockchain/                 # Blockchain interaction
+│   ├── __init__.py
+│   └── subtensor_client.py     # Subtensor API client
+└── database/                   # Database models
+    ├── __init__.py
+    └── models.py               # Database model definitions
+```
+
 ## Components
 
-### SubtensorTransactionTracker
+### VestingSystem
 
-The `SubtensorTransactionTracker` class connects to the Bittensor blockchain using the Subtensor API to track stake transactions:
+The `VestingSystem` class is the main entry point for using the vesting system. It integrates all components and provides a unified API for:
 
-- Monitors stake changes for neurons in a subnet
-- Detects add_stake, remove_stake, and move_stake events
-- Tracks epoch boundaries for synchronizing with the network
+- Tracking stake balances and history
+- Monitoring blockchain transactions
+- Creating and managing vesting schedules
+- Calculating vesting multipliers
+- Integrating with scoring systems
 
-### StakeTrackerService
+### Core Components
 
-The `StakeTrackerService` provides high-level stake tracking functionality:
+#### StakeTracker
 
-- Tracks stake balance changes for each miner over time
-- Records stake transactions and maintains a history
-- Distinguishes between manual stake changes and earned rewards
+The `StakeTracker` tracks stake balances and calculates holding metrics:
+
+- Monitors stake balances for each neuron
+- Records stake history over time
+- Maintains hotkey-coldkey associations
+- Calculates holding percentages and durations
+
+#### VestingScheduler
+
+The `VestingScheduler` manages vesting schedules and payments:
+
 - Creates vesting schedules for earned rewards
-- Processes vesting payments according to configured schedules
+- Processes scheduled vesting payments
+- Tracks vesting status and progress
 
-## Database Models
+#### Multipliers
 
-The system uses the following database models to store data:
+The multiplier functions calculate score multipliers based on:
 
-1. `MinerStakeHistory`: Records stake history and changes over time
-2. `StakeTransaction`: Tracks individual stake transactions on the blockchain
-3. `HotkeyColdkeyAssociation`: Maintains associations between hotkeys and coldkeys
+- Holding percentage (what percentage of rewards are held)
+- Holding duration (how long rewards have been held)
+
+### Blockchain Components
+
+#### SubtensorClient
+
+The `SubtensorClient` provides a unified interface for blockchain interactions:
+
+- Connects to the Bittensor blockchain
+- Monitors stake changes and transactions
+- Detects epoch boundaries
+- Queries transaction history
+
+### Database Models
+
+The system uses these database models to store data:
+
+1. `HotkeyColdkeyAssociation`: Maintains associations between hotkeys and coldkeys
+2. `StakeHistory`: Records stake history and changes over time
+3. `StakeTransaction`: Tracks individual stake transactions on the blockchain
 4. `VestingSchedule`: Defines vesting schedules for earned rewards
 5. `VestingPayment`: Tracks individual payments from vesting schedules
 
 ## Usage Example
 
-Here's a simple example of how to use the stake tracking service:
+Here's a simple example of how to use the vesting system:
 
 ```python
 import asyncio
 import bittensor as bt
 from bettensor.validator.utils.database import DatabaseManager
-from bettensor.validator.utils.vesting.stake_tracker import StakeTrackerService
+from bettensor.validator.utils.vesting import VestingSystem
 
 async def main():
-    # Initialize database manager
-    db_manager = DatabaseManager("vesting.db")
-    await db_manager.connect()
+    # Initialize components
+    db_manager = DatabaseManager("sqlite:///validator.db")
+    metagraph = bt.metagraph(netuid=1)
+    subnet_id = 1
     
-    # Load metagraph
-    metagraph = bt.metagraph(netuid=1)  # Replace with your subnet ID
-    
-    # Create stake tracker service
-    service = StakeTrackerService(
+    # Create vesting system
+    vesting_system = VestingSystem(
         db_manager=db_manager,
         metagraph=metagraph,
-        subnet_id=1,  # Replace with your subnet ID
-        vesting_duration_days=30,  # Configure vesting duration
-        vesting_interval_days=1,   # Configure payment interval
-        min_vesting_amount=0.1,    # Minimum reward amount for vesting
-        network="finney"           # Bittensor network
+        subnet_id=subnet_id,
+        vesting_duration_days=30,
+        vesting_interval_days=1,
+        min_vesting_amount=0.1
     )
     
-    # Start the service
-    await service.start()
+    # Start the system
+    await vesting_system.start()
     
-    try:
-        # Run for some time
-        await asyncio.sleep(3600)  # Run for an hour
-    finally:
-        # Stop the service
-        await service.stop()
-        
-        # Close database connection
-        await db_manager.disconnect()
+    # Integrate with scoring system (optional)
+    vesting_system.integrate_with_scoring(your_scoring_system)
+    
+    # Get holding metrics for a hotkey
+    metrics = await vesting_system.get_holding_metrics("example_hotkey")
+    print(f"Holding metrics: {metrics}")
+    
+    # Get full vesting summary
+    summary = await vesting_system.get_vesting_summary("example_hotkey")
+    print(f"Vesting summary: {summary}")
+    
+    # Create a vesting schedule
+    schedule_id = await vesting_system.create_vesting_schedule(
+        hotkey="example_hotkey",
+        amount=10.0
+    )
+    
+    # ... your validator code ...
+    
+    # Stop the system
+    await vesting_system.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Advanced Features
+## Multiplier Calculation
 
-### Epoch Boundary Detection
+The vesting system calculates score multipliers based on two factors:
 
-The system detects epoch boundaries to synchronize with the Bittensor network:
+1. **Holding Percentage**: What percentage of rewards are being held
+   - >30% held: 1.1x multiplier
+   - >50% held: 1.2x multiplier
+   - >70% held: 1.3x multiplier
 
-- Adjusts sleep intervals based on proximity to epoch boundaries
-- Processes data more frequently near epoch boundaries
-- Recalculates rewards at epoch boundaries
+2. **Holding Duration**: How long rewards have been held
+   - >2 weeks: 1.1x multiplier
+   - >1 month: 1.2x multiplier
+   - >2 months: 1.3x multiplier
 
-### Transaction Classification
+These factors are combined to produce a final multiplier, with a maximum value of 1.5x.
 
-The system classifies stake transactions into several types:
+## Integration with Validators
 
-- **AddStake**: Adding stake to a hotkey
-- **RemoveStake**: Removing stake from a hotkey
-- **MoveStake**: Moving stake between hotkeys (detected as related add/remove pairs)
+The vesting system can be integrated with your validator's scoring system to automatically apply multipliers to scores:
 
-### Stake vs. Reward Attribution
+```python
+# Create vesting system
+vesting_system = VestingSystem(...)
 
-The system distinguishes between manual stake adjustments and earned rewards:
+# Start the system
+await vesting_system.start()
 
-- Manual adjustments are detected via blockchain transactions
-- Earned rewards are calculated by subtracting manual adjustments from total stake changes
-- Only actual rewards are eligible for vesting
+# Integrate with scoring system
+vesting_system.integrate_with_scoring(your_scoring_system)
+```
 
-## Configuration
-
-The vesting system can be configured with several parameters:
-
-- **vesting_duration_days**: Duration for vesting schedules (default: 30 days)
-- **vesting_interval_days**: Interval between vesting payments (default: 1 day)
-- **min_vesting_amount**: Minimum reward amount for creating a vesting schedule (default: 0.1 TAO)
-- **network**: Bittensor network to connect to (default: "finney")
-
-## Integration
-
-To integrate the vesting system into your validator:
-
-1. Initialize the `StakeTrackerService` with your subnet settings
-2. Start the service at validator startup
-3. Stop the service gracefully at validator shutdown
-4. Use the database models to query stake history, transactions, and vesting schedules
-5. Implement reward distribution logic based on vesting schedules 
+This will patch the scoring system's `calculate_weights` method to apply vesting multipliers. 
