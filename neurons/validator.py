@@ -653,14 +653,62 @@ def signal_handler(signum, frame):
     
     if _validator:
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        loop.run_until_complete(cleanup_database_connections(_validator))
-        loop.run_until_complete(_validator.cleanup())
-    sys.exit(0)
+            # Check if we can get the running loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # If there's no running loop, create a new one
+                bt.logging.warning("No running event loop, creating a new one for cleanup")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
+            # Use the loop for cleanup
+            if loop.is_running():
+                bt.logging.info("Using existing event loop for cleanup")
+                
+                # Create a future with a timeout
+                cleanup_task = asyncio.ensure_future(_validator.cleanup())
+                
+                # Add a timeout to prevent hanging
+                def timeout_cleanup():
+                    if not cleanup_task.done():
+                        bt.logging.warning("Cleanup timed out after 10 seconds, forcing exit")
+                        cleanup_task.cancel()
+                
+                # Schedule the timeout
+                loop.call_later(10, timeout_cleanup)
+                
+                # Don't use run_until_complete inside a callback as it could cause issues
+                # Instead, just schedule the exit
+                def finalize_cleanup(_):
+                    bt.logging.info("Cleanup completed, preparing to exit")
+                    # Give a short delay to allow logs to be written before exit
+                    loop.call_later(0.5, sys.exit, 0)
+                
+                # Add callback for when cleanup is done
+                cleanup_task.add_done_callback(finalize_cleanup)
+            else:
+                bt.logging.info("Running cleanup in new event loop")
+                try:
+                    # Run cleanup in the new loop
+                    loop.run_until_complete(asyncio.wait_for(_validator.cleanup(), timeout=10))
+                    bt.logging.info("Cleanup completed successfully")
+                except asyncio.TimeoutError:
+                    bt.logging.warning("Cleanup timed out after 10 seconds")
+                except Exception as e:
+                    bt.logging.error(f"Error during cleanup: {e}")
+                finally:
+                    loop.close()
+                    # Exit after cleanup
+                    sys.exit(0)
+        except Exception as e:
+            bt.logging.error(f"Error during {signal_name} shutdown: {e}")
+            bt.logging.error(traceback.format_exc())
+            # Make sure we exit even if there's an error
+            sys.exit(1)
+    else:
+        bt.logging.info("No validator instance to clean up, exiting directly")
+        sys.exit(0)
 
 @time_task("sync_metagraph")
 @cancellable_task
@@ -1012,19 +1060,42 @@ def cleanup_pycache():
 async def main():
     """Main function for running the validator."""
     global _validator
-    cleanup_pycache()
+    
+    # Configure signal handlers for graceful shutdown
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal_handler)
+    
+    # Clean up __pycache__ folders to avoid loading stale bytecode
+    try:
+        cleanup_pycache()
+    except Exception as e:
+        bt.logging.error(f"Error during pycache cleanup: {str(e)}")
     
     try:
         _validator = await BettensorValidator.create()
+        
+        bt.logging.debug("Starting main validator process loop")
         await run(_validator)
+    except asyncio.CancelledError:
+        bt.logging.info("Validator was cancelled, performing graceful shutdown")
+        # Let the signal handler or finally block handle cleanup
     except Exception as e:
         bt.logging.error(f"Error in validator: {str(e)}")
-        if _validator:
-            await _validator.cleanup()
+        bt.logging.error(traceback.format_exc())
+        # Let the finally block handle cleanup
         raise
     finally:
+        # Final cleanup in case it wasn't triggered by the signal handler
         if _validator:
-            await _validator.cleanup()
+            try:
+                bt.logging.info("Performing final cleanup...")
+                await asyncio.wait_for(_validator.cleanup(), timeout=10)
+                bt.logging.info("Final cleanup completed successfully")
+            except (asyncio.TimeoutError, RuntimeError, Exception) as e:
+                bt.logging.warning(f"Final cleanup attempt failed: {str(e)}")
+        
+        # Ensure validator reference is cleared
+        _validator = None
 
 if __name__ == "__main__":
     try:

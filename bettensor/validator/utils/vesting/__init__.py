@@ -6,8 +6,32 @@ their rewards rather than immediately selling them, and provides multipliers
 to their scores based on the amount and duration of holding.
 """
 
-from bettensor.validator.utils.vesting.tracker import VestingTracker
-from bettensor.validator.utils.vesting.multipliers import calculate_multiplier
-from bettensor.validator.utils.vesting.integration import VestingSystemIntegration
+# Core components
+from bettensor.validator.utils.vesting.core import (
+    calculate_multiplier,
+    get_tier_thresholds,
+    configure_tiers,
+    VestingScheduler,
+    StakeTracker
+)
 
-__all__ = ["VestingTracker", "calculate_multiplier", "VestingSystemIntegration"] 
+# Blockchain components
+from bettensor.validator.utils.vesting.blockchain import SubtensorClient
+
+# Main system
+from bettensor.validator.utils.vesting.system import VestingSystem
+
+__all__ = [
+    # Core components
+    "calculate_multiplier",
+    "get_tier_thresholds",
+    "configure_tiers",
+    "VestingScheduler",
+    "StakeTracker",
+    
+    # Blockchain components
+    "SubtensorClient",
+    
+    # Main system
+    "VestingSystem"
+] 

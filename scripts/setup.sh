@@ -1,232 +1,145 @@
 #!/bin/bash
 
-# Check if the script is being sourced
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "This script must be sourced. Please run: source ./$(basename ${BASH_SOURCE[0]}) <flags>"
+# Change to the directory containing the script
+cd "$(dirname "$0")/.." || exit 1
+
+# Check if bash is installed (might be using sh on some systems)
+if [ -z "$(command -v bash)" ]; then
+    echo "Bash is not installed. Please install bash to continue."
     exit 1
 fi
 
-# Check Ubuntu version
-ubuntu_version=$(lsb_release -rs)
+# Check if python3 is installed
+if [ -z "$(command -v python3)" ]; then
+    echo "Python 3 is not installed. Please install Python 3 to continue."
+    exit 1
+fi
 
-if [[ "$ubuntu_version" == "20.04" ]]; then
-    echo "Running on Ubuntu 20.04"
-    # Add any 20.04-specific adjustments here
-elif [[ "$ubuntu_version" == "22.04" ]]; then
-    echo "Running on Ubuntu 22.04"
+# Check if pip is installed
+if [ -z "$(command -v pip)" ] && [ -z "$(command -v pip3)" ]; then
+    echo "Pip is not installed. Please install pip to continue."
+    exit 1
+fi
+
+# Set pip command based on what's available
+if [ -n "$(command -v pip)" ]; then
+    PIP_CMD="pip"
+elif [ -n "$(command -v pip3)" ]; then
+    PIP_CMD="pip3"
+fi
+
+echo "Starting Bettensor setup..."
+echo "Current working directory: $(pwd)"
+
+# Check if the script is run within an activated Python virtual environment
+if [ -z "$VIRTUAL_ENV" ]; then
+    echo "Warning: No active virtual environment detected."
+    echo "It is recommended to run this script within a virtual environment."
+    
+    read -p "Would you like to create a new virtual environment? (y/n): " CREATE_VENV
+    if [[ "$CREATE_VENV" =~ ^[Yy]$ ]]; then
+        echo "Creating a new virtual environment..."
+        
+        # Try to install virtualenv if it's not available
+        if [ -z "$(command -v virtualenv)" ]; then
+            echo "Installing virtualenv..."
+            $PIP_CMD install virtualenv
+        fi
+        
+        # Create the virtual environment
+        python3 -m virtualenv .venv
+        
+        # Activate the virtual environment
+        source .venv/bin/activate
+        
+        if [ -z "$VIRTUAL_ENV" ]; then
+            echo "Failed to create or activate virtual environment. Please create and activate a virtual environment manually."
+            exit 1
+        else
+            echo "Virtual environment created and activated at: $VIRTUAL_ENV"
+        fi
+    else
+        echo "Continuing without a virtual environment..."
+    fi
+fi
+
+# Install UV - try to use it for faster package installation
+echo "Attempting to install UV package manager for faster dependency resolution..."
+
+UV_INSTALLED=false
+if $PIP_CMD install uv; then
+    echo "UV installed successfully. Will use it for faster package installation."
+    UV_INSTALLED=true
 else
-    echo "This script is only tested on Ubuntu 20.04 and 22.04"
-    echo "Your version: $ubuntu_version"
-    echo "The script may not work correctly. Do you want to continue? (y/n)"
-    read -r response
-    if [[ "$response" != "y" ]]; then
-        echo "Exiting script"
+    echo "Failed to install UV. Will fall back to pip for package installation."
+fi
+
+# Try different installation methods with appropriate fallbacks
+if [ "$UV_INSTALLED" = true ]; then
+    # UV pip install approach first
+    echo "Attempting installation with UV..."
+    if uv pip install -e . --pre; then
+        echo "Installation with UV pip install -e successful!"
+    else
+        echo "UV pip install failed, trying UV sync..."
+        # Try UV sync as a fallback
+        if uv sync --prerelease=allow; then
+            echo "Installation with UV sync successful!"
+        else
+            echo "UV sync failed, falling back to traditional pip..."
+            # Final fallback to pip
+            if $PIP_CMD install -e .; then
+                echo "Installation with traditional pip successful!"
+                if [ -f requirements.txt ]; then
+                    $PIP_CMD install -r requirements.txt
+                fi
+            else
+                echo "All installation methods failed. Please check your environment and try again."
+                exit 1
+            fi
+        fi
+    fi
+else
+    # If UV isn't installed, use pip directly
+    echo "Installing with pip..."
+    if $PIP_CMD install -e .; then
+        echo "Installation with pip successful!"
+        if [ -f requirements.txt ]; then
+            $PIP_CMD install -r requirements.txt
+        fi
+    else
+        echo "Failed to install with pip. Please check your environment and try again."
         exit 1
     fi
 fi
 
-# Default values
-LITE_NODE=false
-NETWORK="test"
-echo "Running setup..."
-echo -e "WARNING: If you are running in a containerized service (vast.ai, runpod, etc), or with a firewall, 
-         you may need to add the appropriate ports to the firewall rules:
-        Ports:
-        9944 - Websocket. This port is used by Bittensor. This port only accepts connections from localhost.
-               Make sure this port is firewalled off from the public internet domain.
-        9933 - RPC. This port should be opened but it is not used.
-        30333 - p2p socket. This port should accept connections from other subtensor nodes on the internet. 
-                Make sure your firewall allows incoming traffic to this port.
-        We assume that your default outgoing traffic policy is ACCEPT. If not, make sure that outbound traffic on port 30333 is allowed.
-        If you decide to set up a firewall, be careful about blocking your ssh port (22) and losing access to your server.
-        "
-# Function to display usage information
-usage() {
-    echo "Usage: $0 [--lite-node] [--subtensor.network <test|main>] [--redis-host <host>] [--redis-port <port>] [--postgres-host <host>] [--postgres-port <port>] [--postgres-user <user>] [--postgres-password <password>] [--postgres-database <database>]"
-    echo "  --lite-node              Set up a lite node (optional)"
-    echo "  --subtensor.network      Specify the network: test | main (default: test)"
-    echo "  --redis-host             Redis server host (default: localhost)"
-    echo "  --redis-port             Redis server port (default: 6379)"
-    echo "  --postgres-host          PostgreSQL host (default: localhost)"
-    echo "  --postgres-port          PostgreSQL port (default: 5432)"
-    echo "  --postgres-user          PostgreSQL user (default: bettensor)"
-    echo "  --postgres-password     PostgreSQL password (default: bettensor_password)"
-    echo "  --postgres-database     PostgreSQL database (default: bettensor)"
-    exit 1
-}
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --lite-node)
-            LITE_NODE=true
-            shift
-            ;;
-        --subtensor.network)
-            if [[ $2 =~ ^(test|main|local)$ ]]; then
-                NETWORK=$2
-                shift 2
-            else
-                echo "Error: Invalid network specified."
-                usage
-            fi
-            ;;
-        --redis-host)
-            REDIS_HOST=$2
-            shift 2
-            ;;
-        --redis-port)
-            REDIS_PORT=$2
-            shift 2
-            ;;
-        --postgres-host)
-            POSTGRES_HOST=$2
-            shift 2
-            ;;
-        --postgres-port)
-            POSTGRES_PORT=$2
-            shift 2
-            ;;
-        --postgres-user)
-            POSTGRES_USER=$2
-            shift 2
-            ;;
-        --postgres-password)
-            POSTGRES_PASSWORD=$2
-            shift 2
-            ;;
-        --postgres-database)
-            POSTGRES_DATABASE=$2
-            shift 2
-            ;;
-        *)
-            echo "Error: Unknown option $1"
-            usage
-            ;;
-    esac
-done
-
-# Set default values if not provided
-REDIS_HOST=${REDIS_HOST:-localhost}
-REDIS_PORT=${REDIS_PORT:-6379}
-POSTGRES_HOST=${POSTGRES_HOST:-localhost}
-POSTGRES_PORT=${POSTGRES_PORT:-5432}
-POSTGRES_USER=${POSTGRES_USER:-bettensor}
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-bettensor_password}
-POSTGRES_DATABASE=${POSTGRES_DATABASE:-bettensor}
-
-echo "Setting up environment for network: $NETWORK"
-if [ "$LITE_NODE" = true ]; then
-    echo "Setting up as a lite node"
-fi
-
-# Update and install dependencies
-apt-get update 
-apt-get install -y build-essential net-tools clang curl git make libssl-dev protobuf-compiler llvm libudev-dev python-is-python3
-
-# Install Redis
-apt-get install -y redis-server
-systemctl enable redis-server
-systemctl start redis-server
-
-# Install PostgreSQL
-apt-get install -y postgresql postgresql-contrib
-systemctl enable postgresql
-systemctl start postgresql
-
-# Set up PostgreSQL
-su - postgres -c "psql -c \"CREATE DATABASE $POSTGRES_DATABASE;\""
-su - postgres -c "psql -c \"CREATE USER root WITH SUPERUSER PASSWORD '$POSTGRES_PASSWORD';\""
-su - postgres -c "psql -c \"GRANT ALL PRIVILEGES ON DATABASE $POSTGRES_DATABASE TO root;\""
-
-# Modify PostgreSQL configuration to allow root access
-sed -i "s/local   all             postgres                                peer/local   all             postgres                                trust/" /etc/postgresql/*/main/pg_hba.conf
-sed -i "s/local   all             all                                     peer/local   all             all                                     trust/" /etc/postgresql/*/main/pg_hba.conf
-
-# Restart PostgreSQL to apply changes
-systemctl restart postgresql
-
-# Modify Redis configuration to allow connections from anywhere (be cautious with this in production)
-sed -i 's/bind 127.0.0.1/bind 0.0.0.0/' /etc/redis/redis.conf
-systemctl restart redis-server
-
-# Install Rust and subtensor only if lite node is requested
-if [ "$LITE_NODE" = true ]; then
-    echo "Installing Rust and subtensor for lite node..."
-    
-    # Install Rust
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    source $HOME/.cargo/env
-
-    # Set up Rust
-    rustup default stable
-    rustup update
-    rustup target add wasm32-unknown-unknown
-    rustup toolchain install nightly
-    rustup target add --toolchain nightly wasm32-unknown-unknown
-
-    # Clone subtensor repository
-    cd $HOME
-    git clone https://github.com/opentensor/subtensor.git
-    cd subtensor
-    git checkout main
-
-    # Build subtensor
-    cargo build --release --features=runtime-benchmarks
-
-    # Set up the node based on the network
-    if [ "$NETWORK" = "main" ]; then
-        echo "Setting up lite node for main network"
-        ./target/release/node-subtensor --chain raw_spec.json --base-path /tmp/blockchain --sync=warp --execution wasm --wasm-execution compiled --port 30333 --max-runtime-instances 64 --rpc-max-response-size 2048 --rpc-cors all --rpc-port 9933 --bootnodes /ip4/13.58.175.193/tcp/30333/p2p/12D3KooWDe7g2JbNETiKypcKT1KsCEZJbTzEHCn8hpd4PHZ6pdz5 --no-mdns --in-peers 8000 --out-peers 8000 --prometheus-external --rpc-external
-    elif [ "$NETWORK" = "test" ]; then
-        echo "Setting up lite node for test network"
-        ./target/release/node-subtensor --chain raw_testspec.json --base-path /tmp/blockchain --sync=warp --execution wasm --wasm-execution compiled --port 30333 --max-runtime-instances 64 --rpc-max-response-size 2048 --rpc-cors all --rpc-port 9933 --bootnodes /dns/bootnode.test.finney.opentensor.ai/tcp/30333/p2p/12D3KooWPM4mLcKJGtyVtkggqdG84zWrd7Rij6PGQDoijh1X86Vr --no-mdns --in-peers 8000 --out-peers 8000 --prometheus-external --rpc-external
-    else
-        echo "Lite node setup is only available for main and test networks."
+# Install additional dependencies
+echo "Installing additional dependencies..."
+if [ "$UV_INSTALLED" = true ]; then
+    if ! uv pip install redis psycopg2-binary --pre; then
+        echo "Failed to install additional dependencies with UV, trying with pip..."
+        $PIP_CMD install redis psycopg2-binary
     fi
 else
-    echo "Skipping Rust and subtensor installation. Use --lite-node flag to install and set up a lite node."
+    $PIP_CMD install redis psycopg2-binary
 fi
 
-# Install Python 3.10
-apt-get install -y software-properties-common
-add-apt-repository -y ppa:deadsnakes/ppa
-apt-get update
-apt-get install -y python3.10 python3.10-venv python3.10-dev
-
-# Install npm, jq, and pm2
-apt-get install -y npm jq libfuzzy-dev
-npm install -g pm2
-
-# Determine the correct directory structure
-CURRENT_DIR=$(basename "$PWD")
-if [ "$CURRENT_DIR" = "bettensor" ]; then
-    VENV_DIR="../.venv"
-    BETTENSOR_DIR="."
-elif [ "$CURRENT_DIR" = "scripts" ]; then
-    VENV_DIR="../../.venv"
-    BETTENSOR_DIR=".."
+# Check if the installation was successful
+if python3 -c "import bittensor" 2>/dev/null; then
+    echo "==============================================="
+    echo "Bettensor setup completed successfully!"
+    if [ "$UV_INSTALLED" = true ]; then
+        echo "Using UV package manager for improved performance."
+    else
+        echo "Using traditional pip. Consider installing UV for better performance."
+    fi
+    echo "==============================================="
 else
-    echo "Error: Script must be run from either the 'bettensor' or 'scripts' directory."
+    echo "==============================================="
+    echo "WARNING: Setup completed but bittensor package may not be properly installed."
+    echo "Please check the above log for errors and try again if needed."
+    echo "==============================================="
     exit 1
 fi
 
-# Create and activate virtual environment
-python3.10 -m venv "$VENV_DIR"
-source "$VENV_DIR/bin/activate"
-
-# Navigate to the Bettensor directory if necessary
-cd "$BETTENSOR_DIR"
-
-# Install Bettensor dependencies
-pip install -e .
-pip install -r requirements.txt
-
-# Install additional dependencies for Redis and PostgreSQL
-pip install redis psycopg2-binary
-
-# Verify installation
-python -c "import bittensor; print(bittensor.__version__)"
-
-echo "Bettensor setup complete!"
-echo "You can now start mining or validating on the Bettensor subnet, after registering your miner/validator with the subnet."
+exit 0

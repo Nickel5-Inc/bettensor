@@ -1,5 +1,8 @@
 """
 Multiplier calculation for the vesting rewards system.
+
+This module provides functions to calculate reward multipliers based on
+how long and how much stake miners hold.
 """
 
 import logging
@@ -7,22 +10,22 @@ from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Define multiplier tiers
+# Define default multiplier tiers
 # Format: (threshold_value, multiplier_value)
-AMOUNT_HELD_TIERS = [
+_AMOUNT_HELD_TIERS = [
     (0.3, 1.1),  # >30% held: 1.1x multiplier
     (0.5, 1.2),  # >50% held: 1.2x multiplier
     (0.7, 1.3),  # >70% held: 1.3x multiplier
 ]
 
-TIME_HELD_TIERS = [
+_TIME_HELD_TIERS = [
     (14, 1.1),   # >2 weeks: 1.1x multiplier
     (30, 1.2),   # >1 month: 1.2x multiplier
     (60, 1.3),   # >2 months: 1.3x multiplier
 ]
 
 # Maximum multiplier (1.5x)
-MAX_MULTIPLIER = 1.5
+_MAX_MULTIPLIER = 1.5
 
 
 def calculate_multiplier(holding_percentage: float, holding_duration_days: int) -> float:
@@ -41,30 +44,28 @@ def calculate_multiplier(holding_percentage: float, holding_duration_days: int) 
     """
     # Calculate amount held multiplier
     amount_multiplier = 1.0
-    for threshold, multiplier in AMOUNT_HELD_TIERS:
+    for threshold, multiplier in _AMOUNT_HELD_TIERS:
         if holding_percentage >= threshold:
             amount_multiplier = multiplier
     
     # Calculate time held multiplier
     time_multiplier = 1.0
-    for threshold, multiplier in TIME_HELD_TIERS:
+    for threshold, multiplier in _TIME_HELD_TIERS:
         if holding_duration_days >= threshold:
             time_multiplier = multiplier
     
-    # Combine multipliers: We take the average and then apply a bonus
-    # This ensures a balanced approach between amount and time
-    # The formula is designed so that max values (1.3 for both) result in MAX_MULTIPLIER (1.5)
+    # Combine multipliers: We take the average and then apply a scaling factor
     combined_multiplier = (amount_multiplier + time_multiplier) / 2
     
     # Scale to ensure max combined value is MAX_MULTIPLIER
     if combined_multiplier > 1.0:
         # Scale the bonus part (everything above 1.0)
         bonus = combined_multiplier - 1.0
-        scaled_bonus = bonus * (MAX_MULTIPLIER - 1.0) / 0.3  # 0.3 is max possible bonus from avg
+        scaled_bonus = bonus * (_MAX_MULTIPLIER - 1.0) / 0.3  # 0.3 is max possible bonus from avg
         combined_multiplier = 1.0 + scaled_bonus
     
     # Ensure we don't exceed MAX_MULTIPLIER
-    combined_multiplier = min(combined_multiplier, MAX_MULTIPLIER)
+    combined_multiplier = min(combined_multiplier, _MAX_MULTIPLIER)
     
     logger.debug(
         f"Multiplier calculation: holding_pct={holding_percentage:.2f}, "
@@ -84,13 +85,13 @@ def get_tier_thresholds() -> Dict[str, Tuple]:
         Dictionary containing the current tier thresholds and their multipliers
     """
     return {
-        "amount_held_tiers": AMOUNT_HELD_TIERS,
-        "time_held_tiers": TIME_HELD_TIERS,
-        "max_multiplier": MAX_MULTIPLIER
+        "amount_held_tiers": _AMOUNT_HELD_TIERS,
+        "time_held_tiers": _TIME_HELD_TIERS,
+        "max_multiplier": _MAX_MULTIPLIER
     }
 
 
-def update_tier_thresholds(
+def configure_tiers(
     amount_held_tiers=None,
     time_held_tiers=None,
     max_multiplier=None
@@ -103,15 +104,15 @@ def update_tier_thresholds(
         time_held_tiers: New thresholds for time held
         max_multiplier: New maximum multiplier
     """
-    global AMOUNT_HELD_TIERS, TIME_HELD_TIERS, MAX_MULTIPLIER
+    global _AMOUNT_HELD_TIERS, _TIME_HELD_TIERS, _MAX_MULTIPLIER
     
     if amount_held_tiers is not None:
-        AMOUNT_HELD_TIERS = amount_held_tiers
+        _AMOUNT_HELD_TIERS = amount_held_tiers
         
     if time_held_tiers is not None:
-        TIME_HELD_TIERS = time_held_tiers
+        _TIME_HELD_TIERS = time_held_tiers
         
     if max_multiplier is not None:
-        MAX_MULTIPLIER = max_multiplier
+        _MAX_MULTIPLIER = max_multiplier
         
     logger.info("Updated vesting multiplier thresholds") 

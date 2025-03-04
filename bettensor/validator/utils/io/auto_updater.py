@@ -7,39 +7,113 @@ import configparser
 import time
 import asyncio
 import sys
+import shutil
 from pathlib import Path
+
+# Check if UV is installed
+async def is_uv_installed():
+    """Check if UV package manager is installed"""
+    try:
+        result = await asyncio.to_thread(
+            lambda: subprocess.run(
+                ["uv", "--version"], 
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+# Check if a package is installed using UV
+async def uv_check_package_installed(package_name):
+    """Check if a package is installed using UV"""
+    try:
+        result = await asyncio.to_thread(
+            lambda: subprocess.run(
+                ["uv", "pip", "show", package_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+# Check if a package is installed using pip
+async def pip_check_package_installed(package_name):
+    """Check if a package is installed using pip"""
+    try:
+        result = await asyncio.to_thread(
+            lambda: subprocess.run(
+                [sys.executable, "-m", "pip", "show", package_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        )
+        return result.returncode == 0
+    except:
+        return False
 
 async def check_and_install_dependencies():
     """Check and install required dependencies before code execution"""
     try:
+        # Check if UV is available
+        use_uv = await is_uv_installed()
+        bt.logging.info(f"Using {'UV' if use_uv else 'pip'} package manager")
+        
+        if not use_uv:
+            # If UV is not available, we'll try to use pip
+            # But first check if pip is available
+            try:
+                await asyncio.to_thread(
+                    lambda: subprocess.check_call(
+                        [sys.executable, "-m", "ensurepip", "--upgrade"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                )
+                bt.logging.info("Ensured pip is installed")
+            except subprocess.CalledProcessError as e:
+                bt.logging.warning(f"Failed to ensure pip is installed: {e}. Will attempt to continue.")
+        
         # Core dependencies needed for update process
         core_deps = {
-            "pip": "--upgrade pip",
             "setuptools": "--upgrade setuptools",
             "wheel": "--upgrade wheel"
         }
         
         for package, install_args in core_deps.items():
-            try:
-                await asyncio.to_thread(
-                    lambda: subprocess.check_call(
-                        [sys.executable, "-m", "pip", "show", package],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                )
-            except subprocess.CalledProcessError:
-                bt.logging.info(f"Installing core dependency: {package}")
-                try:
-                    await asyncio.to_thread(
-                        lambda: subprocess.check_call(
-                            [sys.executable, "-m", "pip", "install"] + install_args.split(),
-                            stdout=subprocess.DEVNULL
+            if use_uv:
+                # Check if package is installed with UV before installing
+                is_installed = await uv_check_package_installed(package)
+                if not is_installed:
+                    bt.logging.info(f"Installing core dependency with UV: {package}")
+                    try:
+                        await asyncio.to_thread(
+                            lambda: subprocess.check_call(
+                                ["uv", "pip", "install"] + install_args.split(),
+                                stdout=subprocess.DEVNULL
+                            )
                         )
-                    )
-                except subprocess.CalledProcessError as e:
-                    bt.logging.error(f"Failed to install {package}: {e}")
-                    return False
+                    except subprocess.CalledProcessError as e:
+                        bt.logging.error(f"Failed to install {package} with UV: {e}")
+                        return False
+            else:
+                # Check if package is installed with pip before installing
+                is_installed = await pip_check_package_installed(package)
+                if not is_installed:
+                    bt.logging.info(f"Installing core dependency with pip: {package}")
+                    try:
+                        await asyncio.to_thread(
+                            lambda: subprocess.check_call(
+                                [sys.executable, "-m", "pip", "install"] + install_args.split(),
+                                stdout=subprocess.DEVNULL
+                            )
+                        )
+                    except subprocess.CalledProcessError as e:
+                        bt.logging.error(f"Failed to install {package} with pip: {e}")
+                        return False
         
         return True
     except Exception as e:
@@ -53,13 +127,24 @@ async def install_requirements():
         if not requirements_path.exists():
             bt.logging.error("requirements.txt not found")
             return False
-            
-        bt.logging.info("Installing project requirements...")
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", "-r", "requirements.txt",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        
+        # Check if UV is available
+        use_uv = await is_uv_installed()
+        
+        bt.logging.info(f"Installing project requirements using {'UV' if use_uv else 'pip'}...")
+        
+        if use_uv:
+            process = await asyncio.create_subprocess_exec(
+                "uv", "pip", "install", "-r", "requirements.txt",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pip", "install", "-r", "requirements.txt",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
         
         stdout, stderr = await process.communicate()
         

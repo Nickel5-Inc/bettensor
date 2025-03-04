@@ -15,6 +15,7 @@ Outputs:
 import os
 from datetime import datetime, timezone, timedelta, date
 import json
+import random
 import numpy as np
 import time
 import traceback
@@ -24,14 +25,18 @@ import async_timeout
 import warnings
 import math
 import bittensor as bt
+from sqlalchemy import text
+from collections import defaultdict, Counter
 
 from pydantic import BaseModel, field_validator, validator
-from typing import List, Dict, Optional, Any, Tuple, Union, Set
+from typing import List, Dict, Any, Optional, Union, Tuple, Set
 from enum import Enum
+import pandas as pd
 
 from bettensor.validator.utils.scoring.scoring_data import ScoringData
-from bettensor.validator.utils.entropy_system import EntropySystem
+from .entropy_system import EntropySystem
 from bettensor.validator.utils.database.database_init import initialize_database
+from bettensor.validator.utils.database.database_manager import DatabaseManager
 
 # Global reference to active scoring system
 _ACTIVE_SCORING_SYSTEM = None
@@ -66,9 +71,12 @@ class ScoringSystem:
         self.num_tiers = (
             7  # 5 tiers + 2 for invalid UIDs (0) and empty network slots (-1)
         )
-        self.valid_uids = set()  # Initialize as an empty set
-        self.validator = validator
-        self.reference_date = reference_date
+        
+        # Initialize internal state variables
+        self.init = False  # Flag to track if this is the first initialization
+        self.current_day = None
+        self.current_date = None
+        self.last_update_date = None  # Will store the last day processed as a date object (no time)
         self.invalid_uids = []
         self.epsilon = 1e-8  # Small constant to prevent division by zero
         self.db_manager = db_manager
@@ -153,9 +161,9 @@ class ScoringSystem:
         self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager)
         self.incentives = []
 
-        self.current_day = 0
-        self.current_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)  # Initialize to start of current UTC day
-        self.last_update_date = None  # Will store the last day processed as a date object (no time)
+        self.valid_uids = set()  # Initialize as an empty set
+        self.validator = validator
+        self.reference_date = reference_date
 
         self.scoring_data = ScoringData(self)
 
@@ -170,10 +178,18 @@ class ScoringSystem:
         bt.logging.info("Populating amount_wagered from prediction data...")
         
         try:
+            # Convert date objects to datetime if needed
+            if isinstance(self.reference_date, date) and not isinstance(self.reference_date, datetime):
+                self.reference_date = datetime.combine(self.reference_date, datetime.min.time())
+            
+            if isinstance(self.current_date, date) and not isinstance(self.current_date, datetime):
+                self.current_date = datetime.combine(self.current_date, datetime.min.time())
+            
             # Ensure reference date is timezone-aware
-            if self.reference_date.tzinfo is None:
+            if hasattr(self.reference_date, 'tzinfo') and self.reference_date.tzinfo is None:
                 self.reference_date = self.reference_date.replace(tzinfo=timezone.utc)
-            if self.current_date.tzinfo is None:
+                
+            if hasattr(self.current_date, 'tzinfo') and self.current_date.tzinfo is None:
                 self.current_date = self.current_date.replace(tzinfo=timezone.utc)
             
             # Get predictions for the last max_days days
@@ -452,15 +468,18 @@ class ScoringSystem:
                 avg_roi = np.mean(active_roi)
                 roi_requirement = avg_roi >= 0
                 
-                bt.logging.trace(f"ROI requirement for tier {tier-1}:")
+                # Fix tier display offset: tier-indexing is 0-based, but display is 1-based
+                display_tier = tier - 1  # Adjust tier for display
+                bt.logging.trace(f"ROI requirement for tier {display_tier}:")
                 bt.logging.trace(f"  15-day average ROI: {avg_roi:.4f}")
                 bt.logging.trace(f"  Requirement met: {roi_requirement}")
                 
                 if not roi_requirement:
-                    bt.logging.info(f"Miner {miner} failed ROI requirement for tier {tier-1} with avg ROI {avg_roi:.4f}")
+                    bt.logging.info(f"Miner {miner} failed ROI requirement for tier {display_tier} with avg ROI {avg_roi:.4f}")
         
-        # Log tier configuration
-        bt.logging.trace(f"Checking tier {tier-1} requirements for miner {miner}:")
+        # Log tier configuration - Fix tier display offset
+        display_tier = tier - 1  # Adjust tier for display
+        bt.logging.trace(f"Checking tier {display_tier} requirements for miner {miner}:")
         bt.logging.trace(f"Window size: {window} days")
         bt.logging.trace(f"Minimum wager required: {min_wager}")
         bt.logging.trace(f"Minimum active days required: {min_days_required} ({min_active_days_ratio*100:.0f}% of window)")

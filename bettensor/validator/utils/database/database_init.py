@@ -59,10 +59,13 @@ def initialize_database():
                 SELECT 'ALTER TABLE miner_stats ADD COLUMN most_recent_weight REAL DEFAULT 0.0;' as sql
             )
         )
+        ELSE (
+            SELECT '' as sql
+        )
         END;
     """)
     
-    # Add new ROI tracking columns if they don't exist
+    # Add miner_15_day_roi column to miner_stats if it doesn't exist
     statements.append("""
         SELECT CASE 
             WHEN NOT EXISTS(
@@ -73,9 +76,13 @@ def initialize_database():
                 SELECT 'ALTER TABLE miner_stats ADD COLUMN miner_15_day_roi REAL DEFAULT 0.0;' as sql
             )
         )
+        ELSE (
+            SELECT '' as sql
+        )
         END;
     """)
     
+    # Add miner_30_day_roi column to miner_stats if it doesn't exist
     statements.append("""
         SELECT CASE 
             WHEN NOT EXISTS(
@@ -86,9 +93,13 @@ def initialize_database():
                 SELECT 'ALTER TABLE miner_stats ADD COLUMN miner_30_day_roi REAL DEFAULT 0.0;' as sql
             )
         )
+        ELSE (
+            SELECT '' as sql
+        )
         END;
     """)
     
+    # Add miner_45_day_roi column to miner_stats if it doesn't exist
     statements.append("""
         SELECT CASE 
             WHEN NOT EXISTS(
@@ -99,10 +110,17 @@ def initialize_database():
                 SELECT 'ALTER TABLE miner_stats ADD COLUMN miner_45_day_roi REAL DEFAULT 0.0;' as sql
             )
         )
+        ELSE (
+            SELECT '' as sql
+        )
         END;
     """)
     
-    # 3. Create backup table
+    # 3. Handle backup table - first drop it if it exists then recreate it with all columns
+    statements.append("""
+        DROP TABLE IF EXISTS miner_stats_backup;
+    """)
+    
     statements.append("""
         CREATE TABLE IF NOT EXISTS miner_stats_backup (
             miner_uid INTEGER,
@@ -135,49 +153,18 @@ def initialize_database():
         )
     """)
     
-    # Add new ROI tracking columns to miner_stats_backup if they don't exist
+    # 4. Backup existing data with proper casting - handle only the base columns
     statements.append("""
-        SELECT CASE 
-            WHEN NOT EXISTS(
-                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_15_day_roi'
-            )
-        THEN (
-            SELECT sql FROM (
-                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN miner_15_day_roi REAL DEFAULT 0.0;' as sql
-            )
+        INSERT OR IGNORE INTO miner_stats_backup(
+            miner_uid, miner_hotkey, miner_coldkey, miner_rank, miner_status,
+            miner_cash, miner_current_incentive, miner_current_tier, miner_current_scoring_window,
+            miner_current_composite_score, miner_current_entropy_score, miner_current_sharpe_ratio,
+            miner_current_sortino_ratio, miner_current_roi, miner_current_clv_avg,
+            miner_last_prediction_date, miner_lifetime_earnings, miner_lifetime_wager_amount,
+            miner_lifetime_roi, miner_lifetime_predictions, miner_lifetime_wins,
+            miner_lifetime_losses, miner_win_loss_ratio, most_recent_weight,
+            miner_15_day_roi, miner_30_day_roi, miner_45_day_roi
         )
-        END;
-    """)
-    
-    statements.append("""
-        SELECT CASE 
-            WHEN NOT EXISTS(
-                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_30_day_roi'
-            )
-        THEN (
-            SELECT sql FROM (
-                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN miner_30_day_roi REAL DEFAULT 0.0;' as sql
-            )
-        )
-        END;
-    """)
-    
-    statements.append("""
-        SELECT CASE 
-            WHEN NOT EXISTS(
-                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_45_day_roi'
-            )
-        THEN (
-            SELECT sql FROM (
-                SELECT 'ALTER TABLE miner_stats_backup ADD COLUMN miner_45_day_roi REAL DEFAULT 0.0;' as sql
-            )
-        )
-        END;
-    """)
-    
-    # 4. Backup existing data with proper casting
-    statements.append("""
-        INSERT OR IGNORE INTO miner_stats_backup 
         SELECT 
             CAST(miner_uid AS INTEGER),
             miner_hotkey,
@@ -203,15 +190,23 @@ def initialize_database():
             CAST(COALESCE(miner_lifetime_losses, 0) AS INTEGER),
             CAST(COALESCE(miner_win_loss_ratio, 0.0) AS REAL),
             CAST(COALESCE(most_recent_weight, 0.0) AS REAL),
-            CAST(COALESCE(miner_15_day_roi, 0.0) AS REAL),
-            CAST(COALESCE(miner_30_day_roi, 0.0) AS REAL),
-            CAST(COALESCE(miner_45_day_roi, 0.0) AS REAL)
+            0.0,  -- Default value for miner_15_day_roi 
+            0.0,  -- Default value for miner_30_day_roi
+            0.0   -- Default value for miner_45_day_roi
         FROM miner_stats WHERE EXISTS (SELECT 1 FROM miner_stats)
     """)
-    
-    # 5. Restore from backup with proper casting
+
+    # 5. Update the restore statement to explicitly list columns for compatibility
     statements.append("""
-        INSERT OR REPLACE INTO miner_stats 
+        INSERT OR REPLACE INTO miner_stats(
+            miner_uid, miner_hotkey, miner_coldkey, miner_rank, miner_status,
+            miner_cash, miner_current_incentive, miner_current_tier, miner_current_scoring_window,
+            miner_current_composite_score, miner_current_entropy_score, miner_current_sharpe_ratio,
+            miner_current_sortino_ratio, miner_current_roi, miner_current_clv_avg,
+            miner_last_prediction_date, miner_lifetime_earnings, miner_lifetime_wager_amount,
+            miner_lifetime_roi, miner_lifetime_predictions, miner_lifetime_wins,
+            miner_lifetime_losses, miner_win_loss_ratio, most_recent_weight
+        )
         SELECT 
             CAST(miner_uid AS INTEGER) as miner_uid,
             miner_hotkey,
@@ -236,12 +231,64 @@ def initialize_database():
             CAST(COALESCE(miner_lifetime_wins, 0) AS INTEGER) as miner_lifetime_wins,
             CAST(COALESCE(miner_lifetime_losses, 0) AS INTEGER) as miner_lifetime_losses,
             CAST(COALESCE(miner_win_loss_ratio, 0.0) AS REAL) as miner_win_loss_ratio,
-            CAST(COALESCE(most_recent_weight, 0.0) AS REAL) as most_recent_weight,
-            CAST(COALESCE(miner_15_day_roi, 0.0) AS REAL) as miner_15_day_roi,
-            CAST(COALESCE(miner_30_day_roi, 0.0) AS REAL) as miner_30_day_roi,
-            CAST(COALESCE(miner_45_day_roi, 0.0) AS REAL) as miner_45_day_roi
+            CAST(COALESCE(most_recent_weight, 0.0) AS REAL) as most_recent_weight
         FROM miner_stats_backup 
         WHERE EXISTS (SELECT 1 FROM miner_stats_backup)
+    """)
+    
+    # 6. Copy ROI values from backup if they exist
+    statements.append("""
+        SELECT CASE 
+            WHEN EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_15_day_roi'
+            ) AND EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='miner_15_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'UPDATE miner_stats SET miner_15_day_roi = (SELECT CAST(COALESCE(miner_15_day_roi, 0.0) AS REAL) FROM miner_stats_backup WHERE miner_stats_backup.miner_uid = miner_stats.miner_uid);' as sql
+            )
+        )
+        ELSE (
+            SELECT '' as sql
+        )
+        END;
+    """)
+    
+    statements.append("""
+        SELECT CASE 
+            WHEN EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_30_day_roi'
+            ) AND EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='miner_30_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'UPDATE miner_stats SET miner_30_day_roi = (SELECT CAST(COALESCE(miner_30_day_roi, 0.0) AS REAL) FROM miner_stats_backup WHERE miner_stats_backup.miner_uid = miner_stats.miner_uid);' as sql
+            )
+        )
+        ELSE (
+            SELECT '' as sql
+        )
+        END;
+    """)
+    
+    statements.append("""
+        SELECT CASE 
+            WHEN EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats_backup') WHERE name='miner_45_day_roi'
+            ) AND EXISTS(
+                SELECT 1 FROM pragma_table_info('miner_stats') WHERE name='miner_45_day_roi'
+            )
+        THEN (
+            SELECT sql FROM (
+                SELECT 'UPDATE miner_stats SET miner_45_day_roi = (SELECT CAST(COALESCE(miner_45_day_roi, 0.0) AS REAL) FROM miner_stats_backup WHERE miner_stats_backup.miner_uid = miner_stats.miner_uid);' as sql
+            )
+        )
+        ELSE (
+            SELECT '' as sql
+        )
+        END;
     """)
     
     # 6. Create dependent tables

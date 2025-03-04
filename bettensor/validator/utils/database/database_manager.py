@@ -311,51 +311,66 @@ class DatabaseManager:
                 bt.logging.debug(f"Error closing connection: {e}")
 
     async def cleanup(self):
-        """Cleanup database resources"""
-        try:
-            self._shutting_down = True
-            
-            # Set cleanup event to prevent new sessions
-            self._cleanup_event.set()
-            
-            # Wait briefly for any in-progress operations
-            await asyncio.sleep(0.5)
-            
-            # Close active sessions with retries
-            retry_count = 3
-            for attempt in range(retry_count):
-                try:
-                    # Close all active sessions
-                    for session in list(self._active_sessions):
-                        try:
-                            if not session.is_closed:
-                                await session.close()
-                        except Exception as e:
-                            bt.logging.debug(f"Session close error (attempt {attempt+1}): {e}")
-                    self._active_sessions.clear()
-                    break
-                except Exception as e:
-                    if attempt == retry_count - 1:
-                        bt.logging.error(f"Failed to close sessions after {retry_count} attempts: {e}")
-                    await asyncio.sleep(0.5)
-            
-            # Dispose engine with retries
-            if hasattr(self, 'engine'):
-                for attempt in range(retry_count):
+        """Close the database connection and clean up resources."""
+        self._shutting_down = True
+        bt.logging.info("Closing database connections...")
+        
+        # 1. Set the shutting down flag to prevent new connections
+        self._shutting_down = True
+        
+        # 2. Close all active sessions
+        sessions_to_close = list(self._active_sessions)
+        if sessions_to_close:
+            bt.logging.debug(f"Closing {len(sessions_to_close)} active database sessions")
+            for session in sessions_to_close:
+                if isinstance(session, weakref.ref):
+                    session = session()
+                if session:
                     try:
-                        await self.engine.dispose()
-                        break
+                        await self.close_session(session)
                     except Exception as e:
-                        if attempt == retry_count - 1:
-                            bt.logging.error(f"Failed to dispose engine after {retry_count} attempts: {e}")
-                        await asyncio.sleep(0.5)
-                
-            bt.logging.debug("Database cleanup completed")
-            
+                        bt.logging.warning(f"Error closing session: {e}")
+        
+        # 3. Run WAL checkpoints to ensure data is persisted
+        try:
+            # Create a temporary session for checkpointing
+            session_factory = sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+            async with session_factory() as session:
+                try:
+                    bt.logging.debug("Running final WAL checkpoint")
+                    # Try to run a full checkpoint
+                    await session.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
+                except Exception as e:
+                    bt.logging.warning(f"Final checkpoint failed: {e}")
         except Exception as e:
-            bt.logging.error(f"Error during database cleanup: {e}")
-            if not isinstance(e, asyncio.CancelledError):
-                bt.logging.error(traceback.format_exc())
+            bt.logging.warning(f"Error during final checkpoint: {e}")
+        
+        # 4. Close the engine
+        if hasattr(self, 'engine') and self.engine:
+            bt.logging.debug("Disposing SQLAlchemy engine")
+            try:
+                await self.engine.dispose()
+            except Exception as e:
+                bt.logging.warning(f"Error disposing engine: {e}")
+        
+        # 5. Close the queue manager connection if it exists
+        if hasattr(self, 'queue') and self.queue:
+            try:
+                bt.logging.debug("Closing queue manager")
+                await self.queue.close()
+            except Exception as e:
+                bt.logging.warning(f"Error closing queue manager: {e}")
+        
+        # 6. Legacy connection support for backward compatibility
+        if hasattr(self, 'conn') and self.conn:
+            try:
+                bt.logging.debug("Closing legacy connection")
+                await self.conn.close()
+                self.conn = None
+            except Exception as e:
+                bt.logging.warning(f"Error closing legacy connection: {e}")
+        
+        bt.logging.info("Database connections closed successfully")
 
     async def close_session(self, session):
         """Safely close a database session"""
@@ -626,48 +641,71 @@ class DatabaseManager:
             raise
 
     async def close(self):
-        """Close the database connection."""
-        if self.conn:
-            await self.conn.close()
-            self.conn = None
-
-    async def cleanup(self):
-        """Clean shutdown of database connections"""
+        """Close the database connection and clean up resources."""
+        self._shutting_down = True
+        bt.logging.info("Closing database connections...")
+        
+        # 1. Set the shutting down flag to prevent new connections
+        self._shutting_down = True
+        
+        # 2. Close all active sessions
+        sessions_to_close = list(self._active_sessions)
+        if sessions_to_close:
+            bt.logging.debug(f"Closing {len(sessions_to_close)} active database sessions")
+            for session in sessions_to_close:
+                if isinstance(session, weakref.ref):
+                    session = session()
+                if session:
+                    try:
+                        await self.close_session(session)
+                    except Exception as e:
+                        bt.logging.warning(f"Error closing session: {e}")
+        
+        # 3. Run WAL checkpoints to ensure data is persisted
         try:
-            async with self.get_session() as session:
-                # Try progressive checkpointing
+            # Create a temporary session for checkpointing
+            session_factory = sessionmaker(self.engine, class_=AsyncSession, expire_on_commit=False)
+            async with session_factory() as session:
                 try:
-                    await session.execute(text("PRAGMA wal_checkpoint(PASSIVE)"))
-                    await asyncio.sleep(1)
-                    
-                    await session.execute(text("PRAGMA wal_checkpoint(RESTART)"))
-                    await asyncio.sleep(1)
-                    
+                    bt.logging.debug("Running final WAL checkpoint")
+                    # Try to run a full checkpoint
                     await session.execute(text("PRAGMA wal_checkpoint(TRUNCATE)"))
                 except Exception as e:
-                    bt.logging.error(f"Checkpoint error during cleanup: {e}")
-                
-                # Ensure WAL mode is disabled before closing
-                await session.execute(text("PRAGMA journal_mode = DELETE"))
-                
-                # Close all connections
-                await self.engine.dispose()
-                
-                # Verify WAL cleanup
-                wal_path = Path(self.db_path).with_suffix('.db-wal')
-                if wal_path.exists():
-                    size = wal_path.stat().st_size
-                    if size > 0:
-                        bt.logging.warning(f"WAL file still has {size} bytes after cleanup")
-                    else:
-                        bt.logging.info("WAL file successfully cleared")
-                    
+                    bt.logging.warning(f"Final checkpoint failed: {e}")
         except Exception as e:
-            bt.logging.error(f"Error during database cleanup: {e}")
-            raise
+            bt.logging.warning(f"Error during final checkpoint: {e}")
+        
+        # 4. Close the engine
+        if hasattr(self, 'engine') and self.engine:
+            bt.logging.debug("Disposing SQLAlchemy engine")
+            try:
+                await self.engine.dispose()
+            except Exception as e:
+                bt.logging.warning(f"Error disposing engine: {e}")
+        
+        # 5. Close the queue manager connection if it exists
+        if hasattr(self, 'queue') and self.queue:
+            try:
+                bt.logging.debug("Closing queue manager")
+                await self.queue.close()
+            except Exception as e:
+                bt.logging.warning(f"Error closing queue manager: {e}")
+        
+        # 6. Legacy connection support for backward compatibility
+        if hasattr(self, 'conn') and self.conn:
+            try:
+                bt.logging.debug("Closing legacy connection")
+                await self.conn.close()
+                self.conn = None
+            except Exception as e:
+                bt.logging.warning(f"Error closing legacy connection: {e}")
+        
+        bt.logging.info("Database connections closed successfully")
 
-    
-    
+    async def cleanup(self):
+        """Clean shutdown of database connections (legacy method)"""
+        await self.close()
+
     async def reconnect(self):
         """Force a reconnection to the database"""
         if self.conn:
@@ -1005,6 +1043,9 @@ class DatabaseManager:
             force (bool): If True, forces a WAL checkpoint after initialization
         """
         try:
+            # Create database directory if it doesn't exist
+            os.makedirs(os.path.dirname(self.database_path), exist_ok=True)
+            
             # First set all PRAGMA settings
             async with self.async_session() as session:
                 # Set optimized pragmas
@@ -1019,6 +1060,18 @@ class DatabaseManager:
                 await session.execute(text("PRAGMA read_uncommitted = 1"))
                 await session.commit()
             
+            # Add _init_check table to track initialization state
+            async with self.async_session() as session:
+                await session.execute(text(
+                    """
+                    CREATE TABLE IF NOT EXISTS _init_check (
+                        initialization_date TIMESTAMP,
+                        version TEXT
+                    )
+                    """
+                ))
+                await session.commit()
+            
             # Then create/update tables
             statements = initialize_database()
             async with self.async_session() as session:
@@ -1028,7 +1081,34 @@ class DatabaseManager:
                     except Exception as e:
                         bt.logging.error(f"Error executing initialization statement: {e}")
                         bt.logging.error(f"Failed statement: {statement}")
-                        raise
+                        # Continue with other statements instead of raising an exception
+                        # Since some statements might fail but others might succeed
+                
+                # Check and add ROI columns to miner_stats if they don't exist
+                bt.logging.info("Checking for required ROI columns in miner_stats table...")
+                for column, column_type in [
+                    ('miner_15_day_roi', 'REAL DEFAULT 0.0'),
+                    ('miner_30_day_roi', 'REAL DEFAULT 0.0'),
+                    ('miner_45_day_roi', 'REAL DEFAULT 0.0')
+                ]:
+                    try:
+                        # Check if column exists - using a method that doesn't require awaiting None
+                        result = await session.execute(text(
+                            f"SELECT COUNT(*) FROM pragma_table_info('miner_stats') WHERE name='{column}'"
+                        ))
+                        count = result.scalar()
+                        
+                        if count == 0:
+                            bt.logging.info(f"Adding missing column {column} to miner_stats...")
+                            await session.execute(text(
+                                f"ALTER TABLE miner_stats ADD COLUMN {column} {column_type}"
+                            ))
+                            bt.logging.info(f"Added column {column} to miner_stats table")
+                        else:
+                            bt.logging.debug(f"Column {column} already exists in miner_stats table")
+                    except Exception as e:
+                        bt.logging.error(f"Error checking/adding column {column}: {e}")
+                
                 await session.commit()
                 
                 if force:

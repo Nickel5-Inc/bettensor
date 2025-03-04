@@ -33,9 +33,10 @@ Clone the Bettensor repository and install the required dependencies:
 ```bash
 git clone https://github.com/bettensor/bettensor.git
 cd bettensor
-pip install -r requirements.txt
-pip install -e .
+source ./scripts/setup.sh
 ```
+
+Our setup script uses `uv`, a faster Python package manager, for improved installation speed. The script will automatically fall back to `pip` if `uv` cannot be installed.
 
 ## Miner Setup
 

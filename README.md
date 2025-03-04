@@ -8,7 +8,7 @@
 
 A sports prediction subnet on the Bittensor network
 
-[Installation](#installation-and-setup) • [Validators](#guide-for-validators) • [Miners](#guide-for-miners) • [Release Details](#details-for-current-release-version-v001-beta) • [Website](https://bettensor.com) • [Official Discord Server](https://discord.gg/YVyVHHEd) 
+[Installation](#installation-and-setup) • [Validators](#guide-for-validators) • [Miners](#guide-for-miners) • [Release Details](#details-for-current-release-version-v001-beta) • [UV Transition](docs/uv_transition.md) • [Website](https://bettensor.com) • [Official Discord Server](https://discord.gg/YVyVHHEd) 
 
 </div>
 
@@ -65,6 +65,8 @@ source ./scripts/setup.sh
 
    - additionally, the script takes `--subtensor.network` as an optional flag. if you want to run the lite node on testnet, run `source ./scripts/setup.sh --subtensor.network test` , or `main` for mainnet.
 
+   - our setup script now uses `uv`, a faster Python package manager, for improved installation speed. The script will automatically fall back to `pip` if `uv` cannot be installed.
+
 7. Set up a Bittensor wallet (guide [here](https://docs.bittensor.com/getting-started/wallets)).
 
 8. Register on the subnet:
@@ -80,7 +82,31 @@ btcli subnet register --netuid 30 --wallet.name <YOUR_COLDKEY> --wallet.hotkey <
 btcli subnet register --netuid 181 --wallet.name <YOUR_COLDKEY> --wallet.hotkey <YOUR_HOTKEY> --subtensor.network test
  ```
 
+## Package Management with UV
 
+Bettensor has transitioned to using `uv`, a modern Python package manager that offers significant improvements in speed and reliability over traditional `pip`. Key benefits include:
+
+- **Faster installations**: UV can install packages up to 10-100x faster than pip
+- **Better dependency resolution**: Reduces conflicts and ensures more stable environments
+- **Enhanced performance**: Uses Rust under the hood for better performance
+- **Native virtual environment management**: Create and manage virtual environments directly with UV
+- **Direct pyproject.toml integration**: Works natively with modern Python packaging standards
+
+Our project now uses UV for improved package management:
+1. Using `uv venv` for virtual environment management
+2. Using `uv pip install -e .` for fast editable installation
+3. Using `uv sync` for dependency synchronization
+4. Leveraging UV's performance benefits throughout
+
+For existing users, we provide a migration script to help you transition to a UV environment:
+
+```bash
+bash scripts/migrate_to_uv.sh
+```
+
+This will create a fresh UV-based virtual environment in `.venv` and install all necessary dependencies.
+
+For more details about UV and how to use it effectively with Bettensor, please see our [UV Transition Guide](docs/uv_transition.md).
 
 
 ## Guide for Validators

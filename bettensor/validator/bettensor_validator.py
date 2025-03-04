@@ -720,21 +720,98 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
     async def cleanup(self):
         """Cleanup validator resources"""
         bt.logging.info("Cleaning up validator resources...")
-        try:
-            # Cancel any pending tasks first
-            if hasattr(self, 'watchdog'):
+        
+        # Check if we already cleaned up
+        if getattr(self, '_cleaned_up', False):
+            bt.logging.info("Validator already cleaned up, skipping")
+            return
+        
+        # Track any errors to return at the end
+        cleanup_errors = []
+        
+        # Set shutdown flag
+        self.is_shutting_down = True
+        
+        # 1. Handle watchdog cleanup
+        if hasattr(self, 'watchdog'):
+            try:
+                bt.logging.debug("Cleaning up watchdog...")
                 self.watchdog.cleanup()
-                
-            # Wait briefly for tasks to cancel
-            await asyncio.sleep(1)
-            
-            # Then cleanup database
-            if hasattr(self, 'db_manager'):
-                await self.db_manager.cleanup()
-                
-            # Finally shutdown executor
-            if hasattr(self, 'executor'):
-                self.executor.shutdown(wait=True)
-                
-        except Exception as e:
-            bt.logging.error(f"Error during cleanup: {str(e)}")
+                bt.logging.debug("Watchdog cleanup completed")
+            except Exception as e:
+                error_msg = f"Error during watchdog cleanup: {str(e)}"
+                bt.logging.error(error_msg)
+                cleanup_errors.append(error_msg)
+        
+        # 2. Save state before database cleanup if possible
+        if hasattr(self, 'db_manager') and hasattr(self, 'save_state'):
+            try:
+                bt.logging.debug("Saving state before shutdown...")
+                try:
+                    await asyncio.wait_for(self.save_state(), timeout=10)
+                    bt.logging.debug("State saved successfully")
+                except asyncio.TimeoutError:
+                    bt.logging.warning("State saving timed out after 10 seconds")
+                    cleanup_errors.append("State saving timed out")
+            except Exception as e:
+                error_msg = f"Error saving state during shutdown: {str(e)}"
+                bt.logging.error(error_msg)
+                cleanup_errors.append(error_msg)
+        
+        # 3. Cancel any pending tasks
+        # Check for background tasks and cancel them
+        if hasattr(self, 'tasks') and self.tasks:
+            bt.logging.debug(f"Cancelling {len(self.tasks)} background tasks...")
+            for task_name, task in list(self.tasks.items()):
+                if not task.done():
+                    bt.logging.debug(f"Cancelling task: {task_name}")
+                    task.cancel()
+                    try:
+                        # Give task a short time to respond to cancellation
+                        await asyncio.wait_for(task, timeout=2)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        # This is expected
+                        pass
+                    except Exception as e:
+                        bt.logging.warning(f"Error while cancelling {task_name}: {str(e)}")
+            bt.logging.debug("All tasks cancelled")
+        
+        # 4. Close database connection
+        if hasattr(self, 'db_manager'):
+            try:
+                bt.logging.debug("Closing database connection...")
+                # Use a timeout for database operations
+                try:
+                    await asyncio.wait_for(self.db_manager.close(), timeout=5)
+                    bt.logging.debug("Database connection closed successfully")
+                except asyncio.TimeoutError:
+                    bt.logging.warning("Database closing timed out after 5 seconds")
+                    cleanup_errors.append("Database closing timed out")
+            except Exception as e:
+                error_msg = f"Error closing database: {str(e)}"
+                bt.logging.error(error_msg)
+                cleanup_errors.append(error_msg)
+        
+        # 5. Close axon if it exists
+        if hasattr(self, 'axon') and hasattr(self.axon, 'close'):
+            try:
+                bt.logging.debug("Closing axon...")
+                self.axon.close()
+                bt.logging.debug("Axon closed successfully")
+            except Exception as e:
+                error_msg = f"Error closing axon: {str(e)}"
+                bt.logging.error(error_msg)
+                cleanup_errors.append(error_msg)
+        
+        # 6. Mark as cleaned up
+        self._cleaned_up = True
+        
+        bt.logging.info("Validator cleanup completed")
+        if cleanup_errors:
+            bt.logging.warning(f"The following cleanup errors occurred: {', '.join(cleanup_errors)}")
+        
+        # Give a moment for logs to be written
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass

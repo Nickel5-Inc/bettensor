@@ -32,7 +32,7 @@ class MinerStats(BaseModel):
     model_config = {
         "arbitrary_types_allowed": True,
         "validate_assignment": True,
-        "extra": "allow"
+        "extra": "ignore"  # Changed from "allow" to "ignore" to handle unexpected fields
     }
 
     miner_hotkey: str = Field(..., description="Miner hotkey")
@@ -58,6 +58,11 @@ class MinerStats(BaseModel):
     miner_lifetime_losses: str = Field(..., description="Miner lifetime losses")
     miner_win_loss_ratio: str = Field(..., description="Miner win/loss ratio")
     most_recent_weight: Optional[str] = Field(None, description="Most recent weight")
+    
+    # Add ROI tracking columns 
+    miner_15_day_roi: Optional[str] = Field(None, description="Miner 15-day ROI")
+    miner_30_day_roi: Optional[str] = Field(None, description="Miner 30-day ROI")
+    miner_45_day_roi: Optional[str] = Field(None, description="Miner 45-day ROI")
 
     @classmethod
     def create(cls, row):
@@ -87,7 +92,10 @@ class MinerStats(BaseModel):
             miner_lifetime_wins=str(row[19]),
             miner_lifetime_losses=str(row[20]),
             miner_win_loss_ratio=str(row[21]),
-            most_recent_weight=str(row[22]) if len(row) > 22 and row[22] is not None else None
+            most_recent_weight=str(row[22]) if len(row) > 22 and row[22] is not None else None,
+            miner_15_day_roi=str(row[23]) if len(row) > 23 and row[23] is not None else None,
+            miner_30_day_roi=str(row[24]) if len(row) > 24 and row[24] is not None else None,
+            miner_45_day_roi=str(row[25]) if len(row) > 25 and row[25] is not None else None
         )
 
 
@@ -97,7 +105,7 @@ class Metadata(BaseModel):
     model_config = {
         "arbitrary_types_allowed": True,
         "validate_assignment": True,
-        "extra": "allow"
+        "extra": "ignore"
     }
 
     synapse_id: str = Field(..., description="UUID of the synapse")
@@ -105,6 +113,13 @@ class Metadata(BaseModel):
     timestamp: str = Field(..., description="Timestamp of the synapse")
     subnet_version: str = Field(..., description="Subnet version of the neuron sending the synapse")
     synapse_type: str = Field(..., description="Type of the synapse | 'prediction' or 'game_data'")
+    
+    # Add headers that might be in new protocol version
+    name: Optional[str] = Field(default=None)
+    timeout: Optional[float] = Field(default=None)
+    header_size: Optional[int] = Field(default=None)
+    total_size: Optional[int] = Field(default=None)
+    computed_body_hash: Optional[str] = Field(default=None)
 
     @classmethod
     def create(cls, subnet_version, neuron_uid, synapse_type):
@@ -134,6 +149,11 @@ class TeamGamePrediction(BaseModel):
     """
     Data class from json. Will need to be modified in the future for more complex prediction types.
     """
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "ignore"  # Changed from default to "ignore" to handle unexpected fields
+    }
 
     prediction_id: str = Field(..., description="UUID of the prediction")
     game_id: str = Field(..., description="Game ID - Not Unique (External ID from API)")
@@ -162,8 +182,7 @@ class TeamGamePrediction(BaseModel):
     )
     outcome: str = Field(..., description="Outcome of prediction")
     payout: float = Field(
-        ...,
-        description="Payout of prediction - for local tracking, not used in scoring",
+        ..., description="Payout of the prediction, null if prediction has not been settled"
     )
 
 
@@ -171,6 +190,11 @@ class TeamGame(BaseModel):
     """
     Data class from json. May need to be modified in the future for more complex prediction types
     """
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "ignore"  # Changed from default to "ignore" to handle unexpected fields
+    }
 
     game_id: str = Field(
         ...,
@@ -198,7 +222,7 @@ class GameData(bt.Synapse):
     model_config = {
         "arbitrary_types_allowed": True,
         "validate_assignment": True,
-        "extra": "allow"
+        "extra": "ignore"
     }
 
     metadata: Optional[Metadata] = Field(default=None)
@@ -206,6 +230,13 @@ class GameData(bt.Synapse):
     prediction_dict: Optional[Dict[str, TeamGamePrediction]] = Field(default=None)
     confirmation_dict: Optional[Dict[str, Dict[str, str]]] = Field(default=None)
     error: Optional[str] = Field(default=None)
+    
+    # Add headers that might be in new protocol version
+    name: Optional[str] = Field(default=None)
+    timeout: Optional[float] = Field(default=None)
+    header_size: Optional[int] = Field(default=None)
+    total_size: Optional[int] = Field(default=None)
+    computed_body_hash: Optional[str] = Field(default=None)
 
     @classmethod
     def create(
