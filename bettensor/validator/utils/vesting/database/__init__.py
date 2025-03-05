@@ -8,6 +8,8 @@ from bettensor.validator.utils.vesting.database.models import (
     StakeTransaction,
     VestingSchedule,
     VestingPayment,
+    EpochEmissions,
+    StakeMinimumRequirement,
     Base
 )
 
@@ -17,5 +19,7 @@ __all__ = [
     "StakeTransaction",
     "VestingSchedule",
     "VestingPayment",
+    "EpochEmissions",
+    "StakeMinimumRequirement",
     "Base"
 ] 

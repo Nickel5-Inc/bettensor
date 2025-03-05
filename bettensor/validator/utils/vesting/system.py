@@ -16,9 +16,13 @@ from bettensor.validator.utils.database import DatabaseManager
 from bettensor.validator.utils.vesting.core import (
     calculate_multiplier,
     VestingScheduler,
-    StakeTracker
+    StakeTracker,
+    StakeRequirements
 )
-from bettensor.validator.utils.vesting.blockchain import SubtensorClient
+from bettensor.validator.utils.vesting.blockchain import (
+    SubtensorClient,
+    StakeChangeProcessor
+)
 
 logger = logging.getLogger(__name__)
 
@@ -82,11 +86,28 @@ class VestingSystem:
             subtensor_client=self.subtensor_client
         )
         
+        self.stake_requirements = StakeRequirements(
+            db_manager=db_manager,
+            metagraph=metagraph,
+            subtensor_client=self.subtensor_client,
+            minimum_stake=0.3,
+            retention_window_days=30,
+            retention_target=0.9
+        )
+        
         self.vesting_scheduler = VestingScheduler(
             db_manager=db_manager,
             vesting_duration_days=vesting_duration_days,
             vesting_interval_days=vesting_interval_days,
             min_vesting_amount=min_vesting_amount
+        )
+        
+        # Initialize blockchain monitoring for distinguishing earned vs purchased stake
+        self.stake_change_processor = StakeChangeProcessor(
+            db_manager=db_manager,
+            subnet_id=subnet_id,
+            network=network,
+            dedicated_thread=True  # Run blockchain monitoring in a dedicated thread
         )
         
         # State
@@ -114,6 +135,15 @@ class VestingSystem:
         await self.stake_tracker.update_key_associations()
         await self.stake_tracker.update_stake_history()
         
+        # Start transaction monitoring
+        await self.stake_change_processor.start()
+        
+        # Set up hotkeys to track from the metagraph
+        for hotkey in self.metagraph.hotkeys:
+            if not hotkey.startswith("0x"):  # Skip invalid hotkeys
+                self.stake_change_processor.add_hotkey_to_track(hotkey)
+                logger.debug(f"Added hotkey to transaction tracking: {hotkey}")
+        
         # Start background task
         self._running = True
         self._background_task = asyncio.create_task(self._background_loop())
@@ -135,6 +165,9 @@ class VestingSystem:
             except asyncio.CancelledError:
                 pass
             self._background_task = None
+        
+        # Stop transaction monitoring
+        await self.stake_change_processor.stop()
         
         # Restore original scoring if integrated
         if self._scoring_system and self._original_calculate_weights:
@@ -171,46 +204,14 @@ class VestingSystem:
                     if payments_processed > 0:
                         logger.info(f"Processed {payments_processed} vesting payments")
                     
-                    # Check for stake changes
-                    stake_changes = await self.subtensor_client.detect_stake_changes()
-                    
-                    # Record stake transactions
-                    for event_type, events in stake_changes.items():
-                        for event in events:
-                            # Record transactions for add_stake and remove_stake
-                            # move_stake would need additional processing
-                            if event_type in ["add_stake", "remove_stake"]:
-                                await self.stake_tracker.record_stake_transaction(
-                                    transaction_type=event_type,
-                                    hotkey=event["hotkey"],
-                                    coldkey=event["coldkey"],
-                                    amount=event["amount"],
-                                    extrinsic_hash="auto_detected",  # Not from blockchain
-                                    block_number=0,  # Not from blockchain
-                                    block_timestamp=event["timestamp"]
-                                )
-                    
-                    # Update transaction history
-                    transactions = await self.subtensor_client.query_transactions()
-                    for tx in transactions:
-                        if "transaction_type" in tx and tx["transaction_type"] in ["add_stake", "remove_stake", "move_stake"]:
-                            await self.stake_tracker.record_stake_transaction(
-                                transaction_type=tx["transaction_type"],
-                                hotkey=tx["hotkey"],
-                                coldkey=tx["coldkey"],
-                                amount=tx["amount"],
-                                extrinsic_hash=tx["extrinsic_hash"],
-                                block_number=tx["block_number"],
-                                block_timestamp=tx["block_timestamp"],
-                                source_hotkey=tx.get("source_hotkey")
-                            )
-                    
                     # Check epoch boundary
                     epoch_changed = await self.subtensor_client.check_epoch_boundary()
                     if epoch_changed:
                         logger.info("Epoch boundary detected, performing full update")
                         # Add any epoch boundary specific logic here
-                    
+                        # Note: The StakeChangeProcessor will automatically detect 
+                        # epoch-related stake changes as 'reward' transactions
+                        
                 except Exception as e:
                     logger.error(f"Error in background loop: {e}")
                 
@@ -317,11 +318,15 @@ class VestingSystem:
             # Get stake changes
             stake_changes = await self.stake_tracker.get_stake_changes(hotkey)
             
+            # Get transaction summary with added_stake vs earned_rewards split
+            transaction_summary = await self._get_transaction_summary(hotkey)
+            
             # Combine results
             summary = {
                 **holding_metrics,
                 **vesting_summary,
-                **stake_changes
+                **stake_changes,
+                **transaction_summary
             }
             
             return summary
@@ -331,6 +336,99 @@ class VestingSystem:
             return {
                 "hotkey": hotkey,
                 "error": str(e)
+            }
+    
+    async def _get_transaction_summary(self, hotkey: str, days: int = 30) -> Dict[str, Any]:
+        """
+        Get detailed transaction summary showing the split between
+        earned rewards and manually added stake.
+        
+        Args:
+            hotkey: The hotkey to get summary for
+            days: Number of days to look back
+            
+        Returns:
+            Dictionary with transaction summary
+        """
+        try:
+            from datetime import datetime, timedelta
+            from sqlalchemy import func, and_, case
+            from bettensor.validator.utils.vesting.database.models import StakeTransaction
+            
+            cutoff_date = datetime.utcnow() - timedelta(days=days)
+            
+            result = {
+                "manual_stake_added": 0.0,
+                "manual_stake_removed": 0.0,
+                "rewards_earned": 0.0,
+                "penalties_incurred": 0.0,
+                "net_rewards": 0.0,
+                "net_manual_stake_change": 0.0,
+                "transaction_count": 0
+            }
+            
+            async with self.db_manager.async_session() as session:
+                # Use a single optimized query with conditional aggregation
+                summary_result = await session.execute(
+                    session.query(
+                        func.count(StakeTransaction.id).label('transaction_count'),
+                        func.sum(
+                            case(
+                                (StakeTransaction.transaction_type == 'add_stake', StakeTransaction.amount),
+                                else_=0
+                            )
+                        ).label('manual_stake_added'),
+                        func.sum(
+                            case(
+                                (StakeTransaction.transaction_type == 'remove_stake', StakeTransaction.amount),
+                                else_=0
+                            )
+                        ).label('manual_stake_removed'),
+                        func.sum(
+                            case(
+                                (StakeTransaction.transaction_type == 'reward', StakeTransaction.amount),
+                                else_=0
+                            )
+                        ).label('rewards_earned'),
+                        func.sum(
+                            case(
+                                (StakeTransaction.transaction_type == 'penalty', StakeTransaction.amount),
+                                else_=0
+                            )
+                        ).label('penalties_incurred')
+                    )
+                    .filter(
+                        and_(
+                            StakeTransaction.hotkey == hotkey,
+                            StakeTransaction.block_timestamp >= cutoff_date
+                        )
+                    )
+                )
+                
+                summary_row = summary_result.fetchone()
+                
+                if summary_row:
+                    result["transaction_count"] = summary_row.transaction_count or 0
+                    result["manual_stake_added"] = summary_row.manual_stake_added or 0.0
+                    result["manual_stake_removed"] = summary_row.manual_stake_removed or 0.0
+                    result["rewards_earned"] = summary_row.rewards_earned or 0.0
+                    result["penalties_incurred"] = summary_row.penalties_incurred or 0.0
+            
+            # Calculate summaries
+            result["net_rewards"] = result["rewards_earned"] - result["penalties_incurred"]
+            result["net_manual_stake_change"] = result["manual_stake_added"] - result["manual_stake_removed"]
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting transaction summary: {e}")
+            return {
+                "error": str(e),
+                "manual_stake_added": 0.0,
+                "manual_stake_removed": 0.0,
+                "rewards_earned": 0.0,
+                "penalties_incurred": 0.0,
+                "transaction_count": 0
             }
     
     def integrate_with_scoring(self, scoring_system):
@@ -380,29 +478,54 @@ class VestingSystem:
             # Make a copy of the weights
             modified_weights = weights.copy()
             
-            # Get all UIDs with non-zero weights
-            uids = np.where(modified_weights > 0)[0]
+            # First apply minimum stake requirements filter
+            filtered_weights = await self.stake_requirements.apply_minimum_requirements_filter(modified_weights)
             
-            # Apply multipliers for each UID
-            for uid in uids:
-                # Get hotkey
+            # Get all UIDs with non-zero weights after filtering
+            eligible_uids = np.where(filtered_weights > 0)[0]
+            
+            if len(eligible_uids) == 0:
+                return filtered_weights
+            
+            # Get all hotkeys for eligible UIDs
+            eligible_hotkeys = [self.metagraph.hotkeys[uid] for uid in eligible_uids]
+            
+            # Batch calculate retention multipliers
+            retention_multipliers = await self.stake_requirements.calculate_retention_multipliers_batch(eligible_hotkeys)
+            
+            # Batch calculate holding metrics and vesting multipliers
+            holding_metrics = {}
+            for hotkey_batch in self._batch_list(eligible_hotkeys, 50):  # Process in batches of 50
+                # Get holding metrics for each hotkey in batch
+                for hotkey in hotkey_batch:
+                    holding_percentage, holding_duration = await self.stake_tracker.calculate_holding_metrics(hotkey)
+                    vesting_multiplier = calculate_multiplier(holding_percentage, holding_duration)
+                    holding_metrics[hotkey] = vesting_multiplier
+            
+            # Apply multipliers for each eligible UID
+            for uid in eligible_uids:
                 hotkey = self.metagraph.hotkeys[uid]
                 
-                # Calculate holding metrics and multiplier
-                holding_percentage, holding_duration = await self.stake_tracker.calculate_holding_metrics(hotkey)
-                multiplier = calculate_multiplier(holding_percentage, holding_duration)
+                # Get retention multiplier (default to 1.0 if not found)
+                retention_mult = retention_multipliers.get(hotkey, 1.0)
                 
-                # Apply multiplier
-                if multiplier > 1.0:
-                    modified_weights[uid] *= multiplier
+                # Get vesting multiplier (default to 1.0 if not found)
+                vesting_mult = holding_metrics.get(hotkey, 1.0)
+                
+                # Apply multipliers (retention multiplier first, then vesting multiplier)
+                filtered_weights[uid] *= retention_mult * vesting_mult
             
             # Normalize weights
-            if np.sum(modified_weights) > 0:
-                total_weight = np.sum(modified_weights)
-                modified_weights = modified_weights / total_weight
+            if np.sum(filtered_weights) > 0:
+                total_weight = np.sum(filtered_weights)
+                filtered_weights = filtered_weights / total_weight
             
-            return modified_weights
+            return filtered_weights
             
         except Exception as e:
             logger.error(f"Error applying vesting multipliers: {e}")
-            return weights  # Return original weights on error 
+            return weights  # Return original weights on error
+    
+    def _batch_list(self, items, batch_size):
+        """Helper function to batch a list into chunks."""
+        return [items[i:i + batch_size] for i in range(0, len(items), batch_size)] 

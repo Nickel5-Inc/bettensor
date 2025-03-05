@@ -53,6 +53,14 @@ class SubtensorClient:
         self._last_check_block = 0
         self._last_epoch_block = 0
         self._is_connected = False
+        
+        # Connect to the network
+        self.subtensor = bt.subtensor(network=self.network)
+        
+        # Cache for dynamic info
+        self._dynamic_info = None
+        self._dynamic_info_last_updated = None
+        self._dynamic_info_ttl = 300  # 5 minutes
     
     async def connect(self) -> bool:
         """
@@ -308,4 +316,40 @@ class SubtensorClient:
             
         except Exception as e:
             logger.error(f"Error getting epoch progress: {e}")
-            return 0, 0 
+            return 0, 0
+    
+    def get_dynamic_info(self) -> 'bt.DynamicInfo':
+        """
+        Get the DynamicInfo for the subnet.
+        
+        Returns:
+            DynamicInfo object for the current subnet
+        """
+        current_time = datetime.utcnow()
+        
+        # Check if we need to refresh the cached info
+        if (self._dynamic_info is None or 
+            self._dynamic_info_last_updated is None or
+            (current_time - self._dynamic_info_last_updated).total_seconds() > self._dynamic_info_ttl):
+            
+            try:
+                # Get fresh dynamic info from the subtensor
+                self._dynamic_info = self.subtensor.get_dynamic_info(self.subnet_id)
+                self._dynamic_info_last_updated = current_time
+                
+                logger.info(f"Updated dynamic info for subnet {self.subnet_id}: "
+                           f"symbol={self._dynamic_info.symbol}, "
+                           f"price={self._dynamic_info.price}")
+            except Exception as e:
+                logger.error(f"Error getting dynamic info: {e}")
+                
+                # If we have no cached info, create a default one
+                if self._dynamic_info is None:
+                    # Create a default dynamic info with a 1:1 conversion rate
+                    # This will be updated on the next successful fetch
+                    logger.warning("Using default 1:1 tao to alpha conversion rate")
+                    self._dynamic_info = bt.DynamicInfo()
+                    self._dynamic_info.netuid = self.subnet_id
+                    self._dynamic_info.price = bt.Balance.from_tao(1.0)
+        
+        return self._dynamic_info 

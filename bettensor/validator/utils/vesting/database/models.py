@@ -11,8 +11,30 @@ from typing import Dict, Any, Optional
 from sqlalchemy import Column, Integer, Float, String, DateTime, ForeignKey, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
+from sqlalchemy.types import TypeDecorator
+
+import bittensor as bt
 
 Base = declarative_base()
+
+
+class BalanceType(TypeDecorator):
+    """SQLAlchemy type for bittensor.Balance objects"""
+    impl = Float
+    
+    def process_bind_param(self, value, dialect):
+        """Convert Balance to float when storing in database"""
+        if value is None:
+            return None
+        if isinstance(value, bt.Balance):
+            return value.tao
+        return float(value)
+        
+    def process_result_value(self, value, dialect):
+        """Convert float to Balance when loading from database"""
+        if value is None:
+            return None
+        return bt.Balance.from_tao(value)
 
 
 class HotkeyColdkeyAssociation(Base):
@@ -43,7 +65,7 @@ class StakeHistory(Base):
     hotkey = Column(String(255), index=True)
     coldkey = Column(String(255), index=True)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
-    stake = Column(Float, default=0.0)
+    stake = Column(BalanceType, default=0.0)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -66,8 +88,8 @@ class StakeTransaction(Base):
     block_timestamp = Column(DateTime, index=True)
     hotkey = Column(String(255), index=True)
     coldkey = Column(String(255), index=True)
-    transaction_type = Column(String(32), index=True)  # "add_stake", "remove_stake", "move_stake"
-    amount = Column(Float)
+    transaction_type = Column(String(32), index=True)  # "add_stake", "remove_stake", "reward", "penalty"
+    amount = Column(BalanceType)
     source_hotkey = Column(String(255), nullable=True)  # For move_stake only
     
     def to_dict(self) -> Dict[str, Any]:
@@ -94,8 +116,8 @@ class VestingSchedule(Base):
     coldkey = Column(String(255), index=True)
     start_time = Column(DateTime, index=True)
     end_time = Column(DateTime, index=True)
-    initial_amount = Column(Float)
-    remaining_amount = Column(Float)
+    initial_amount = Column(BalanceType)
+    remaining_amount = Column(BalanceType)
     interval_days = Column(Integer)
     status = Column(String(32), default="active")  # "active", "completed", "cancelled"
     
@@ -125,7 +147,7 @@ class VestingPayment(Base):
     id = Column(Integer, primary_key=True)
     schedule_id = Column(Integer, ForeignKey("vesting_schedules.id"), index=True)
     payment_time = Column(DateTime, index=True)
-    amount = Column(Float)
+    amount = Column(BalanceType)
     status = Column(String(32), default="scheduled")  # "scheduled", "paid"
     
     # Relationship with schedule
@@ -139,4 +161,54 @@ class VestingPayment(Base):
             "payment_time": self.payment_time,
             "amount": self.amount,
             "status": self.status
+        }
+
+
+class EpochEmissions(Base):
+    """Record of emissions earned by miners per epoch."""
+    
+    __tablename__ = "vesting_epoch_emissions"
+    
+    id = Column(Integer, primary_key=True)
+    hotkey = Column(String(255), index=True)
+    coldkey = Column(String(255), index=True)
+    epoch = Column(Integer, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    emission_amount = Column(BalanceType, default=0.0)  # Total emissions earned in this epoch
+    retained_amount = Column(BalanceType, default=0.0)  # Current amount still retained (updated as stake changes)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "id": self.id,
+            "hotkey": self.hotkey,
+            "coldkey": self.coldkey,
+            "epoch": self.epoch,
+            "timestamp": self.timestamp,
+            "emission_amount": self.emission_amount,
+            "retained_amount": self.retained_amount
+        }
+
+
+class StakeMinimumRequirement(Base):
+    """Record of minimum stake requirements by hotkey."""
+    
+    __tablename__ = "vesting_minimum_requirements"
+    
+    id = Column(Integer, primary_key=True)
+    hotkey = Column(String(255), index=True, unique=True)
+    coldkey = Column(String(255), index=True)
+    minimum_stake = Column(BalanceType, default=0.3)  # Default minimum of 0.3 TAO equivalent
+    last_updated = Column(DateTime, default=datetime.utcnow)
+    is_meeting_requirement = Column(Boolean, default=False)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "id": self.id,
+            "hotkey": self.hotkey,
+            "coldkey": self.coldkey,
+            "minimum_stake": self.minimum_stake,
+            "last_updated": self.last_updated,
+            "is_meeting_requirement": self.is_meeting_requirement
         } 
