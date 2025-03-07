@@ -136,6 +136,8 @@ dependencies = [
     "yarl",
     "matplotlib>=3.10.1",
     "async-substrate-interface>=1.0.3",
+    "seaborn>=0.13.2",
+    "ipywidgets>=8.1.5",
 ]
 
 [project.scripts]

@@ -25,6 +25,10 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import bittensor as bt
 
+from bettensor.validator.utils.vesting.blockchain_monitor import BlockchainMonitor
+from bettensor.validator.utils.vesting.stake_tracker import StakeTracker
+from bettensor.validator.utils.vesting.system import VestingSystem
+
 # Create mock classes for testing since we can't import the actual modules
 class DatabaseManager:
     """Mock DatabaseManager for testing."""
@@ -982,6 +986,243 @@ class TestTaoAlphaConversion:
         converted_back_to_tao = stake_tracker.dynamic_info.alpha_to_tao(stored_alpha_amount).tao
         assert abs(converted_back_to_tao - 10.0) < 0.0001, f"Expected 10.0 tao, got {converted_back_to_tao}"
 
+
+class MockSubtensor:
+    """Mock Subtensor for testing."""
+    
+    def __init__(self):
+        self.get_current_block = AsyncMock(return_value=1000)
+        self.get_block_hash = AsyncMock(return_value="0xhash")
+        self.get_block = AsyncMock(return_value=MagicMock(
+            timestamp=int(datetime.now().timestamp()),
+            extrinsics=[]
+        ))
+        self.neurons_for_subnet = AsyncMock(return_value=[])
+        self.neuron_for_pubkey = AsyncMock(return_value=None)
+
+class MockDatabaseManager:
+    """Mock DatabaseManager for testing."""
+    
+    def __init__(self):
+        self.tables = {}
+        self.execute_query = AsyncMock()
+        self.execute_many = AsyncMock()
+        self.fetch_one = AsyncMock(return_value=None)
+        self.fetch_all = AsyncMock(return_value=[])
+
+@pytest.fixture
+def mock_subtensor():
+    return MockSubtensor()
+
+@pytest.fixture
+def mock_db_manager():
+    return MockDatabaseManager()
+
+@pytest.mark.asyncio
+class TestBlockchainMonitor:
+    """Test suite for BlockchainMonitor."""
+    
+    async def test_initialization(self, mock_subtensor, mock_db_manager):
+        """Test BlockchainMonitor initialization."""
+        monitor = BlockchainMonitor(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager
+        )
+        
+        await monitor.initialize()
+        
+        # Verify tables were created
+        assert mock_db_manager.execute_query.call_count >= 2
+        
+    async def test_track_manual_transactions(self, mock_subtensor, mock_db_manager):
+        """Test tracking manual stake transactions."""
+        monitor = BlockchainMonitor(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager
+        )
+        
+        # Mock a transaction
+        mock_subtensor.get_block.return_value.extrinsics = [
+            MagicMock(
+                method=MagicMock(name='add_stake'),
+                args=MagicMock(
+                    hotkey='0xhotkey1',
+                    coldkey='0xcoldkey1',
+                    amount=10.0
+                ),
+                hash='0xtx1'
+            )
+        ]
+        
+        await monitor.initialize()
+        num_transactions = await monitor.track_manual_transactions()
+        
+        assert num_transactions == 1
+        assert mock_db_manager.execute_many.called
+        
+    async def test_track_balance_changes(self, mock_subtensor, mock_db_manager):
+        """Test tracking balance changes between epochs."""
+        monitor = BlockchainMonitor(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager
+        )
+        
+        # Mock current stakes
+        mock_subtensor.neurons_for_subnet.return_value = [
+            MagicMock(hotkey='0xhotkey1', stake=100.0)
+        ]
+        
+        # Mock previous stakes
+        mock_db_manager.fetch_all.return_value = [
+            {'hotkey': '0xhotkey1', 'new_balance': 90.0}
+        ]
+        
+        await monitor.initialize()
+        changes = await monitor.track_balance_changes(epoch=1)
+        
+        assert '0xhotkey1' in changes
+        assert changes['0xhotkey1'] == 10.0
+
+@pytest.mark.asyncio
+class TestStakeTracker:
+    """Test suite for StakeTracker."""
+    
+    async def test_initialization(self, mock_db_manager):
+        """Test StakeTracker initialization."""
+        tracker = StakeTracker(db_manager=mock_db_manager)
+        await tracker.initialize()
+        
+        # Verify tables were created
+        assert mock_db_manager.execute_query.call_count >= 2
+        
+    async def test_record_stake_change(self, mock_db_manager):
+        """Test recording stake changes."""
+        tracker = StakeTracker(db_manager=mock_db_manager)
+        await tracker.initialize()
+        
+        await tracker.record_stake_change(
+            hotkey='0xhotkey1',
+            coldkey='0xcoldkey1',
+            amount=10.0,
+            change_type='manual_add'
+        )
+        
+        assert mock_db_manager.execute_query.called
+        
+    async def test_calculate_holding_metrics(self, mock_db_manager):
+        """Test calculating holding metrics."""
+        tracker = StakeTracker(db_manager=mock_db_manager)
+        
+        # Mock stake metrics
+        mock_db_manager.fetch_one.side_effect = [
+            {
+                'total_stake': 90.0,
+                'earned_stake': 100.0,
+                'manual_stake': 10.0
+            },
+            None  # No last removal
+        ]
+        
+        await tracker.initialize()
+        percentage, duration = await tracker.calculate_holding_metrics('0xhotkey1')
+        
+        assert percentage == 0.9  # 90.0 / 100.0
+        assert duration == 30  # Default window
+
+@pytest.mark.asyncio
+class TestVestingSystem:
+    """Test suite for VestingSystem."""
+    
+    async def test_initialization(self, mock_subtensor, mock_db_manager):
+        """Test VestingSystem initialization."""
+        system = VestingSystem(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager
+        )
+        
+        await system.initialize()
+        
+        # Verify components were initialized
+        assert system.blockchain_monitor is not None
+        assert system.stake_tracker is not None
+        
+    async def test_apply_vesting_multipliers(self, mock_subtensor, mock_db_manager):
+        """Test applying vesting multipliers to weights."""
+        system = VestingSystem(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager
+        )
+        
+        # Mock stake metrics
+        mock_db_manager.fetch_one.side_effect = [
+            # First call: get_stake_metrics
+            {
+                'total_stake': 100.0,
+                'earned_stake': 100.0,
+                'manual_stake': 0.0
+            },
+            # Second call: calculate_holding_metrics (last removal)
+            None
+        ]
+        
+        await system.initialize()
+        
+        weights = np.array([0.5, 0.5])
+        uids = [0, 1]
+        hotkeys = ['0xhotkey1', '0xhotkey2']
+        
+        modified_weights = await system.apply_vesting_multipliers(weights, uids, hotkeys)
+        
+        assert len(modified_weights) == 2
+        assert np.sum(modified_weights) == pytest.approx(1.0)
+        
+    async def test_minimum_stake_requirement(self, mock_subtensor, mock_db_manager):
+        """Test minimum stake requirement filtering."""
+        system = VestingSystem(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager,
+            minimum_stake=0.3  # 30% of average
+        )
+        
+        # Mock stake distribution
+        mock_db_manager.fetch_all.return_value = [
+            {'total_stake': 100.0, 'manual_stake': 0.0, 'earned_stake': 100.0},
+            {'total_stake': 50.0, 'manual_stake': 0.0, 'earned_stake': 50.0}
+        ]
+        
+        await system.initialize()
+        
+        min_stake = await system._get_minimum_stake_requirement()
+        assert min_stake == pytest.approx(22.5)  # (100 + 50) / 2 * 0.3
+        
+    async def test_vesting_stats(self, mock_subtensor, mock_db_manager):
+        """Test getting vesting system statistics."""
+        system = VestingSystem(
+            subtensor=mock_subtensor,
+            subnet_id=1,
+            db_manager=mock_db_manager
+        )
+        
+        # Mock stake distribution
+        mock_db_manager.fetch_all.return_value = [
+            {'total_stake': 100.0, 'manual_stake': 20.0, 'earned_stake': 80.0},
+            {'total_stake': 50.0, 'manual_stake': 10.0, 'earned_stake': 40.0}
+        ]
+        
+        await system.initialize()
+        stats = await system.get_vesting_stats()
+        
+        assert stats['total_stake'] == 150.0
+        assert stats['total_manual_stake'] == 30.0
+        assert stats['total_earned_stake'] == 120.0
+        assert stats['num_miners'] == 2
+        assert stats['avg_stake'] == 75.0
 
 # Run tests if executed as script
 if __name__ == "__main__":

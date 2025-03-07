@@ -1,531 +1,534 @@
 """
-Vesting system for Bettensor validators.
+Vesting system for Bettensor.
 
-This module provides a comprehensive vesting system that rewards miners
-for holding their stakes rather than immediately selling them.
+This module implements a vesting rewards system that tracks miners who hold 
+their rewards rather than immediately selling them, and provides multipliers
+to their scores based on the amount and duration of holding.
 """
 
 import logging
 import asyncio
-from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Any, Union
 
 import bittensor as bt
 import numpy as np
 
-from bettensor.validator.utils.database import DatabaseManager
-from bettensor.validator.utils.vesting.core import (
-    calculate_multiplier,
-    VestingScheduler,
-    StakeTracker,
-    StakeRequirements
-)
-from bettensor.validator.utils.vesting.blockchain import (
-    SubtensorClient,
-    StakeChangeProcessor
-)
+from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.utils.vesting.blockchain_monitor import BlockchainMonitor
+from bettensor.validator.utils.vesting.stake_tracker import StakeTracker
 
 logger = logging.getLogger(__name__)
 
-
 class VestingSystem:
     """
-    Complete vesting system for validators.
+    Vesting system for Bettensor.
     
-    This class integrates all components of the vesting system:
-    1. Stake tracking
-    2. Blockchain monitoring
-    3. Vesting schedules and payments
-    4. Score multipliers
+    This system integrates stake tracking with the scoring system to provide
+    vesting multipliers based on stake holding metrics.
     
-    It provides a high-level interface for validators to integrate
-    the vesting system into their scoring and rewards process.
+    The system tracks:
+    1. Manual stake transactions (add/remove)
+    2. Epoch-based balance changes (rewards/emissions)
+    3. Holding metrics (percentage and duration)
+    
+    It then applies multipliers to miner weights based on these metrics.
     """
     
     def __init__(
         self,
-        db_manager: DatabaseManager,
-        metagraph: 'bt.metagraph.Metagraph',
+        subtensor: 'bt.subtensor',
         subnet_id: int,
-        vesting_duration_days: int = 30,
-        vesting_interval_days: int = 1,
-        min_vesting_amount: float = 0.1,
-        network: str = "finney",
-        update_interval_seconds: int = 300
+        db_manager: DatabaseManager,
+        minimum_stake: float = 0.3,
+        retention_window_days: int = 30,
+        retention_target: float = 0.9,
+        max_multiplier: float = 1.5,
+        use_background_thread: bool = True,
+        query_interval_seconds: int = 300
     ):
         """
         Initialize the vesting system.
         
         Args:
+            subtensor: Initialized subtensor instance
+            subnet_id: The subnet ID to monitor
             db_manager: Database manager for persistent storage
-            metagraph: Bittensor metagraph
-            subnet_id: Subnet ID
-            vesting_duration_days: Duration for vesting schedules in days
-            vesting_interval_days: Interval between vesting payments in days
-            min_vesting_amount: Minimum amount for creating a vesting schedule
-            network: Bittensor network to connect to
-            update_interval_seconds: Interval between background updates
+            minimum_stake: Minimum stake required to receive a multiplier
+            retention_window_days: Window for calculating retention metrics
+            retention_target: Target retention percentage for max multiplier
+            max_multiplier: Maximum multiplier to apply
+            use_background_thread: Whether to run blockchain monitoring in a background thread
+            query_interval_seconds: Interval between blockchain queries in seconds
         """
-        self.db_manager = db_manager
-        self.metagraph = metagraph
+        self.subtensor = subtensor
         self.subnet_id = subnet_id
-        self.vesting_duration_days = vesting_duration_days
-        self.vesting_interval_days = vesting_interval_days
-        self.min_vesting_amount = min_vesting_amount
-        self.network = network
-        self.update_interval = update_interval_seconds
+        self.db_manager = db_manager
         
-        # Initialize components
-        self.subtensor_client = SubtensorClient(
+        # Configuration
+        self.minimum_stake = minimum_stake
+        self.retention_window_days = retention_window_days
+        self.retention_target = retention_target
+        self.max_multiplier = max_multiplier
+        self.use_background_thread = use_background_thread
+        
+        # Components
+        self.blockchain_monitor = BlockchainMonitor(
+            subtensor=subtensor,
             subnet_id=subnet_id,
-            network=network
+            db_manager=db_manager,
+            query_interval_seconds=query_interval_seconds,
+            auto_start_thread=False  # We'll start it manually after initialization
         )
         
         self.stake_tracker = StakeTracker(
-            db_manager=db_manager,
-            metagraph=metagraph,
-            subtensor_client=self.subtensor_client
+            db_manager=db_manager
         )
         
-        self.stake_requirements = StakeRequirements(
-            db_manager=db_manager,
-            metagraph=metagraph,
-            subtensor_client=self.subtensor_client,
-            minimum_stake=0.3,
-            retention_window_days=30,
-            retention_target=0.9
-        )
+        # Cache for minimum stake requirement
+        self._minimum_stake_cache = None
+        self._minimum_stake_last_updated = None
+        self._minimum_stake_ttl = 3600  # 1 hour
         
-        self.vesting_scheduler = VestingScheduler(
-            db_manager=db_manager,
-            vesting_duration_days=vesting_duration_days,
-            vesting_interval_days=vesting_interval_days,
-            min_vesting_amount=min_vesting_amount
-        )
-        
-        # Initialize blockchain monitoring for distinguishing earned vs purchased stake
-        self.stake_change_processor = StakeChangeProcessor(
-            db_manager=db_manager,
-            subnet_id=subnet_id,
-            network=network,
-            dedicated_thread=True  # Run blockchain monitoring in a dedicated thread
-        )
-        
-        # State
-        self._running = False
-        self._background_task = None
-        self._scoring_system = None
-        self._original_calculate_weights = None
+        # Event handlers
+        self._epoch_boundary_handlers = []
     
-    async def start(self):
-        """Start the vesting system."""
-        if self._running:
-            logger.warning("Vesting system already running")
-            return
-            
-        # Connect to blockchain
-        connected = await self.subtensor_client.connect()
-        if not connected:
-            logger.error("Failed to connect to Subtensor. Vesting system not started.")
-            return
-            
-        # Initialize database
-        await self._initialize_database()
-        
-        # Load data
-        await self.stake_tracker.update_key_associations()
-        await self.stake_tracker.update_stake_history()
-        
-        # Start transaction monitoring
-        await self.stake_change_processor.start()
-        
-        # Set up hotkeys to track from the metagraph
-        for hotkey in self.metagraph.hotkeys:
-            if not hotkey.startswith("0x"):  # Skip invalid hotkeys
-                self.stake_change_processor.add_hotkey_to_track(hotkey)
-                logger.debug(f"Added hotkey to transaction tracking: {hotkey}")
-        
-        # Start background task
-        self._running = True
-        self._background_task = asyncio.create_task(self._background_loop())
-        
-        logger.info("Vesting system started")
-    
-    async def stop(self):
-        """Stop the vesting system."""
-        if not self._running:
-            logger.warning("Vesting system not running")
-            return
-            
-        # Stop background task
-        self._running = False
-        if self._background_task:
-            self._background_task.cancel()
-            try:
-                await self._background_task
-            except asyncio.CancelledError:
-                pass
-            self._background_task = None
-        
-        # Stop transaction monitoring
-        await self.stake_change_processor.stop()
-        
-        # Restore original scoring if integrated
-        if self._scoring_system and self._original_calculate_weights:
-            self._scoring_system.calculate_weights = self._original_calculate_weights
-            self._scoring_system = None
-            self._original_calculate_weights = None
-            
-        logger.info("Vesting system stopped")
-    
-    async def _initialize_database(self):
-        """Initialize database tables."""
-        from bettensor.validator.utils.vesting.database.models import Base
-        
-        try:
-            # Create tables
-            engine = self.db_manager.get_engine()
-            Base.metadata.create_all(engine)
-            logger.info("Database tables initialized")
-            
-        except Exception as e:
-            logger.error(f"Error initializing database: {e}")
-    
-    async def _background_loop(self):
-        """Background loop for periodic updates."""
-        try:
-            while self._running:
-                try:
-                    # Update stake information
-                    await self.stake_tracker.update_key_associations()
-                    await self.stake_tracker.update_stake_history()
-                    
-                    # Process vesting payments
-                    payments_processed = await self.vesting_scheduler.process_vesting_payments()
-                    if payments_processed > 0:
-                        logger.info(f"Processed {payments_processed} vesting payments")
-                    
-                    # Check epoch boundary
-                    epoch_changed = await self.subtensor_client.check_epoch_boundary()
-                    if epoch_changed:
-                        logger.info("Epoch boundary detected, performing full update")
-                        # Add any epoch boundary specific logic here
-                        # Note: The StakeChangeProcessor will automatically detect 
-                        # epoch-related stake changes as 'reward' transactions
-                        
-                except Exception as e:
-                    logger.error(f"Error in background loop: {e}")
-                
-                # Wait for next update
-                await asyncio.sleep(self.update_interval)
-                
-        except asyncio.CancelledError:
-            # Task was cancelled, clean up
-            logger.info("Background task cancelled")
-            
-        except Exception as e:
-            logger.error(f"Background task failed: {e}")
-    
-    async def create_vesting_schedule(self, hotkey: str, amount: float):
+    async def initialize(self):
         """
-        Create a vesting schedule for a miner.
+        Initialize the vesting system.
+        
+        This method initializes the blockchain monitor and stake tracker,
+        and ensures all required database tables exist.
+        
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        try:
+            # Initialize components
+            await self.blockchain_monitor.initialize()
+            await self.stake_tracker.initialize()
+            
+            # Register event handlers for stake changes
+            self._register_stake_change_handler()
+            
+            # Start background thread if enabled
+            if self.use_background_thread:
+                self.blockchain_monitor.start_background_thread()
+                logger.info("Started blockchain monitor in background thread")
+            
+            logger.info("Vesting system initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize vesting system: {e}")
+            return False
+    
+    def _register_stake_change_handler(self):
+        """
+        Register handlers for stake changes detected by the blockchain monitor.
+        
+        This method sets up the necessary event handlers to process stake changes
+        and update the stake tracker when emissions are detected.
+        """
+        # This is a placeholder for future event-based implementation
+        # Currently, the stake changes are processed directly in the blockchain monitor
+        # and the stake tracker is updated in the update() method
+        pass
+    
+    async def register_epoch_boundary_handler(self, handler):
+        """
+        Register a handler to be called when an epoch boundary is detected.
         
         Args:
-            hotkey: Miner's hotkey
-            amount: Amount to vest
-            
+            handler: Async function to call when an epoch boundary is detected
+        """
+        if callable(handler):
+            self._epoch_boundary_handlers.append(handler)
+            logger.info(f"Registered epoch boundary handler: {handler.__name__}")
+    
+    async def shutdown(self):
+        """
+        Shutdown the vesting system.
+        
+        This method stops the background thread if it's running.
+        
         Returns:
-            The ID of the created schedule or None if creation failed
+            bool: True if shutdown was successful, False otherwise
         """
         try:
-            # Get coldkey
-            coldkey = ""
-            async with self.db_manager.async_session() as session:
-                from bettensor.validator.utils.vesting.database.models import HotkeyColdkeyAssociation
-                result = await session.execute(
-                    session.query(HotkeyColdkeyAssociation)
-                    .filter(HotkeyColdkeyAssociation.hotkey == hotkey)
+            # Stop background thread if running
+            if self.use_background_thread and self.blockchain_monitor.is_running:
+                self.blockchain_monitor.stop_background_thread()
+                logger.info("Stopped blockchain monitor background thread")
+            
+            logger.info("Vesting system shutdown successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to shutdown vesting system: {e}")
+            return False
+    
+    async def update(self, epoch: int):
+        """
+        Update the vesting system state.
+        
+        This method:
+        1. Tracks manual stake transactions
+        2. Tracks balance changes for the given epoch
+        3. Updates stake metrics based on these changes
+        
+        If using a background thread, this method does nothing as the
+        updates are handled by the thread.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            bool: True if update was successful, False otherwise
+        """
+        # Skip if using background thread
+        if self.use_background_thread and self.blockchain_monitor.is_running:
+            logger.debug("Skipping manual update as blockchain monitor is running in background thread")
+            return True
+        
+        try:
+            # Track manual transactions
+            num_transactions = await self.blockchain_monitor.track_manual_transactions()
+            if num_transactions > 0:
+                logger.info(f"Tracked {num_transactions} manual stake transactions")
+            
+            # Track balance changes
+            changes = await self.blockchain_monitor.track_balance_changes(epoch)
+            
+            # Update stake metrics for each change
+            for hotkey, change in changes.items():
+                # Get coldkey for hotkey
+                coldkey = await self.blockchain_monitor._get_coldkey_for_hotkey(hotkey)
+                
+                # Record stake change
+                change_type = "reward" if change > 0 else "penalty"
+                await self.stake_tracker.record_stake_change(
+                    hotkey=hotkey,
+                    coldkey=coldkey,
+                    amount=change,
+                    change_type=change_type
                 )
-                association = result.first()
+            
+            logger.info(f"Updated stake metrics for {len(changes)} miners")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating vesting system: {e}")
+            return False
+    
+    async def process_emissions(self, epoch: int):
+        """
+        Process emissions from the most recent epoch boundary.
+        
+        This method retrieves the emissions calculated by the blockchain monitor
+        and updates the stake tracker accordingly.
+        
+        Args:
+            epoch: Current epoch number
+            
+        Returns:
+            bool: True if processing was successful, False otherwise
+        """
+        try:
+            # Get emissions from the database
+            emissions = await self._get_emissions_for_epoch(epoch)
+            
+            # Update stake metrics for each emission
+            for emission in emissions:
+                uid = emission['uid']
+                hotkey = emission['hotkey']
+                true_emission = emission['true_emission']
                 
-                if association:
-                    coldkey = association.coldkey
-            
-            if not coldkey:
-                logger.warning(f"No coldkey found for hotkey {hotkey}")
-                return None
-            
-            # Create vesting schedule
-            schedule_id = await self.vesting_scheduler.create_vesting_schedule(
-                hotkey=hotkey,
-                coldkey=coldkey,
-                amount=amount
-            )
-            
-            return schedule_id
-            
-        except Exception as e:
-            logger.error(f"Error creating vesting schedule: {e}")
-            return None
-    
-    async def get_holding_metrics(self, hotkey: str):
-        """
-        Get holding metrics for a hotkey.
-        
-        Args:
-            hotkey: Miner's hotkey
-            
-        Returns:
-            Dict with holding metrics
-        """
-        try:
-            # Calculate holding metrics
-            holding_percentage, holding_duration = await self.stake_tracker.calculate_holding_metrics(hotkey)
-            
-            # Calculate multiplier
-            multiplier = calculate_multiplier(holding_percentage, holding_duration)
-            
-            return {
-                "hotkey": hotkey,
-                "holding_percentage": holding_percentage,
-                "holding_duration_days": holding_duration,
-                "multiplier": multiplier
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting holding metrics: {e}")
-            return {
-                "hotkey": hotkey,
-                "error": str(e)
-            }
-    
-    async def get_vesting_summary(self, hotkey: str):
-        """
-        Get vesting summary for a hotkey.
-        
-        Args:
-            hotkey: Miner's hotkey
-            
-        Returns:
-            Dict with vesting summary
-        """
-        try:
-            # Get holding metrics
-            holding_metrics = await self.get_holding_metrics(hotkey)
-            
-            # Get vesting schedules
-            vesting_summary = await self.vesting_scheduler.get_vesting_summary(hotkey)
-            
-            # Get stake changes
-            stake_changes = await self.stake_tracker.get_stake_changes(hotkey)
-            
-            # Get transaction summary with added_stake vs earned_rewards split
-            transaction_summary = await self._get_transaction_summary(hotkey)
-            
-            # Combine results
-            summary = {
-                **holding_metrics,
-                **vesting_summary,
-                **stake_changes,
-                **transaction_summary
-            }
-            
-            return summary
-            
-        except Exception as e:
-            logger.error(f"Error getting vesting summary: {e}")
-            return {
-                "hotkey": hotkey,
-                "error": str(e)
-            }
-    
-    async def _get_transaction_summary(self, hotkey: str, days: int = 30) -> Dict[str, Any]:
-        """
-        Get detailed transaction summary showing the split between
-        earned rewards and manually added stake.
-        
-        Args:
-            hotkey: The hotkey to get summary for
-            days: Number of days to look back
-            
-        Returns:
-            Dictionary with transaction summary
-        """
-        try:
-            from datetime import datetime, timedelta
-            from sqlalchemy import func, and_, case
-            from bettensor.validator.utils.vesting.database.models import StakeTransaction
-            
-            cutoff_date = datetime.utcnow() - timedelta(days=days)
-            
-            result = {
-                "manual_stake_added": 0.0,
-                "manual_stake_removed": 0.0,
-                "rewards_earned": 0.0,
-                "penalties_incurred": 0.0,
-                "net_rewards": 0.0,
-                "net_manual_stake_change": 0.0,
-                "transaction_count": 0
-            }
-            
-            async with self.db_manager.async_session() as session:
-                # Use a single optimized query with conditional aggregation
-                summary_result = await session.execute(
-                    session.query(
-                        func.count(StakeTransaction.id).label('transaction_count'),
-                        func.sum(
-                            case(
-                                (StakeTransaction.transaction_type == 'add_stake', StakeTransaction.amount),
-                                else_=0
-                            )
-                        ).label('manual_stake_added'),
-                        func.sum(
-                            case(
-                                (StakeTransaction.transaction_type == 'remove_stake', StakeTransaction.amount),
-                                else_=0
-                            )
-                        ).label('manual_stake_removed'),
-                        func.sum(
-                            case(
-                                (StakeTransaction.transaction_type == 'reward', StakeTransaction.amount),
-                                else_=0
-                            )
-                        ).label('rewards_earned'),
-                        func.sum(
-                            case(
-                                (StakeTransaction.transaction_type == 'penalty', StakeTransaction.amount),
-                                else_=0
-                            )
-                        ).label('penalties_incurred')
-                    )
-                    .filter(
-                        and_(
-                            StakeTransaction.hotkey == hotkey,
-                            StakeTransaction.block_timestamp >= cutoff_date
-                        )
-                    )
+                # Skip if no hotkey or zero emission
+                if not hotkey or abs(true_emission) < 0.000001:
+                    continue
+                
+                # Get coldkey for hotkey
+                coldkey = await self.blockchain_monitor._get_coldkey_for_hotkey(hotkey)
+                
+                # Record stake change
+                change_type = "reward" if true_emission > 0 else "penalty"
+                await self.stake_tracker.record_stake_change(
+                    hotkey=hotkey,
+                    coldkey=coldkey,
+                    amount=true_emission,
+                    change_type=change_type
                 )
                 
-                summary_row = summary_result.fetchone()
-                
-                if summary_row:
-                    result["transaction_count"] = summary_row.transaction_count or 0
-                    result["manual_stake_added"] = summary_row.manual_stake_added or 0.0
-                    result["manual_stake_removed"] = summary_row.manual_stake_removed or 0.0
-                    result["rewards_earned"] = summary_row.rewards_earned or 0.0
-                    result["penalties_incurred"] = summary_row.penalties_incurred or 0.0
+                logger.debug(f"Processed emission for UID {uid}: {true_emission:.6f}τ")
             
-            # Calculate summaries
-            result["net_rewards"] = result["rewards_earned"] - result["penalties_incurred"]
-            result["net_manual_stake_change"] = result["manual_stake_added"] - result["manual_stake_removed"]
-            
-            return result
+            logger.info(f"Processed {len(emissions)} emissions for epoch {epoch}")
+            return True
             
         except Exception as e:
-            logger.error(f"Error getting transaction summary: {e}")
-            return {
-                "error": str(e),
-                "manual_stake_added": 0.0,
-                "manual_stake_removed": 0.0,
-                "rewards_earned": 0.0,
-                "penalties_incurred": 0.0,
-                "transaction_count": 0
-            }
+            logger.error(f"Error processing emissions: {e}")
+            return False
     
-    def integrate_with_scoring(self, scoring_system):
+    async def _get_emissions_for_epoch(self, epoch: int) -> List[Dict[str, Any]]:
         """
-        Integrate the vesting system with a scoring system.
-        
-        This patches the scoring system's calculate_weights method to
-        apply vesting multipliers to scores.
+        Get emissions for a specific epoch.
         
         Args:
-            scoring_system: The scoring system to integrate with
-        """
-        if self._scoring_system:
-            logger.warning("Vesting system already integrated with a scoring system")
-            return
-            
-        # Save original method
-        self._scoring_system = scoring_system
-        self._original_calculate_weights = scoring_system.calculate_weights
-        
-        # Replace with patched version
-        scoring_system.calculate_weights = self._patched_calculate_weights
-        
-        logger.info("Vesting system integrated with scoring system")
-    
-    async def _patched_calculate_weights(self, day=None):
-        """
-        Patched version of calculate_weights that applies vesting multipliers.
-        
-        Args:
-            day: The day to calculate weights for
+            epoch: Epoch number
             
         Returns:
-            The modified weights with vesting multipliers applied
+            List[Dict[str, Any]]: List of emission records
         """
-        if not self._original_calculate_weights:
-            logger.error("Original calculate_weights method not found")
-            return None
-            
-        # Call original method
-        weights = self._original_calculate_weights(day)
-        
-        if weights is None or not np.any(weights > 0):
-            return weights
-            
         try:
-            # Make a copy of the weights
-            modified_weights = weights.copy()
+            # Get the epoch boundary block for the specified epoch
+            epoch_boundary = await self.db_manager.fetch_one("""
+                SELECT block_num FROM epoch_boundaries
+                WHERE id = ?
+            """, (epoch,))
             
-            # First apply minimum stake requirements filter
-            filtered_weights = await self.stake_requirements.apply_minimum_requirements_filter(modified_weights)
+            if not epoch_boundary:
+                logger.warning(f"No epoch boundary found for epoch {epoch}")
+                return []
             
-            # Get all UIDs with non-zero weights after filtering
-            eligible_uids = np.where(filtered_weights > 0)[0]
+            block_num = epoch_boundary['block_num']
             
-            if len(eligible_uids) == 0:
-                return filtered_weights
+            # Get emissions for the epoch boundary block
+            emissions = await self.db_manager.fetch_all("""
+                SELECT uid, hotkey, true_emission FROM stake_changes
+                WHERE block_num = ?
+            """, (block_num,))
             
-            # Get all hotkeys for eligible UIDs
-            eligible_hotkeys = [self.metagraph.hotkeys[uid] for uid in eligible_uids]
+            return emissions
             
-            # Batch calculate retention multipliers
-            retention_multipliers = await self.stake_requirements.calculate_retention_multipliers_batch(eligible_hotkeys)
+        except Exception as e:
+            logger.error(f"Error getting emissions for epoch {epoch}: {e}")
+            return []
+    
+    async def get_true_emissions(self, hotkey: str, window_days: int = None) -> float:
+        """
+        Get the true emissions for a hotkey over a specified time window.
+        
+        Args:
+            hotkey: Hotkey to get emissions for
+            window_days: Number of days to look back (defaults to retention_window_days)
             
-            # Batch calculate holding metrics and vesting multipliers
-            holding_metrics = {}
-            for hotkey_batch in self._batch_list(eligible_hotkeys, 50):  # Process in batches of 50
-                # Get holding metrics for each hotkey in batch
-                for hotkey in hotkey_batch:
-                    holding_percentage, holding_duration = await self.stake_tracker.calculate_holding_metrics(hotkey)
-                    vesting_multiplier = calculate_multiplier(holding_percentage, holding_duration)
-                    holding_metrics[hotkey] = vesting_multiplier
+        Returns:
+            float: Total true emissions for the hotkey
+        """
+        try:
+            if window_days is None:
+                window_days = self.retention_window_days
             
-            # Apply multipliers for each eligible UID
-            for uid in eligible_uids:
-                hotkey = self.metagraph.hotkeys[uid]
+            # Calculate start time
+            start_time = int((datetime.now(timezone.utc) - timedelta(days=window_days)).timestamp())
+            
+            # Get emissions from stake_changes table
+            emissions = await self.db_manager.fetch_all("""
+                SELECT SUM(true_emission) as total_emission FROM stake_changes
+                WHERE hotkey = ? AND timestamp >= ?
+            """, (hotkey, start_time))
+            
+            if emissions and emissions[0]['total_emission'] is not None:
+                return float(emissions[0]['total_emission'])
+            
+            return 0.0
+            
+        except Exception as e:
+            logger.error(f"Error getting true emissions for {hotkey}: {e}")
+            return 0.0
+    
+    async def apply_vesting_multipliers(self, weights: np.ndarray, uids: List[int], hotkeys: List[str]) -> np.ndarray:
+        """
+        Apply vesting multipliers to the scoring weights.
+        
+        This method:
+        1. Checks if each miner meets the minimum stake requirement
+        2. Calculates holding metrics for each miner
+        3. Applies a multiplier based on these metrics
+        
+        Args:
+            weights: Array of weights to adjust
+            uids: List of UIDs corresponding to the weights
+            hotkeys: List of hotkeys corresponding to the weights
+            
+        Returns:
+            np.ndarray: Adjusted weights with vesting multipliers applied
+        """
+        try:
+            # Get minimum stake requirement
+            min_stake = await self._get_minimum_stake_requirement()
+            
+            # Create a copy of the weights to adjust
+            adjusted_weights = weights.copy()
+            
+            # Track miners that don't meet requirements
+            zero_weight_indices = []
+            
+            # Apply multipliers for each miner
+            for i, (uid, hotkey) in enumerate(zip(uids, hotkeys)):
+                # Skip if weight is already zero
+                if weights[i] <= 0:
+                    continue
                 
-                # Get retention multiplier (default to 1.0 if not found)
-                retention_mult = retention_multipliers.get(hotkey, 1.0)
+                # Get stake metrics
+                metrics = await self.stake_tracker.get_stake_metrics(hotkey)
                 
-                # Get vesting multiplier (default to 1.0 if not found)
-                vesting_mult = holding_metrics.get(hotkey, 1.0)
+                # If no metrics or below minimum stake, set weight to zero
+                if not metrics or metrics['total_stake'] < min_stake:
+                    zero_weight_indices.append(i)
+                    continue
                 
-                # Apply multipliers (retention multiplier first, then vesting multiplier)
-                filtered_weights[uid] *= retention_mult * vesting_mult
+                # Calculate holding metrics
+                holding_percentage, holding_duration = await self.stake_tracker.calculate_holding_metrics(
+                    hotkey=hotkey,
+                    window_days=self.retention_window_days
+                )
+                
+                # Calculate multiplier
+                multiplier = self._calculate_multiplier(holding_percentage, holding_duration)
+                
+                # Apply multiplier
+                adjusted_weights[i] *= multiplier
+                
+                logger.debug(f"UID {uid}: Applied multiplier {multiplier:.2f} "
+                           f"(holding: {holding_percentage:.2f}, duration: {holding_duration})")
             
-            # Normalize weights
-            if np.sum(filtered_weights) > 0:
-                total_weight = np.sum(filtered_weights)
-                filtered_weights = filtered_weights / total_weight
+            # Set weights to zero for miners that don't meet requirements
+            if zero_weight_indices:
+                adjusted_weights[zero_weight_indices] = 0.0
+                logger.info(f"Set weights to zero for {len(zero_weight_indices)} miners below minimum stake")
             
-            return filtered_weights
+            # Renormalize weights if needed
+            total_weight = np.sum(adjusted_weights)
+            if total_weight > 0:
+                adjusted_weights = adjusted_weights / total_weight
+            
+            return adjusted_weights
             
         except Exception as e:
             logger.error(f"Error applying vesting multipliers: {e}")
-            return weights  # Return original weights on error
+            logger.warning("Returning original weights due to error")
+            return weights
     
-    def _batch_list(self, items, batch_size):
-        """Helper function to batch a list into chunks."""
-        return [items[i:i + batch_size] for i in range(0, len(items), batch_size)] 
+    def _calculate_multiplier(self, holding_percentage: float, holding_duration: int) -> float:
+        """
+        Calculate the vesting multiplier based on holding metrics.
+        
+        The multiplier is calculated based on:
+        1. The percentage of stake that is held (vs. sold)
+        2. The duration of holding
+        
+        Args:
+            holding_percentage: Percentage of stake held (0.0 to 1.0)
+            holding_duration: Duration of holding in days
+            
+        Returns:
+            float: Multiplier to apply (1.0 to max_multiplier)
+        """
+        # Base multiplier based on holding percentage
+        percentage_factor = min(1.0, holding_percentage / self.retention_target)
+        
+        # Duration factor (saturates at retention_window_days)
+        duration_factor = min(1.0, holding_duration / self.retention_window_days)
+        
+        # Combined factor (geometric mean)
+        combined_factor = (percentage_factor * duration_factor) ** 0.5
+        
+        # Calculate multiplier (linear interpolation between 1.0 and max_multiplier)
+        multiplier = 1.0 + combined_factor * (self.max_multiplier - 1.0)
+        
+        return multiplier
+    
+    async def _get_minimum_stake_requirement(self) -> float:
+        """
+        Get the minimum stake requirement with caching.
+        
+        This method returns the configured minimum stake requirement,
+        with an option to dynamically calculate it based on network metrics
+        in the future.
+        
+        Returns:
+            float: Minimum stake requirement in TAO
+        """
+        current_time = datetime.now(timezone.utc)
+        
+        # Check if cache is valid
+        if (self._minimum_stake_cache is not None and 
+            self._minimum_stake_last_updated is not None and
+            (current_time - self._minimum_stake_last_updated).total_seconds() < self._minimum_stake_ttl):
+            return self._minimum_stake_cache
+        
+        # For now, just return the configured value
+        # In the future, this could be calculated dynamically based on network metrics
+        self._minimum_stake_cache = self.minimum_stake
+        self._minimum_stake_last_updated = current_time
+        
+        return self._minimum_stake_cache
+    
+    async def get_vesting_stats(self) -> Dict:
+        """
+        Get current vesting system statistics.
+        
+        Returns:
+            Dict: Dictionary of vesting system statistics
+        """
+        try:
+            # Get stake distribution
+            distribution = await self.stake_tracker.get_stake_distribution()
+            
+            # Calculate average holding metrics
+            total_holding_percentage = 0.0
+            total_holding_duration = 0
+            num_miners = 0
+            
+            for hotkey in distribution.get('hotkeys', []):
+                holding_percentage, holding_duration = await self.stake_tracker.calculate_holding_metrics(
+                    hotkey=hotkey,
+                    window_days=self.retention_window_days
+                )
+                
+                total_holding_percentage += holding_percentage
+                total_holding_duration += holding_duration
+                num_miners += 1
+            
+            avg_holding_percentage = total_holding_percentage / num_miners if num_miners > 0 else 0.0
+            avg_holding_duration = total_holding_duration / num_miners if num_miners > 0 else 0
+            
+            # Get epoch statistics
+            epoch_count = await self.db_manager.fetch_one("""
+                SELECT COUNT(*) as count FROM epoch_boundaries
+            """)
+            epoch_count = epoch_count['count'] if epoch_count else 0
+            
+            # Get emission statistics
+            emission_stats = await self.db_manager.fetch_one("""
+                SELECT 
+                    COUNT(*) as count,
+                    SUM(true_emission) as total_emission,
+                    AVG(true_emission) as avg_emission
+                FROM stake_changes
+                WHERE true_emission > 0
+            """)
+            
+            # Return statistics
+            return {
+                'num_miners': num_miners,
+                'total_stake': sum(distribution.get('stakes', [])),
+                'avg_stake': sum(distribution.get('stakes', [])) / num_miners if num_miners > 0 else 0.0,
+                'min_stake_requirement': await self._get_minimum_stake_requirement(),
+                'avg_holding_percentage': avg_holding_percentage,
+                'avg_holding_duration': avg_holding_duration,
+                'retention_window_days': self.retention_window_days,
+                'retention_target': self.retention_target,
+                'max_multiplier': self.max_multiplier,
+                'epoch_count': epoch_count,
+                'emission_count': emission_stats['count'] if emission_stats else 0,
+                'total_emission': emission_stats['total_emission'] if emission_stats and emission_stats['total_emission'] is not None else 0.0,
+                'avg_emission': emission_stats['avg_emission'] if emission_stats and emission_stats['avg_emission'] is not None else 0.0
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting vesting stats: {e}")
+            return {
+                'error': str(e)
+            } 

@@ -178,22 +178,55 @@ class ScoringSystem:
         bt.logging.info("Populating amount_wagered from prediction data...")
         
         try:
-            # Convert date objects to datetime if needed
+            # First, ensure that current_date and reference_date are properly initialized
+            if self.current_date is None or self.reference_date is None:
+                bt.logging.warning("Dates are not properly initialized.")
+                # Set reference_date if None
+                if self.reference_date is None:
+                    self.reference_date = datetime.now(timezone.utc)
+                    bt.logging.info(f"Set reference_date to current time: {self.reference_date}")
+                    
+                # Set current_date if None
+                if self.current_date is None:
+                    self.current_date = self.reference_date
+                    bt.logging.info(f"Set current_date to reference_date: {self.current_date}")
+            
+            # Ensure dates are datetime objects
             if isinstance(self.reference_date, date) and not isinstance(self.reference_date, datetime):
-                self.reference_date = datetime.combine(self.reference_date, datetime.min.time())
+                self.reference_date = datetime.combine(self.reference_date, datetime.min.time(), tzinfo=timezone.utc)
+                bt.logging.debug(f"Converted reference_date to datetime: {self.reference_date}")
             
             if isinstance(self.current_date, date) and not isinstance(self.current_date, datetime):
-                self.current_date = datetime.combine(self.current_date, datetime.min.time())
+                self.current_date = datetime.combine(self.current_date, datetime.min.time(), tzinfo=timezone.utc)
+                bt.logging.debug(f"Converted current_date to datetime: {self.current_date}")
             
-            # Ensure reference date is timezone-aware
+            # Ensure dates are timezone-aware
             if hasattr(self.reference_date, 'tzinfo') and self.reference_date.tzinfo is None:
                 self.reference_date = self.reference_date.replace(tzinfo=timezone.utc)
+                bt.logging.debug(f"Made reference_date timezone-aware: {self.reference_date}")
                 
             if hasattr(self.current_date, 'tzinfo') and self.current_date.tzinfo is None:
                 self.current_date = self.current_date.replace(tzinfo=timezone.utc)
+                bt.logging.debug(f"Made current_date timezone-aware: {self.current_date}")
             
-            # Get predictions for the last max_days days
-            cutoff_date = (self.current_date - timedelta(days=self.max_days)).isoformat()
+            # Verify dates before proceeding
+            if not isinstance(self.current_date, datetime) or not isinstance(self.reference_date, datetime):
+                raise ValueError(f"Invalid date types: current_date={type(self.current_date)}, reference_date={type(self.reference_date)}")
+            
+            # Calculate cutoff_date safely
+            try:
+                cutoff_date = (self.current_date - timedelta(days=self.max_days)).isoformat()
+                bt.logging.debug(f"Cutoff date: {cutoff_date}")
+            except Exception as e:
+                bt.logging.error(f"Error calculating cutoff date: {e}")
+                # Fallback to a safe cutoff date (90 days ago)
+                cutoff_date = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+                bt.logging.warning(f"Using fallback cutoff date: {cutoff_date}")
+            
+            # Reset amount_wagered array
+            self.amount_wagered = np.zeros((self.num_miners, self.max_days))
+            
+            # Get prediction data
             query = """
                 SELECT 
                     miner_uid,
@@ -208,14 +241,11 @@ class ScoringSystem:
                 ORDER BY miner_uid, pred_date
             """
             
-            # Reset amount_wagered array
-            self.amount_wagered = np.zeros((self.num_miners, self.max_days))
-            
-            # Get prediction data
             params = {
                 "num_miners": self.num_miners,
                 "cutoff_date": cutoff_date
             }
+            
             results = await self.db_manager.fetch_all(query, params)
             bt.logging.info(f"Found {len(results)} days of prediction data")
             
@@ -259,10 +289,17 @@ class ScoringSystem:
             bt.logging.info(f"- Total wager: {total_wager:.2f}")
             bt.logging.info(f"- Average wager per active miner: {total_wager/active_miners if active_miners > 0 else 0:.2f}")
             
+            return True
+            
         except Exception as e:
             bt.logging.error(f"Error populating amount_wagered: {str(e)}")
             bt.logging.error(f"Traceback: {traceback.format_exc()}")
-            raise
+            
+            # Initialize with empty data to avoid further errors
+            self.amount_wagered = np.zeros((self.num_miners, self.max_days))
+            bt.logging.warning("Initialized empty amount_wagered array")
+            
+            return False
 
     def advance_day(self, current_date: date):
         bt.logging.debug(f"Attempting to advance day with current_date: {current_date}, last_update_date: {self.last_update_date}")
@@ -815,10 +852,7 @@ class ScoringSystem:
         """Calculate weights with smooth transitions and increased spread within tiers."""
         bt.logging.info("Calculating weights with enhanced score separation")
         
-        # Hardcoded UID for recycling tier 1 and 2 incentives
-        # This UID will receive all remaining incentives from tiers 1 and 2
-        RECYCLING_UID = 42  # Replace with the actual UID to use
-        
+        # Remove recycling UID - we're now using the vesting system to handle emissions
         weights = np.zeros(self.num_miners)
         if day is None:
             day = self.current_day
@@ -849,11 +883,8 @@ class ScoringSystem:
             empty_tier_incentives = 0
             total_populated_incentive = 0
             
-            # Track tier 1 and 2 incentives for recycling
-            tier1_incentive = 0
-            tier2_incentive = 0
-            
-            for tier in range(2, self.num_tiers):
+            # Include all tiers (except tier 0) in the redistribution
+            for tier in range(1, self.num_tiers):
                 tier_miners = valid_miners[current_tiers[valid_miners] == tier]
                 config = self.tier_configs[tier]
                 
@@ -866,21 +897,6 @@ class ScoringSystem:
                 else:
                     empty_tier_incentives += config["capacity"] * config["incentive"]
                     bt.logging.debug(f"Tier {tier-1} is empty, redistributing {config['capacity'] * config['incentive']:.4f} incentive")
-
-            # Capture incentives from tier 1 and 2
-            # We're redirecting these to the recycling UID instead of distributing them
-            for tier in [1, 2]:
-                config = self.tier_configs[tier]
-                tier_incentive = config["capacity"] * config["incentive"]
-                if tier == 1:
-                    tier1_incentive = tier_incentive
-                    bt.logging.info(f"Redirecting tier 1 incentive of {tier1_incentive:.4f} to recycling UID {RECYCLING_UID}")
-                else:
-                    tier2_incentive = tier_incentive
-                    bt.logging.info(f"Redirecting tier 2 incentive of {tier2_incentive:.4f} to recycling UID {RECYCLING_UID}")
-                
-            # Total recycled incentive
-            recycled_incentive = tier1_incentive + tier2_incentive
             
             # Redistribute empty tier incentives proportionally
             if empty_tier_incentives > 0 and total_populated_incentive > 0:
@@ -948,15 +964,6 @@ class ScoringSystem:
                     tier_weights = np.array([allocation['center']])
 
                 weights[tier_miners] = tier_weights
-            
-            # Assign recycled incentive to the recycling UID if it exists in our miners list
-            if 0 <= RECYCLING_UID < self.num_miners:
-                # We'll set a fixed weight that represents the recycled incentive
-                # Use 1.0 as a starting value before normalization
-                weights[RECYCLING_UID] = recycled_incentive if weights[RECYCLING_UID] == 0 else weights[RECYCLING_UID] + recycled_incentive
-                bt.logging.info(f"Assigned recycled incentive of {recycled_incentive:.4f} to UID {RECYCLING_UID}")
-            else:
-                bt.logging.warning(f"Recycling UID {RECYCLING_UID} is out of range (0-{self.num_miners-1}). Incentive not recycled.")
 
             # Normalize final weights
             total_weight = weights.sum()
@@ -973,10 +980,6 @@ class ScoringSystem:
                         bt.logging.info(f"  Weight range: {weights[tier_miners].min():.6f} - {weights[tier_miners].max():.6f}")
                         bt.logging.info(f"  Weight spread: {tier_spread:.6f}")
                         bt.logging.info(f"  Total weight: {tier_sum:.4f}")
-                
-                # Log the weight assigned to recycling UID
-                if 0 <= RECYCLING_UID < self.num_miners and weights[RECYCLING_UID] > 0:
-                    bt.logging.info(f"Recycling UID {RECYCLING_UID} final weight: {weights[RECYCLING_UID]:.6f}")
 
             final_sum = weights.sum()
             bt.logging.info(f"Final weight sum: {final_sum:.6f}")
@@ -1266,7 +1269,7 @@ class ScoringSystem:
                         bt.logging.trace("ScoringSystem state saved to database, including amount_wagered and tiers.")
                         return
 
-            except (asyncio.TimeoutError, SQLAlchemyError) as e:
+            except (asyncio.TimeoutError) as e:
                 if attempt < max_retries - 1:
                     # Exponential backoff with jitter
                     delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
@@ -1284,7 +1287,22 @@ class ScoringSystem:
                     
                     await asyncio.sleep(delay)
                     continue
-                raise
+                else:
+                    # Log error on final attempt
+                    bt.logging.error(f"Error saving state to database: {e}")
+                    bt.logging.error(traceback.format_exc())
+                    
+                    # Restore state on error
+                    self.current_day = state_backup['current_day']
+                    self.current_date = state_backup['current_date']
+                    self.reference_date = state_backup['reference_date']
+                    self.last_update_date = state_backup['last_update_date']
+                    self.invalid_uids = copy.deepcopy(state_backup['invalid_uids'])
+                    self.valid_uids = copy.deepcopy(state_backup['valid_uids'])
+                    self.amount_wagered = state_backup['amount_wagered'].copy()
+                    self.tiers = state_backup['tiers'].copy()
+                    
+                    raise
             except Exception as e:
                 bt.logging.error(f"Error saving state to database: {e}")
                 bt.logging.error(traceback.format_exc())
@@ -1691,8 +1709,6 @@ class ScoringSystem:
         tables = [
             "tier_stats",
             "miner_stats",
-            "daily_scores",
-            "component_scores"
         ]
         
         for table in tables:
@@ -1706,28 +1722,61 @@ class ScoringSystem:
         """
         bt.logging.info("Checking and migrating ROI columns in miner_stats table")
         
-        # Check if columns exist first to avoid errors
-        table_info_query = "PRAGMA table_info(miner_stats)"
-        columns = await self.db_manager.fetch_all(table_info_query)
-        
-        # Extract existing column names
-        existing_columns = [col['name'] for col in columns]
-        
-        # Define new columns to add
-        new_columns = {
-            "miner_15_day_roi": "REAL DEFAULT 0",
-            "miner_30_day_roi": "REAL DEFAULT 0",
-            "miner_45_day_roi": "REAL DEFAULT 0"
-        }
-        
-        # Add missing columns
-        for column_name, column_type in new_columns.items():
-            if column_name not in existing_columns:
-                alter_query = f"ALTER TABLE miner_stats ADD COLUMN {column_name} {column_type}"
-                await self.db_manager.execute_query(alter_query)
-                bt.logging.info(f"Added column {column_name} to miner_stats table")
-        
-        bt.logging.info("ROI column migration completed")
+        try:
+            # Check if columns exist first to avoid errors
+            table_info_query = "PRAGMA table_info(miner_stats)"
+            columns = await self.db_manager.fetch_all(table_info_query)
+            
+            # Extract existing column names
+            existing_columns = [col['name'] for col in columns]
+            bt.logging.info(f"Existing columns: {existing_columns}")
+            
+            # Define new columns to add
+            new_columns = {
+                "miner_15_day_roi": "REAL DEFAULT 0",
+                "miner_30_day_roi": "REAL DEFAULT 0",
+                "miner_45_day_roi": "REAL DEFAULT 0"
+            }
+            
+            # Add missing columns
+            for column_name, column_type in new_columns.items():
+                if column_name not in existing_columns:
+                    # Use direct query execution with retries
+                    alter_query = f"ALTER TABLE miner_stats ADD COLUMN {column_name} {column_type}"
+                    max_retries = 3
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            await self.db_manager.execute_query(alter_query)
+                            bt.logging.info(f"Added column {column_name} to miner_stats table")
+                            break
+                        except Exception as e:
+                            bt.logging.error(f"Error adding column {column_name} (attempt {attempt+1}/{max_retries}): {e}")
+                            if "duplicate column name" in str(e):
+                                bt.logging.info(f"Column {column_name} already exists, skipping")
+                                break
+                            if attempt == max_retries - 1:
+                                bt.logging.error(f"Failed to add column {column_name} after {max_retries} attempts")
+                                raise
+                            await asyncio.sleep(1)  # Wait before retry
+            
+            # Verify columns were added
+            columns_after = await self.db_manager.fetch_all(table_info_query)
+            existing_columns_after = [col['name'] for col in columns_after]
+            bt.logging.info(f"Columns after migration: {existing_columns_after}")
+            
+            for column_name in new_columns:
+                if column_name not in existing_columns_after:
+                    bt.logging.error(f"Failed to verify column {column_name} was added correctly")
+                    raise Exception(f"Failed to add column {column_name}")
+            
+            bt.logging.info("ROI column migration completed successfully")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error during ROI column migration: {e}")
+            bt.logging.error(traceback.format_exc())
+            raise
 
     def _calculate_clv_scores(self, predictions, closing_line_odds):
         """
@@ -2060,29 +2109,48 @@ class ScoringSystem:
             bt.logging.error(traceback.format_exc())
 
     async def initialize(self):
-        """Initialize the scoring system."""
+        """Initialize the scoring system"""
+        bt.logging.info("Initializing scoring system...")
+        
         try:
-            # Initialize database connection if needed
-            if not self.db_manager:
-                bt.logging.warning("No database manager provided. Scoring system won't be able to save/load state.")
-                return False
-
+            # Ensure database is initialized
             await self.db_manager.initialize()
             
-            # Run database migrations to ensure all required columns exist
-            db_init_statements = initialize_database()
-            for statement in db_init_statements:
-                try:
-                    await self.db_manager.execute_query(statement)
-                except Exception as e:
-                    bt.logging.warning(f"Error executing initialization statement: {e}")
-                    # Continue to next statement if one fails (column might already exist)
-                    
-            bt.logging.info("Database migrations completed")
-
+            # Verify and repair database schema
+            schema_valid = await self.verify_and_repair_database_schema()
+            if not schema_valid:
+                bt.logging.error("Database schema verification failed - some operations may not work correctly")
+            
+            # Run any other database migrations
+            if self.validator:
+                # Perform migrations specific to validator mode
+                # Add migrations here
+                
+                bt.logging.info("Database migrations completed")
+                
+                # Explicitly migrate ROI columns
+                await self._migrate_miner_stats_roi_columns()
+            
             # Try to load existing state
-            await self.load_state()
-            await self.load_scores()
+            try:
+                await self.load_state()
+            except Exception as e:
+                bt.logging.error(f"Error loading state: {e}")
+                bt.logging.warning("Setting default state values due to load_state error")
+                self.current_day = 0
+                self.current_date = self.reference_date
+                self.last_update_date = datetime.now(timezone.utc)
+                self.tiers = np.ones((self.num_miners, self.max_days), dtype=np.int32)
+                self.amount_wagered = np.zeros((self.num_miners, self.max_days), dtype=np.float32)
+                self.init = True
+            
+            # Try to load scores
+            try:
+                await self.load_scores()
+            except Exception as e:
+                bt.logging.error(f"Error loading scores: {e}")
+                bt.logging.warning("Unable to load scores, will initialize empty score arrays")
+                self._initialize_empty_score_arrays()
 
             # Initialize with default values if no state exists
             if self.current_day is None:
@@ -2098,6 +2166,78 @@ class ScoringSystem:
             
         except Exception as e:
             bt.logging.error(f"Error initializing scoring system: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
+
+    def _initialize_empty_score_arrays(self):
+        """Initialize empty score arrays when unable to load existing scores"""
+        bt.logging.info("Initializing empty score arrays")
+        
+        # Initialize with zeros
+        self.clv_scores = np.zeros((self.num_miners, self.max_days))
+        self.roi_scores = np.zeros((self.num_miners, self.max_days))
+        self.risk_scores = np.zeros((self.num_miners, self.max_days))
+        self.entropy_scores = np.zeros((self.num_miners, self.max_days))
+        
+        # Initialize composite scores for each tier
+        self.composite_scores = np.zeros((self.num_miners, self.max_days, self.num_tiers - 1))
+        
+        bt.logging.info("Empty score arrays initialized successfully")
+
+    async def verify_and_repair_database_schema(self):
+        """
+        Verify and repair the database schema if needed.
+        This function performs a thorough check of the database schema and attempts to repair any issues.
+        """
+        bt.logging.info("Verifying and repairing database schema...")
+        
+        try:
+            # 1. Check that required tables exist
+            tables_query = "SELECT name FROM sqlite_master WHERE type='table'"
+            tables = await self.db_manager.fetch_all(tables_query)
+            existing_tables = [table['name'] for table in tables]
+            bt.logging.info(f"Existing tables: {existing_tables}")
+            
+            # Only check for tables that should actually exist in this particular database
+            required_tables = ['_init_check', 'db_version', 'miner_stats', 'predictions', 'game_data', 'keys', 'scores', 'score_state', 'sqlite_sequence', 'entropy_game_pools', 'entropy_predictions', 'entropy_miner_scores', 'entropy_closed_games', 'entropy_system_state', 'miner_stats_backup']
+            missing_tables = [table for table in required_tables if table not in existing_tables]
+            
+            if missing_tables:
+                bt.logging.error(f"Missing required tables: {missing_tables}")
+                await self.db_manager.initialize(force=True)
+            
+            # 2. Verify ROI columns in miner_stats
+            await self._migrate_miner_stats_roi_columns()
+            
+            # 3. Verify miner_stats data integrity
+            bt.logging.info("Verifying miner_stats data integrity...")
+            
+            # Check for entries with null values in critical columns
+            null_check_query = """
+                SELECT miner_uid FROM miner_stats 
+                WHERE miner_15_day_roi IS NULL OR miner_30_day_roi IS NULL OR miner_45_day_roi IS NULL
+            """
+            null_entries = await self.db_manager.fetch_all(null_check_query)
+            
+            if null_entries:
+                bt.logging.warning(f"Found {len(null_entries)} entries with NULL ROI values")
+                
+                # Set NULL values to 0.0
+                fix_nulls_query = """
+                    UPDATE miner_stats
+                    SET miner_15_day_roi = COALESCE(miner_15_day_roi, 0.0),
+                        miner_30_day_roi = COALESCE(miner_30_day_roi, 0.0),
+                        miner_45_day_roi = COALESCE(miner_45_day_roi, 0.0)
+                    WHERE miner_15_day_roi IS NULL OR miner_30_day_roi IS NULL OR miner_45_day_roi IS NULL
+                """
+                await self.db_manager.execute_query(fix_nulls_query)
+                bt.logging.info("Fixed NULL ROI values in miner_stats")
+            
+            bt.logging.info("Database schema verification and repair completed")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error verifying/repairing database schema: {e}")
             bt.logging.error(traceback.format_exc())
             return False
 
@@ -2560,16 +2700,6 @@ class ScoringSystem:
 
         return meets_wager and meets_history
 
-    async def run_scoring(self, date=None):
-        """Run scoring for a specific date or today"""
-        date = date or datetime.now(timezone.utc).date()
-        bt.logging.trace(f"=== Starting scoring run for date: {date} ===")
-        
-        # ... rest of the method ...
-        
-        date_str = date.strftime("%Y-%m-%d")
-        bt.logging.trace(f"=== Completed scoring run for date: {date_str} ===")
-
     async def update_miner_roi_stats(self):
         """
         Update the miner_stats table with current ROI values, including:
@@ -2581,6 +2711,17 @@ class ScoringSystem:
         This method should be called after scores have been updated in scoring_run.
         """
         bt.logging.info("Updating miner ROI statistics...")
+        
+        # Ensure ROI columns exist before updating
+        try:
+            migration_success = await self._migrate_miner_stats_roi_columns()
+            if not migration_success:
+                bt.logging.error("Migration of ROI columns failed, cannot update ROI statistics")
+                return False
+        except Exception as e:
+            bt.logging.error(f"Error ensuring ROI columns exist: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
         
         # Prepare data for all miners
         roi_updates = []
