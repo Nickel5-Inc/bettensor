@@ -22,18 +22,12 @@ import traceback
 import copy
 import asyncio
 import async_timeout
-import warnings
-import math
-import bittensor as bt
-from sqlalchemy import text
-from collections import defaultdict, Counter
+import random
+import copy
+import scipy.special
 
-from pydantic import BaseModel, field_validator, validator
-from typing import List, Dict, Any, Optional, Union, Tuple, Set
-from enum import Enum
-import pandas as pd
-
-from bettensor.validator.utils.scoring.scoring_data import ScoringData
+from bettensor.validator.utils.database.database_manager import DatabaseManager
+from .scoring_data import ScoringData
 from .entropy_system import EntropySystem
 from bettensor.validator.utils.database.database_init import initialize_database
 from bettensor.validator.utils.database.database_manager import DatabaseManager
@@ -98,31 +92,31 @@ class ScoringSystem:
                 "window": 3,
                 "min_wager": 0,
                 "capacity": int(num_miners * 1.0),
-                "incentive": 0.1,
+                "incentive": 0.02,
             },  # Tier 1
             {
                 "window": 7,
                 "min_wager": 4000,
                 "capacity": int(num_miners * 0.2),
-                "incentive": 0.10,
+                "incentive": 0.05,
             },  # Tier 2
             {
                 "window": 15,
                 "min_wager": 10000,
                 "capacity": int(num_miners * 0.2),
-                "incentive": 0.2,
+                "incentive": 0.23,
             },  # Tier 3
             {
                 "window": 30,
                 "min_wager": 20000,
                 "capacity": int(num_miners * 0.1),
-                "incentive": 0.35,
+                "incentive": 0.27,
             },  # Tier 4
             {
                 "window": 45,
                 "min_wager": 35000,
                 "capacity": int(num_miners * 0.05),
-                "incentive": 0.5,
+                "incentive": 0.43,
             },  # Tier 5
         ]
         
@@ -849,8 +843,8 @@ class ScoringSystem:
         #np.set_printoptions(threshold=1000)  # Reset to default threshold
 
     def calculate_weights(self, day=None):
-        """Calculate weights with smooth transitions and increased spread within tiers."""
-        bt.logging.info("Calculating weights with enhanced score separation")
+        """Calculate weights with a continuous exponential curve based on tier and score."""
+        bt.logging.info("Calculating weights with continuous exponential curve")
         
         # Remove recycling UID - we're now using the vesting system to handle emissions
         weights = np.zeros(self.num_miners)
@@ -858,133 +852,144 @@ class ScoringSystem:
             day = self.current_day
 
         try:
-            current_tiers = self.tiers[:, day]
-            # Check for any wager in the last 7 days to determine active miners
-            start_idx = (day - 7 + 1) % self.max_days
-            if start_idx <= day:
-                recent_wagers = np.sum(self.amount_wagered[:, start_idx:day + 1], axis=1)
-            else:
-                recent_wagers = np.sum(self.amount_wagered[:, start_idx:], axis=1) + np.sum(self.amount_wagered[:, :day + 1], axis=1)
-            has_predictions = recent_wagers > 0
+            day = self._get_day_index(day)
+            bt.logging.debug(f"Calculating weights for day {day}")
             
-            valid_miners = np.array(list(set(range(self.num_miners)) - self.invalid_uids))
-            valid_miners = valid_miners[
-                (current_tiers[valid_miners] >= 2) & 
-                (current_tiers[valid_miners] < self.num_tiers) &
-                has_predictions[valid_miners]
-            ]
-
-            if not valid_miners.any():
-                bt.logging.warning("No valid miners found. Returning zero weights.")
-                return weights
-
-            # First, identify populated tiers and their base allocations
+            # Setup weights array with zeros
+            weights = np.zeros(self.num_miners)
+            
+            # Get current tiers for all miners
+            current_tiers = self.tiers[:, day].copy()
+            
+            # Apply penalties for invalid UIDs
+            if hasattr(self, 'invalid_uids') and self.invalid_uids:
+                current_tiers[list(self.invalid_uids)] = 0
+            
+            # Create dictionary of populated tiers
             populated_tiers = {}
-            empty_tier_incentives = 0
-            total_populated_incentive = 0
-            
-            # Include all tiers (except tier 0) in the redistribution
-            for tier in range(1, self.num_tiers):
-                tier_miners = valid_miners[current_tiers[valid_miners] == tier]
-                config = self.tier_configs[tier]
-                
-                if len(tier_miners) > 0:
+            for tier in range(1, len(self.tier_configs) + 1):
+                miners = np.where(current_tiers == tier)[0]
+                if len(miners) > 0:
                     populated_tiers[tier] = {
-                        'miners': tier_miners,
-                        'base_incentive': config["capacity"] * config["incentive"]
+                        'miners': miners,
+                        'base_incentive': self.tier_configs[tier-1]['incentive'],
+                        'adjusted_incentive': self.tier_configs[tier-1]['incentive']
                     }
-                    total_populated_incentive += config["capacity"] * config["incentive"]
-                else:
-                    empty_tier_incentives += config["capacity"] * config["incentive"]
-                    bt.logging.debug(f"Tier {tier-1} is empty, redistributing {config['capacity'] * config['incentive']:.4f} incentive")
             
-            # Redistribute empty tier incentives proportionally
-            if empty_tier_incentives > 0 and total_populated_incentive > 0:
-                for tier_data in populated_tiers.values():
-                    proportion = tier_data['base_incentive'] / total_populated_incentive
-                    additional_incentive = empty_tier_incentives * proportion
-                    tier_data['adjusted_incentive'] = tier_data['base_incentive'] + additional_incentive
-                    bt.logging.debug(f"Adding {additional_incentive:.4f} redistributed incentive")
+            if not populated_tiers:
+                return weights
+            
+            # Create a continuous rank across all miners
+            all_miners = []
+            miner_tiers = []
+            
+            # Collect all miners and their tiers
+            for tier in sorted(populated_tiers.keys()):
+                all_miners.extend(populated_tiers[tier]['miners'])
+                miner_tiers.extend([tier] * len(populated_tiers[tier]['miners']))
+            
+            # Convert to arrays
+            all_miners = np.array(all_miners)
+            miner_tiers = np.array(miner_tiers)
+            
+            # Get scores for all miners in their respective tiers
+            all_scores = np.zeros(len(all_miners))
+            for i, (miner, tier) in enumerate(zip(all_miners, miner_tiers)):
+                all_scores[i] = self.composite_scores[miner, day, tier-1]
+            
+            # Sort by tier (ascending order - higher tier numbers first), then by score (high to low)
+            # This ensures tier 5 is at the top, followed by tier 4, etc.
+            sort_indices = np.lexsort((-all_scores, miner_tiers))[::1]  # Reverse to put higher tiers first
+            sorted_miners = all_miners[sort_indices]
+            
+            # Create continuous ranks from 0 to 1
+            total_miners = len(sorted_miners)
+            continuous_ranks = np.linspace(0, 1, total_miners)
+            
+            # Apply exponential function to create Pareto-like distribution
+            pareto_exponent = 12  # Controls the steepness (higher = steeper curve)
+            
+            # Calculate weights using the exponential curve - maintain the curve's shape
+            for i, miner in enumerate(sorted_miners):
+                weights[miner] = np.exp(pareto_exponent * continuous_ranks[i])
+            
+            # Create small, fixed "steps" at tier boundaries while preserving the overall curve
+            # First, identify tier boundaries in the sorted list
+            sorted_tiers = np.zeros(len(sorted_miners), dtype=int)
+            for i, miner in enumerate(sorted_miners):
+                # Find the tier for this miner
+                for tier, data in populated_tiers.items():
+                    if miner in data['miners']:
+                        sorted_tiers[i] = tier
+                        break
+            
+            # Track the previous miner's tier to detect tier boundaries
+            prev_tier = sorted_tiers[0] if len(sorted_miners) > 0 else 0
+            tier_step = 0.15  # Much larger step at tier boundaries for clear visual breaks
+            
+            # Apply small steps at tier boundaries
+            adjusted_weights = weights.copy()
+            
+            # Track total adjustment for each tier
+            tier_adjustments = {}
+            current_adjustment = 0
+            
+            # First identify tier boundaries and calculate cumulative adjustment
+            for tier in sorted(populated_tiers.keys()):
+                if tier > min(populated_tiers.keys()):
+                    # Add a step for each tier boundary (except the lowest tier)
+                    current_adjustment += tier_step
+                tier_adjustments[tier] = current_adjustment
+            
+            # Apply the adjustments to each miner based on their tier
+            for miner in range(self.num_miners):
+                for tier, data in populated_tiers.items():
+                    if miner in data['miners']:
+                        adjusted_weights[miner] += tier_adjustments[tier]
+                        break
+            
+            # Replace weights with adjusted weights
+            weights = adjusted_weights
+            
+            # No need to renormalize the complete weights array, as we want to preserve
+            # the distinct tier separation
+            
+            # Apply penalties for invalid UIDs
+            if hasattr(self, 'invalid_uids') and self.invalid_uids:
+                weights[list(self.invalid_uids)] = 0
+            
+            # Renormalize after applying penalties
+            if np.sum(weights) > 0:
+                weights = weights / np.sum(weights)
             else:
-                for tier_data in populated_tiers.values():
-                    tier_data['adjusted_incentive'] = tier_data['base_incentive']
-
-            # Calculate total allocation after redistribution
-            total_allocation = sum(data['adjusted_incentive'] for data in populated_tiers.values())
+                bt.logging.warning("Total weight is zero. Distributing weights equally among valid miners.")
+                if hasattr(self, 'valid_uids') and self.valid_uids:
+                    weights[list(self.valid_uids)] = 1 / len(self.valid_uids)
             
-            # Calculate overlapping weight ranges for populated tiers
-            overlap_factor = 0.3
-            spread_factor = 2.0
-            tier_allocations = {}
-            weight_start = 0
-            
-            for tier, data in sorted(populated_tiers.items()):
-                tier_weight = data['adjusted_incentive'] / total_allocation
-                
-                # Extend range to overlap with adjacent tiers
-                start = max(0, weight_start - (tier_weight * overlap_factor))
-                end = weight_start + tier_weight + (tier_weight * overlap_factor)
-                
-                tier_allocations[tier] = {
-                    'start': start,
-                    'end': end,
-                    'total_weight': tier_weight,
-                    'center': weight_start + (tier_weight / 2)
-                }
-                weight_start += tier_weight
-                
-                bt.logging.debug(f"Tier {tier-1} adjusted allocation:")
-                bt.logging.debug(f"  Original incentive: {data['base_incentive']:.4f}")
-                bt.logging.debug(f"  Adjusted incentive: {data['adjusted_incentive']:.4f}")
-                bt.logging.debug(f"  Weight range: {start:.4f} - {end:.4f}")
-
-            # Rest of the weight assignment logic remains the same
+            # Log weight distribution by tier
             for tier in populated_tiers:
-                tier_miners = populated_tiers[tier]['miners']
-                allocation = tier_allocations[tier]
-                tier_scores = self.composite_scores[tier_miners, day, tier-1]
-                
-                if len(tier_miners) > 1:
-                    # Enhance score separation before normalization
-                    scores_mean = np.mean(tier_scores)
-                    scores_std = np.std(tier_scores)
-                    if scores_std > 0:
-                        spread_scores = (tier_scores - scores_mean) * spread_factor
-                        temperature = 0.5
-                        exp_scores = np.exp(spread_scores / temperature)
-                        normalized_scores = exp_scores / exp_scores.sum()
-                    else:
-                        normalized_scores = np.ones_like(tier_scores) / len(tier_scores)
-                    
-                    center = allocation['center']
-                    spread = (allocation['end'] - allocation['start']) / 2
-                    tier_weights = center + (normalized_scores - 0.5) * spread * 1.5
-                    tier_weights = np.clip(tier_weights, allocation['start'], allocation['end'])
-                else:
-                    tier_weights = np.array([allocation['center']])
-
-                weights[tier_miners] = tier_weights
-
-            # Normalize final weights
-            total_weight = weights.sum()
-            if total_weight > 0:
-                weights /= total_weight
-                
-                # Verification logging
-                for tier in populated_tiers:
-                    tier_miners = np.where((current_tiers == tier) & (weights > 0))[0]
-                    if len(tier_miners) > 0:
-                        tier_sum = weights[tier_miners].sum()
-                        tier_spread = weights[tier_miners].max() - weights[tier_miners].min()
-                        bt.logging.info(f"Tier {tier-1} final distribution:")
-                        bt.logging.info(f"  Weight range: {weights[tier_miners].min():.6f} - {weights[tier_miners].max():.6f}")
-                        bt.logging.info(f"  Weight spread: {tier_spread:.6f}")
-                        bt.logging.info(f"  Total weight: {tier_sum:.4f}")
-
+                tier_miners = np.where(current_tiers == tier)[0]
+                if len(tier_miners) > 0:
+                    tier_sum = weights[tier_miners].sum()
+                    tier_min = weights[tier_miners].min()
+                    tier_max = weights[tier_miners].max()
+                    tier_spread = tier_max - tier_min
+                    bt.logging.info(f"Tier {tier-1} distribution:")
+                    bt.logging.info(f"  Weight range: {tier_min:.6f} - {tier_max:.6f}")
+                    bt.logging.info(f"  Weight spread: {tier_spread:.6f}")
+                    bt.logging.info(f"  Total weight: {tier_sum:.4f}")
+            
+            # Calculate approximate 80/20 verification
+            top_20pct_count = int(total_miners * 0.2)
+            if top_20pct_count > 0:
+                top_20pct_weight = weights[sorted_miners[-top_20pct_count:]].sum()
+                bt.logging.info(f"Top 20% miners ({top_20pct_count}) get {top_20pct_weight*100:.1f}% of weight")
+            
             final_sum = weights.sum()
             bt.logging.info(f"Final weight sum: {final_sum:.6f}")
             
             return weights
+        
         except Exception as e:
             bt.logging.error(f"Error calculating weights: {e}")
             bt.logging.error(f"Traceback: {traceback.format_exc()}")
