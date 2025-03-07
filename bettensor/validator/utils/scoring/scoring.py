@@ -12,6 +12,8 @@ Outputs:
 """
 
 
+from sqlalchemy import text
+from collections import defaultdict
 import os
 from datetime import datetime, timezone, timedelta, date
 import json
@@ -24,7 +26,7 @@ import asyncio
 import async_timeout
 import random
 import copy
-import scipy.special
+import bittensor as bt
 
 from bettensor.validator.utils.database.database_manager import DatabaseManager
 from .scoring_data import ScoringData

@@ -17,6 +17,8 @@ import numpy as np
 from bettensor.validator.utils.database.database_manager import DatabaseManager
 from bettensor.validator.utils.vesting.blockchain_monitor import BlockchainMonitor
 from bettensor.validator.utils.vesting.stake_tracker import StakeTracker
+from bettensor.validator.utils.vesting.transaction_monitor import TransactionMonitor
+from bettensor.validator.utils.vesting.stake_tracker import INFLOW, OUTFLOW, NEUTRAL, EMISSION
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +47,8 @@ class VestingSystem:
         retention_target: float = 0.9,
         max_multiplier: float = 1.5,
         use_background_thread: bool = True,
-        query_interval_seconds: int = 300
+        query_interval_seconds: int = 300,
+        detailed_transaction_tracking: bool = True
     ):
         """
         Initialize the vesting system.
@@ -60,6 +63,7 @@ class VestingSystem:
             max_multiplier: Maximum multiplier to apply
             use_background_thread: Whether to run blockchain monitoring in a background thread
             query_interval_seconds: Interval between blockchain queries in seconds
+            detailed_transaction_tracking: Whether to use detailed transaction tracking
         """
         self.subtensor = subtensor
         self.subnet_id = subnet_id
@@ -71,6 +75,7 @@ class VestingSystem:
         self.retention_target = retention_target
         self.max_multiplier = max_multiplier
         self.use_background_thread = use_background_thread
+        self.detailed_transaction_tracking = detailed_transaction_tracking
         
         # Components
         self.blockchain_monitor = BlockchainMonitor(
@@ -85,6 +90,17 @@ class VestingSystem:
             db_manager=db_manager
         )
         
+        # Transaction monitor for detailed transaction tracking
+        if detailed_transaction_tracking:
+            self.transaction_monitor = TransactionMonitor(
+                subtensor=subtensor,
+                subnet_id=subnet_id,
+            db_manager=db_manager,
+                verbose=False
+            )
+        else:
+            self.transaction_monitor = None
+        
         # Cache for minimum stake requirement
         self._minimum_stake_cache = None
         self._minimum_stake_last_updated = None
@@ -93,20 +109,28 @@ class VestingSystem:
         # Event handlers
         self._epoch_boundary_handlers = []
     
-    async def initialize(self):
+    async def initialize(self, auto_init_metagraph: bool = True):
         """
         Initialize the vesting system.
         
         This method initializes the blockchain monitor and stake tracker,
-        and ensures all required database tables exist.
+        and ensures all required database tables exist. It also optionally
+        initializes miner data from the metagraph.
         
+        Args:
+            auto_init_metagraph: Whether to automatically initialize miner data from metagraph
+            
         Returns:
-            bool: True if initialization was successful, False otherwise
+            bool: True if initialization was successful
         """
         try:
             # Initialize components
             await self.blockchain_monitor.initialize()
             await self.stake_tracker.initialize()
+            
+            # Initialize transaction monitor if enabled
+            if self.detailed_transaction_tracking and self.transaction_monitor:
+                await self.transaction_monitor.initialize()
             
             # Register event handlers for stake changes
             self._register_stake_change_handler()
@@ -115,6 +139,25 @@ class VestingSystem:
             if self.use_background_thread:
                 self.blockchain_monitor.start_background_thread()
                 logger.info("Started blockchain monitor in background thread")
+            
+            # Start transaction monitoring if enabled
+            if self.detailed_transaction_tracking and self.transaction_monitor:
+                self.transaction_monitor.start_monitoring()
+                logger.info("Started detailed transaction monitoring")
+            
+            # Initialize from metagraph if requested
+            if auto_init_metagraph:
+                # Check if we have any existing data first
+                results = await self.db_manager.fetch_all("""
+                    SELECT COUNT(*) as count FROM stake_metrics
+                """)
+                count = results[0]['count'] if results else 0
+                
+                if count == 0:
+                    logger.info("No existing stake metrics found, initializing from metagraph")
+                    await self.initialize_from_metagraph()
+                else:
+                    logger.info(f"Found {count} existing stake metric entries, skipping metagraph initialization")
             
             logger.info("Vesting system initialized successfully")
             return True
@@ -160,6 +203,11 @@ class VestingSystem:
             if self.use_background_thread and self.blockchain_monitor.is_running:
                 self.blockchain_monitor.stop_background_thread()
                 logger.info("Stopped blockchain monitor background thread")
+            
+            # Stop transaction monitoring if enabled
+            if self.detailed_transaction_tracking and self.transaction_monitor and self.transaction_monitor.is_running:
+                self.transaction_monitor.stop_monitoring()
+                logger.info("Stopped detailed transaction monitoring")
             
             logger.info("Vesting system shutdown successfully")
             return True
@@ -254,11 +302,11 @@ class VestingSystem:
                 # Record stake change
                 change_type = "reward" if true_emission > 0 else "penalty"
                 await self.stake_tracker.record_stake_change(
-                    hotkey=hotkey,
-                    coldkey=coldkey,
+                hotkey=hotkey,
+                coldkey=coldkey,
                     amount=true_emission,
                     change_type=change_type
-                )
+            )
                 
                 logger.debug(f"Processed emission for UID {uid}: {true_emission:.6f}τ")
             
@@ -336,6 +384,54 @@ class VestingSystem:
         except Exception as e:
             logger.error(f"Error getting true emissions for {hotkey}: {e}")
             return 0.0
+    
+    async def get_detailed_stake_transactions(self, hotkey: str = None, coldkey: str = None, 
+                                           days: int = None, transaction_type: str = None) -> List[Dict]:
+        """
+        Get detailed stake transactions for a hotkey or coldkey.
+        
+        Args:
+            hotkey: Filter by hotkey (optional)
+            coldkey: Filter by coldkey (optional)
+            days: Number of days to look back (optional)
+            transaction_type: Filter by transaction type (optional)
+            
+        Returns:
+            List[Dict]: List of detailed stake transactions
+        """
+        try:
+            # Build query
+            query = "SELECT * FROM detailed_stake_transactions WHERE 1=1"
+            params = []
+            
+            # Apply filters
+            if hotkey:
+                query += " AND hotkey = ?"
+                params.append(hotkey)
+            
+            if coldkey:
+                query += " AND coldkey = ?"
+                params.append(coldkey)
+            
+            if transaction_type:
+                query += " AND transaction_type = ?"
+                params.append(transaction_type)
+            
+            if days:
+                start_time = datetime.now(timezone.utc) - timedelta(days=days)
+                query += " AND timestamp >= ?"
+                params.append(start_time)
+            
+            query += " ORDER BY timestamp DESC"
+            
+            # Execute query
+            transactions = await self.db_manager.fetch_all(query, params)
+            
+            return transactions
+            
+        except Exception as e:
+            logger.error(f"Error getting detailed stake transactions: {e}")
+            return []
     
     async def apply_vesting_multipliers(self, weights: np.ndarray, uids: List[int], hotkeys: List[str]) -> np.ndarray:
         """
@@ -510,8 +606,54 @@ class VestingSystem:
                 WHERE true_emission > 0
             """)
             
+            # Get transaction statistics if detailed tracking is enabled
+            transaction_stats = {}
+            if self.detailed_transaction_tracking:
+                transaction_count = await self.db_manager.fetch_one("""
+                    SELECT COUNT(*) as count FROM detailed_stake_transactions
+                """)
+                
+                add_stake_count = await self.db_manager.fetch_one("""
+                    SELECT COUNT(*) as count FROM detailed_stake_transactions
+                    WHERE transaction_type = 'add_stake'
+                """)
+                
+                remove_stake_count = await self.db_manager.fetch_one("""
+                    SELECT COUNT(*) as count FROM detailed_stake_transactions
+                    WHERE transaction_type = 'remove_stake'
+                """)
+                
+                transaction_stats = {
+                    'total_transactions': transaction_count['count'] if transaction_count else 0,
+                    'add_stake_transactions': add_stake_count['count'] if add_stake_count else 0,
+                    'remove_stake_transactions': remove_stake_count['count'] if remove_stake_count else 0,
+                }
+            
+            # Get tranche statistics
+            tranche_stats = await self.db_manager.fetch_one("""
+                SELECT 
+                    COUNT(*) as total_tranches,
+                    SUM(CASE WHEN is_emission = 1 THEN 1 ELSE 0 END) as emission_tranches,
+                    SUM(CASE WHEN is_emission = 0 THEN 1 ELSE 0 END) as manual_tranches,
+                    SUM(initial_amount) as total_initial_amount,
+                    SUM(remaining_amount) as total_remaining_amount,
+                    SUM(CASE WHEN is_emission = 1 THEN initial_amount ELSE 0 END) as emission_initial_amount,
+                    SUM(CASE WHEN is_emission = 1 THEN remaining_amount ELSE 0 END) as emission_remaining_amount,
+                    AVG(CASE WHEN is_emission = 1 THEN remaining_amount / initial_amount ELSE NULL END) as avg_emission_retention
+                FROM stake_tranches
+            """)
+            
+            # Get tranche exit statistics
+            exit_stats = await self.db_manager.fetch_one("""
+                SELECT 
+                    COUNT(*) as total_exits,
+                    SUM(exit_amount) as total_exit_amount,
+                    AVG(exit_amount) as avg_exit_amount
+                FROM stake_tranche_exits
+            """)
+            
             # Return statistics
-            return {
+            stats = {
                 'num_miners': num_miners,
                 'total_stake': sum(distribution.get('stakes', [])),
                 'avg_stake': sum(distribution.get('stakes', [])) / num_miners if num_miners > 0 else 0.0,
@@ -524,11 +666,295 @@ class VestingSystem:
                 'epoch_count': epoch_count,
                 'emission_count': emission_stats['count'] if emission_stats else 0,
                 'total_emission': emission_stats['total_emission'] if emission_stats and emission_stats['total_emission'] is not None else 0.0,
-                'avg_emission': emission_stats['avg_emission'] if emission_stats and emission_stats['avg_emission'] is not None else 0.0
+                'avg_emission': emission_stats['avg_emission'] if emission_stats and emission_stats['avg_emission'] is not None else 0.0,
+                
+                # Tranche statistics
+                'tranche_stats': {
+                    'total_tranches': tranche_stats['total_tranches'] if tranche_stats else 0,
+                    'emission_tranches': tranche_stats['emission_tranches'] if tranche_stats else 0,
+                    'manual_tranches': tranche_stats['manual_tranches'] if tranche_stats else 0,
+                    'total_initial_amount': tranche_stats['total_initial_amount'] if tranche_stats else 0,
+                    'total_remaining_amount': tranche_stats['total_remaining_amount'] if tranche_stats else 0,
+                    'emission_initial_amount': tranche_stats['emission_initial_amount'] if tranche_stats else 0,
+                    'emission_remaining_amount': tranche_stats['emission_remaining_amount'] if tranche_stats else 0,
+                    'avg_emission_retention': tranche_stats['avg_emission_retention'] if tranche_stats and tranche_stats['avg_emission_retention'] is not None else 0,
+                    'total_exits': exit_stats['total_exits'] if exit_stats else 0,
+                    'total_exit_amount': exit_stats['total_exit_amount'] if exit_stats and exit_stats['total_exit_amount'] is not None else 0,
+                    'avg_exit_amount': exit_stats['avg_exit_amount'] if exit_stats and exit_stats['avg_exit_amount'] is not None else 0
+                }
             }
+            
+            # Add transaction stats if available
+            if transaction_stats:
+                stats.update(transaction_stats)
+            
+            return stats
             
         except Exception as e:
             logger.error(f"Error getting vesting stats: {e}")
             return {
                 'error': str(e)
-            } 
+            }
+    
+    async def initialize_from_metagraph(self, metagraph: 'bt.metagraph' = None, force_update: bool = False):
+        """
+        Initialize hotkeys, associated coldkeys, and stake balances from the metagraph.
+        
+        This method fetches the current state of miners from the metagraph and
+        creates initial stake metrics for them if they don't already exist in the database.
+        
+        Args:
+            metagraph: Metagraph instance to use. If not provided, will fetch from subtensor.
+            force_update: If True, will update existing entries even if they exist.
+            
+        Returns:
+            bool: True if initialization was successful
+        """
+        try:
+            # Get metagraph if not provided
+            if metagraph is None:
+                metagraph = self.subtensor.metagraph(self.subnet_id)
+                # Ensure metagraph is synced
+                metagraph.sync(subtensor=self.subtensor)
+            
+            # Get current stake metrics to check which hotkeys already exist
+            existing_hotkeys = []
+            if not force_update:
+                results = await self.db_manager.fetch_all("""
+                    SELECT hotkey FROM stake_metrics
+                """)
+                existing_hotkeys = [row['hotkey'] for row in results] if results else []
+            
+            init_count = 0
+            update_count = 0
+            
+            # Process each hotkey in the metagraph
+            for idx, (hotkey, coldkey, stake) in enumerate(zip(metagraph.hotkeys, metagraph.coldkeys, metagraph.stake)):
+                if hotkey not in existing_hotkeys or force_update:
+                    # Format stake amount (convert from torch if needed)
+                    stake_amount = float(stake) if hasattr(stake, 'item') else float(stake)
+                    
+                    # If existing, we're updating
+                    is_update = hotkey in existing_hotkeys
+                    
+                    # Get timestamp (current for new entries)
+                    timestamp = datetime.now(timezone.utc)
+                    
+                    if is_update:
+                        # Update existing entry - just update the total manual stake
+                        # but preserve earned stake and other metrics
+                        metrics = await self.stake_tracker.get_stake_metrics(hotkey)
+                        if metrics:
+                            # Calculate net difference to apply
+                            stake_diff = stake_amount - metrics['total_stake']
+                            if abs(stake_diff) > 0.000001:  # Avoid tiny floating point changes
+                                # Record the difference as a change
+                                change_type = "metagraph_update"
+                                flow_type = INFLOW if stake_diff > 0 else OUTFLOW
+                                
+                                await self.stake_tracker.record_stake_change(
+                                    hotkey=hotkey,
+                                    coldkey=coldkey,
+                                    amount=stake_diff,
+                                    change_type=change_type,
+                                    flow_type=flow_type,
+                                    timestamp=timestamp
+                                )
+                                update_count += 1
+                                
+                                logger.info(
+                                    f"Updated existing stake for {hotkey} from metagraph: "
+                                    f"adjustment of {stake_diff:.6f} TAO"
+                                )
+                    else:
+                        # Create new tranche for initial stake
+                        tranche_id = await self.stake_tracker._create_new_tranche(
+                            hotkey=hotkey,
+                            coldkey=coldkey,
+                            amount=stake_amount,
+                            is_emission=False,  # Initial stake is manual, not emissions
+                            timestamp=timestamp
+                        )
+                        
+                        # Create initial stake metrics
+                        await self.db_manager.execute_query("""
+                            INSERT INTO stake_metrics 
+                            (hotkey, coldkey, total_stake, manual_stake, earned_stake, last_update)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            hotkey,
+                            coldkey,
+                            stake_amount,
+                            stake_amount,  # All initial stake is manual
+                            0.0,  # No earned stake initially
+                            timestamp
+                        ))
+                        
+                        # Record in history
+                        await self.db_manager.execute_query("""
+                            INSERT INTO stake_change_history 
+                            (timestamp, hotkey, coldkey, amount, change_type, flow_type, 
+                            prev_total_stake, new_total_stake,
+                            prev_manual_stake, new_manual_stake,
+                            prev_earned_stake, new_earned_stake)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            timestamp,
+                            hotkey,
+                            coldkey,
+                            stake_amount,
+                            "metagraph_init",
+                            INFLOW,
+                            0.0,  # prev_total_stake
+                            stake_amount,  # new_total_stake
+                            0.0,  # prev_manual_stake
+                            stake_amount,  # new_manual_stake
+                            0.0,  # prev_earned_stake
+                            0.0,  # new_earned_stake
+                        ))
+                        
+                        init_count += 1
+                        logger.info(f"Initialized stake for {hotkey} from metagraph: {stake_amount:.6f} TAO")
+                    
+                    # Update aggregated metrics
+                    await self.stake_tracker._update_aggregated_tranche_metrics(hotkey)
+                    await self.stake_tracker._update_coldkey_metrics(coldkey)
+            
+            logger.info(f"Metagraph initialization complete: {init_count} new entries, {update_count} updates")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error initializing from metagraph: {e}")
+            return False
+    
+    async def handle_deregistered_keys(self, deregistered_hotkeys: List[str] = None):
+        """
+        Handle deregistered keys by cleaning up their data.
+        
+        This method:
+        1. Identifies deregistered miners by comparing the metagraph with the database
+        2. Deletes all data associated with deregistered miners
+        
+        Args:
+            deregistered_hotkeys: List of specific hotkeys to deregister.
+                If None, will compare metagraph with database to find deregistered miners.
+                
+        Returns:
+            int: Number of deregistered miners whose data was cleaned up
+        """
+        try:
+            # If no specific hotkeys provided, identify deregistered miners
+            if deregistered_hotkeys is None:
+                # Get current hotkeys from metagraph
+                metagraph = self.subtensor.metagraph(self.subnet_id)
+                metagraph.sync(subtensor=self.subtensor)
+                current_hotkeys = set(metagraph.hotkeys)
+                
+                # Get all hotkeys in our database
+                results = await self.db_manager.fetch_all("""
+                    SELECT DISTINCT hotkey FROM stake_metrics
+                """)
+                db_hotkeys = set(row['hotkey'] for row in results) if results else set()
+                
+                # Find hotkeys that are in our database but not in the metagraph (deregistered)
+                deregistered_hotkeys = list(db_hotkeys - current_hotkeys)
+            
+            if not deregistered_hotkeys:
+                logger.info("No deregistered miners found")
+                return 0
+            
+            # For each deregistered hotkey, clean up all related data
+            for hotkey in deregistered_hotkeys:
+                # Get the coldkey first so we can update coldkey metrics later
+                coldkey_result = await self.db_manager.fetch_one("""
+                    SELECT coldkey FROM stake_metrics WHERE hotkey = ?
+                """, (hotkey,))
+                
+                coldkey = coldkey_result['coldkey'] if coldkey_result else None
+                
+                # Delete from stake_metrics
+                await self.db_manager.execute_query("""
+                    DELETE FROM stake_metrics WHERE hotkey = ?
+                """, (hotkey,))
+                
+                # Delete from aggregated_tranche_metrics
+                await self.db_manager.execute_query("""
+                    DELETE FROM aggregated_tranche_metrics WHERE hotkey = ?
+                """, (hotkey,))
+                
+                # Get all tranche IDs for this hotkey
+                tranche_results = await self.db_manager.fetch_all("""
+                    SELECT id FROM stake_tranches WHERE hotkey = ?
+                """, (hotkey,))
+                
+                if tranche_results:
+                    tranche_ids = [row['id'] for row in tranche_results]
+                    
+                    # Delete from stake_tranche_exits for all associated tranches
+                    for tranche_id in tranche_ids:
+                        await self.db_manager.execute_query("""
+                            DELETE FROM stake_tranche_exits WHERE tranche_id = ?
+                        """, (tranche_id,))
+                
+                # Delete from stake_tranches
+                await self.db_manager.execute_query("""
+                    DELETE FROM stake_tranches WHERE hotkey = ?
+                """, (hotkey,))
+                
+                # Delete from stake_change_history
+                await self.db_manager.execute_query("""
+                    DELETE FROM stake_change_history WHERE hotkey = ?
+                """, (hotkey,))
+                
+                logger.info(f"Cleaned up data for deregistered miner: {hotkey}")
+                
+                # Update coldkey metrics if we know the coldkey
+                if coldkey:
+                    # Check if this coldkey has any remaining hotkeys
+                    remaining_hotkeys = await self.stake_tracker.get_all_hotkeys_for_coldkey(coldkey)
+                    
+                    if remaining_hotkeys:
+                        # Update coldkey metrics since some hotkeys were removed
+                        await self.stake_tracker._update_coldkey_metrics(coldkey)
+                    else:
+                        # No remaining hotkeys, delete coldkey metrics
+                        await self.db_manager.execute_query("""
+                            DELETE FROM coldkey_metrics WHERE coldkey = ?
+                        """, (coldkey,))
+                        
+                        logger.info(f"Removed coldkey metrics for {coldkey} (no remaining hotkeys)")
+            
+            logger.info(f"Deregistration cleanup complete: removed data for {len(deregistered_hotkeys)} miners")
+            return len(deregistered_hotkeys)
+            
+        except Exception as e:
+            logger.error(f"Error handling deregistered keys: {e}")
+            return 0
+    
+    async def cleanup_deregistered_miner(self, hotkey: str) -> bool:
+        """
+        Clean up all data for a specific deregistered miner.
+        
+        This method is designed to be called from the validator when a 
+        miner is deregistered, ensuring data is properly cleaned up.
+        
+        Args:
+            hotkey: Hotkey of the deregistered miner
+            
+        Returns:
+            bool: True if cleanup was successful
+        """
+        try:
+            logger.info(f"Cleaning up vesting data for deregistered miner: {hotkey}")
+            count = await self.handle_deregistered_keys(deregistered_hotkeys=[hotkey])
+            success = count > 0
+            
+            if success:
+                logger.info(f"Successfully cleaned up vesting data for {hotkey}")
+            else:
+                logger.warning(f"No data found to clean up for {hotkey}")
+                
+            return success
+        except Exception as e:
+            logger.error(f"Error cleaning up vesting data for {hotkey}: {e}")
+            return False 

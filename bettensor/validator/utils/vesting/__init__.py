@@ -10,10 +10,14 @@ to their scores based on the amount and duration of holding.
 from bettensor.validator.utils.vesting.blockchain_monitor import BlockchainMonitor
 from bettensor.validator.utils.vesting.stake_tracker import StakeTracker
 from bettensor.validator.utils.vesting.system import VestingSystem
+from bettensor.validator.utils.vesting.transaction_monitor import TransactionMonitor
+from bettensor.validator.utils.vesting.integration import VestingIntegration
 
 __all__ = [
     # Main components
     "BlockchainMonitor",
     "StakeTracker",
-    "VestingSystem"
+    "VestingSystem",
+    "TransactionMonitor",
+    "VestingIntegration"
 ] 

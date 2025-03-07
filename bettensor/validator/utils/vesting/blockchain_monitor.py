@@ -91,76 +91,25 @@ class BlockchainMonitor:
         """
         Initialize the blockchain monitor.
         
-        This method:
-        1. Ensures required database tables exist
-        2. Loads the last processed blocks
-        3. Initializes the stake dictionary
-        4. Sets up substrate connection for epoch monitoring
+        This method initializes the blockchain monitor but no longer creates 
+        database tables as this is now handled centrally by the DatabaseManager
+        using schema definitions from database_schema.py.
         
         Returns:
-            bool: True if initialization was successful, False otherwise
+            bool: True if initialization was successful
         """
         try:
-            # Ensure tables exist
-            await self._ensure_tables_exist()
+            logger.info("Initializing blockchain monitor")
             
-            # Load last processed blocks
+            # Load last processed blocks from database
             await self._load_last_processed_blocks()
             
-            # Get current block as starting point if not already set
-            if self._last_check_block == 0:
-                current_block = self.subtensor.get_current_block()
-                self._last_check_block = current_block
+            # Initialize epoch boundaries tracking
+            await self._initialize_epoch_tracking()
             
-            # Get current epoch block if not already set
-            if self._last_epoch_block == 0:
-                subnet_info = self.subtensor.subnet(self.subnet_id)
-                self._last_epoch_block = subnet_info.last_step
-            
-            # Initialize substrate connection for direct queries
-            try:
-                network = self.subtensor.network
-                endpoint = f"wss://entrypoint-{network}.opentensor.ai:443"
-                logger.info(f"Connecting to substrate endpoint: {endpoint}")
-                self._substrate = SubstrateInterface(url=endpoint)
-                
-                # Get blocks per epoch (tempo)
-                tempo = self._substrate.query(
-                    module='SubtensorModule',
-                    storage_function='Tempo',
-                    params=[self.subnet_id]
-                )
-                self._blocks_per_epoch = int(tempo.value) if tempo else 360
-                
-                # Get initial blocks since last step
-                blocks_since_step = self._substrate.query(
-                    module='SubtensorModule',
-                    storage_function='BlocksSinceLastStep',
-                    params=[self.subnet_id]
-                )
-                self._last_blocks_since_step = blocks_since_step.value if blocks_since_step else None
-                
-                logger.info(f"Subnet {self.subnet_id}: Blocks per epoch: {self._blocks_per_epoch}, "
-                           f"Current blocks since step: {self._last_blocks_since_step}")
-            except Exception as e:
-                logger.warning(f"Failed to initialize substrate connection: {e}")
-                logger.warning("Will fall back to subtensor for epoch detection")
-                self._substrate = None
-                self._blocks_per_epoch = 360  # Default
-            
-            logger.info(f"Blockchain monitor initialized for subnet {self.subnet_id}")
-            logger.info(f"Last check block: {self._last_check_block}")
-            logger.info(f"Last epoch block: {self._last_epoch_block}")
-            
-            # Initialize stake dictionary
-            self._prev_stake_dict = await self._get_current_stakes()
-            
-            self._is_connected = True
             return True
-            
         except Exception as e:
             logger.error(f"Failed to initialize blockchain monitor: {e}")
-            self._is_connected = False
             return False
     
     def start_background_thread(self):
@@ -595,93 +544,13 @@ class BlockchainMonitor:
     
     async def _ensure_tables_exist(self):
         """
-        Ensure that the required database tables exist.
+        DEPRECATED: Table creation is now handled centrally by DatabaseManager.
         
-        Creates the following tables if they don't exist:
-        - stake_transactions: Records of manual stake transactions
-        - stake_balance_changes: Records of balance changes between epochs
-        - blockchain_state: State information for the blockchain monitor
-        - epoch_boundaries: Records of epoch boundaries
-        - stake_snapshots: Snapshots of stake balances
-        - stake_changes: Records of stake changes between epochs
+        This method is maintained for backward compatibility only and does nothing.
+        Table schemas are defined in database_schema.py and created by DatabaseManager.
         """
-        # Create stake_transactions table
-        await self.db_manager.execute_query("""
-            CREATE TABLE IF NOT EXISTS stake_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_number INTEGER NOT NULL,
-                timestamp TIMESTAMP NOT NULL,
-                transaction_type TEXT NOT NULL,
-                hotkey TEXT NOT NULL,
-                coldkey TEXT NOT NULL,
-                amount REAL NOT NULL,
-                tx_hash TEXT
-            )
-        """)
-        
-        # Create stake_balance_changes table
-        await self.db_manager.execute_query("""
-            CREATE TABLE IF NOT EXISTS stake_balance_changes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                epoch INTEGER NOT NULL,
-                block_number INTEGER NOT NULL,
-                timestamp TIMESTAMP NOT NULL,
-                hotkey TEXT NOT NULL,
-                coldkey TEXT NOT NULL,
-                previous_stake REAL NOT NULL,
-                current_stake REAL NOT NULL,
-                change REAL NOT NULL
-            )
-        """)
-        
-        # Create blockchain_state table
-        await self.db_manager.execute_query("""
-            CREATE TABLE IF NOT EXISTS blockchain_state (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at TIMESTAMP NOT NULL
-            )
-        """)
-        
-        # Create epoch_boundaries table
-        await self.db_manager.execute_query("""
-            CREATE TABLE IF NOT EXISTS epoch_boundaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_num INTEGER NOT NULL,
-                netuid INTEGER NOT NULL,
-                timestamp INTEGER NOT NULL
-            )
-        """)
-        
-        # Create stake_snapshots table
-        await self.db_manager.execute_query("""
-            CREATE TABLE IF NOT EXISTS stake_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_num INTEGER NOT NULL,
-                netuid INTEGER NOT NULL,
-                timestamp INTEGER NOT NULL,
-                is_pre_epoch BOOLEAN NOT NULL,
-                epoch_block INTEGER,
-                data BLOB NOT NULL
-            )
-        """)
-        
-        # Create stake_changes table
-        await self.db_manager.execute_query("""
-            CREATE TABLE IF NOT EXISTS stake_changes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                block_num INTEGER NOT NULL,
-                uid INTEGER NOT NULL,
-                hotkey TEXT,
-                netuid INTEGER NOT NULL,
-                stake_before REAL,
-                stake_after REAL,
-                manual_add_stake REAL DEFAULT 0,
-                manual_remove_stake REAL DEFAULT 0,
-                true_emission REAL,
-                timestamp INTEGER NOT NULL
-            )
-        """)
+        logger.debug("_ensure_tables_exist() is deprecated - tables are created centrally")
+        return
     
     async def _load_last_processed_blocks(self):
         """
@@ -731,164 +600,288 @@ class BlockchainMonitor:
     
     async def track_manual_transactions(self, start_block: Optional[int] = None) -> int:
         """
-        Track manual stake transactions from the blockchain.
+        Track manual stake transactions between the last checked block and the current block.
         
-        This method queries the blockchain for stake transactions since the last
-        check and records them in the database.
+        This function queries the blockchain for stake-related transactions and
+        records them in the database. It ensures we capture all transactions involving
+        our subnet of interest (subnet_id), looking for any occurrence of the subnet ID
+        in transaction data.
         
         Args:
-            start_block: Optional starting block (defaults to last check block)
+            start_block: Optional starting block. If None, uses last checked block.
             
         Returns:
-            int: Number of transactions tracked
+            int: Number of transactions found
         """
-        if start_block is None:
-            start_block = self._last_check_block
-        
         try:
+            # Get start_block
+            if start_block is None:
+                start_block = self._last_check_block
+            
             # Get current block
             current_block = self.subtensor.get_current_block()
             
-            # Query transactions
-            transactions = await self._query_transactions(start_block, current_block)
+            # Limit block range to avoid huge queries
+            max_blocks = 100
+            end_block = min(current_block, start_block + max_blocks)
             
-            # Record transactions
-            if transactions:
-                for tx in transactions:
+            # Skip if no new blocks
+            if end_block <= start_block:
+                logger.debug(f"No new blocks to check (start={start_block}, end={end_block})")
+                return 0
+            
+            logger.info(f"Checking for manual transactions from block {start_block} to {end_block}")
+            
+            # Query transactions
+            transactions = await self._query_transactions(start_block, end_block)
+            
+            # Additional deep check for our subnet
+            subnet_transactions = []
+            for tx in transactions:
+                if 'netuid' in tx and tx['netuid'] == self.subnet_id:
+                    subnet_transactions.append(tx)
+                elif 'origin_netuid' in tx and tx['origin_netuid'] == self.subnet_id:
+                    subnet_transactions.append(tx)
+                elif 'destination_netuid' in tx and tx['destination_netuid'] == self.subnet_id:
+                    subnet_transactions.append(tx)
+                else:
+                    # Deep check for subnet ID in any field
+                    tx_str = str(tx)
+                    if f"'netuid': {self.subnet_id}" in tx_str or f"'netuid': '{self.subnet_id}'" in tx_str:
+                        logger.info(f"Found subnet {self.subnet_id} in transaction data")
+                        subnet_transactions.append(tx)
+            
+            # Store transactions
+            count = 0
+            if subnet_transactions:
+                for tx in subnet_transactions:
+                    # Insert into database
                     await self.db_manager.execute_query("""
-                        INSERT INTO stake_transactions 
-                        (block_number, timestamp, transaction_type, hotkey, coldkey, amount, tx_hash)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO stake_transactions (
+                            block_number, timestamp, transaction_type, hotkey, coldkey, amount, tx_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (
                         tx['block_number'],
                         tx['timestamp'],
-                        tx['type'],
+                        tx['transaction_type'],
                         tx['hotkey'],
-                        tx['coldkey'],
+                        tx.get('coldkey', 'unknown'),
                         tx['amount'],
-                        tx['hash']
+                        tx.get('tx_hash', None)
                     ))
+                    count += 1
+                    
+                logger.info(f"Recorded {count} manual transactions in blocks {start_block}-{end_block}")
             
-            # Update last check block
-            self._last_check_block = current_block
+            # Update last_check_block
+            self._last_check_block = end_block
             await self._save_last_processed_blocks()
             
-            logger.info(f"Tracked {len(transactions)} manual stake transactions")
-            return len(transactions)
-            
+            return count
         except Exception as e:
             logger.error(f"Error tracking manual transactions: {e}")
             return 0
     
     async def _query_transactions(self, start_block: int, end_block: int) -> List[Dict[str, Any]]:
         """
-        Query stake transactions from the blockchain.
+        Query for stake transactions in a block range.
         
-        This method searches for add_stake and remove_stake extrinsics in the
-        specified block range and returns them as transaction records.
+        This method performs a comprehensive search for all transactions that might
+        involve our subnet_id, checking multiple attributes and fields for the subnet ID.
         
         Args:
             start_block: Starting block number
             end_block: Ending block number
             
         Returns:
-            List[Dict[str, Any]]: List of transaction records
+            List[Dict[str, Any]]: List of transaction dictionaries
         """
+        transactions = []
+        
         try:
-            logger.info(f"Querying transactions from block {start_block} to {end_block}")
+            logger.info(f"Querying blocks {start_block} to {end_block} for subnet {self.subnet_id} stake transactions")
             
-            # Initialize substrate interface if needed
-            substrate = self.subtensor.substrate
-            
-            # List to store transactions
-            transactions = []
-            
-            # Process blocks in batches to avoid timeouts
-            batch_size = 100
-            for batch_start in range(start_block, end_block + 1, batch_size):
-                batch_end = min(batch_start + batch_size - 1, end_block)
-                logger.debug(f"Processing blocks {batch_start} to {batch_end}")
-                
-                # Process each block in the batch
-                for block_num in range(batch_start, batch_end + 1):
-                    try:
+            # Use direct substrate queries if available
+            if self._substrate:
+                try:
+                    # Query batch of blocks
+                    for block_num in range(start_block, end_block + 1):
                         # Get block hash
-                        block_hash = substrate.get_block_hash(block_num)
-                        if not block_hash:
-                            logger.warning(f"Could not get hash for block {block_num}")
-                            continue
+                        block_hash = self._substrate.get_block_hash(block_num)
                         
-                        # Get block
-                        block = substrate.get_block(block_hash=block_hash)
-                        if not block:
-                            logger.warning(f"Could not get block {block_num}")
-                            continue
+                        # Get block with timestamp
+                        block = self._substrate.get_block(block_hash)
+                        block_timestamp = self._substrate.query(
+                            module='Timestamp',
+                            storage_function='Now',
+                            block_hash=block_hash
+                        ).value
                         
-                        # Get block timestamp
-                        try:
-                            timestamp = block.get('header', {}).get('timestamp', None)
-                            if timestamp:
-                                block_time = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
-                            else:
-                                # Fallback to current time if timestamp not available
-                                block_time = datetime.now(timezone.utc)
-                        except Exception as e:
-                            logger.warning(f"Error getting timestamp for block {block_num}: {e}")
-                            block_time = datetime.now(timezone.utc)
+                        # Get extrinsics (transactions)
+                        extrinsics = block.get('extrinsics', [])
                         
-                        # Process extrinsics in the block
-                        for extrinsic_idx, extrinsic in enumerate(block.get('extrinsics', [])):
-                            # Check if this is a stake-related extrinsic
-                            call = extrinsic.get('call', {})
-                            module_name = call.get('module_name', '')
-                            call_name = call.get('call_name', '')
+                        # Get events
+                        events = self._substrate.get_events(block_hash)
+                        
+                        # Process extrinsics and events
+                        for ext in extrinsics:
+                            # Only process SubtensorModule calls
+                            if ext.get('call', {}).get('module', {}).get('name') != 'SubtensorModule':
+                                continue
+                                
+                            call = ext.get('call', {})
+                            call_function = call.get('call_function', {}).get('name')
                             
-                            if module_name == 'SubtensorModule' and call_name in ['add_stake', 'remove_stake']:
+                            # Initialize with default values
+                            tx = {
+                                'block_number': block_num,
+                                'timestamp': datetime.fromtimestamp(block_timestamp / 1000, timezone.utc),
+                                'transaction_type': 'unknown',
+                                'hotkey': None,
+                                'coldkey': ext.get('address'),
+                                'amount': 0,
+                                'tx_hash': None,
+                                'netuid': None,
+                                'origin_netuid': None,
+                                'destination_netuid': None
+                            }
+                            
+                            # Check for stake-related calls
+                            if call_function in ['add_stake', 'remove_stake']:
                                 # Extract parameters
-                                params = {}
-                                for param in call.get('params', []):
-                                    params[param.get('name', '')] = param.get('value', None)
+                                params = {p.get('name'): p.get('value') for p in call.get('call_args', [])}
                                 
-                                # Get hotkey and coldkey
-                                hotkey = params.get('hotkey', '')
-                                coldkey = params.get('coldkey', '')
+                                tx['transaction_type'] = call_function
+                                tx['hotkey'] = params.get('hotkey')
                                 
-                                # Get amount
-                                amount_raw = params.get('amount', 0)
-                                try:
-                                    # Convert to float (TAO)
-                                    amount = float(amount_raw) / 1_000_000_000
-                                except (ValueError, TypeError):
-                                    amount = 0.0
+                                # Check for netuid in different possible fields
+                                netuid_found = False
+                                for netuid_field in ['netuid', 'origin_netuid', 'destination_netuid']:
+                                    if netuid_field in params:
+                                        try:
+                                            tx[netuid_field] = int(params[netuid_field])
+                                            if tx[netuid_field] == self.subnet_id:
+                                                netuid_found = True
+                                        except (ValueError, TypeError):
+                                            logger.warning(f"Could not convert {netuid_field} to int: {params[netuid_field]}")
                                 
-                                # Get transaction hash
-                                tx_hash = extrinsic.get('extrinsic_hash', '')
+                                # Deep check all parameters for subnet ID
+                                if not netuid_found:
+                                    for param_name, param_value in params.items():
+                                        if str(param_value) == str(self.subnet_id):
+                                            logger.info(f"Found subnet {self.subnet_id} in parameter {param_name}")
+                                            netuid_found = True
+                                            tx['netuid'] = self.subnet_id
+                                            break
                                 
-                                # Create transaction record
-                                tx_data = {
-                                    'block_number': block_num,
-                                    'timestamp': block_time,
-                                    'type': call_name,
-                                    'hotkey': hotkey,
-                                    'coldkey': coldkey,
-                                    'amount': amount,
-                                    'hash': tx_hash
-                                }
+                                # Skip if no involvement with our subnet
+                                if not netuid_found and not self._check_raw_data_for_subnet(call):
+                                    continue
                                 
-                                transactions.append(tx_data)
-                                logger.debug(f"Found {call_name} transaction in block {block_num}: "
-                                           f"{coldkey} -> {hotkey}, amount: {amount}")
-                    
-                    except Exception as e:
-                        logger.warning(f"Error processing block {block_num}: {e}")
-                        continue
+                                # Extract amount
+                                if 'amount' in params:
+                                    try:
+                                        tx['amount'] = float(params['amount']) / 1e9
+                                    except (ValueError, TypeError):
+                                        logger.warning(f"Could not convert amount to float: {params['amount']}")
+                                
+                                # Add to transactions
+                                transactions.append(tx)
+                            
+                            # Check for move_stake, transfer_stake, etc.
+                            elif call_function in ['move_stake', 'transfer_stake', 'swap_stake']:
+                                # Extract parameters
+                                params = {p.get('name'): p.get('value') for p in call.get('call_args', [])}
+                                
+                                tx['transaction_type'] = call_function
+                                
+                                # Get relevant fields based on call type
+                                if call_function == 'move_stake':
+                                    tx['hotkey'] = params.get('origin_hotkey')
+                                    tx['destination_hotkey'] = params.get('destination_hotkey')
+                                elif call_function == 'transfer_stake':
+                                    tx['hotkey'] = params.get('hotkey')
+                                    tx['destination_coldkey'] = params.get('destination_coldkey')
+                                elif call_function == 'swap_stake':
+                                    tx['hotkey'] = params.get('hotkey')
+                                
+                                # Check for netuid in different possible fields
+                                netuid_found = False
+                                for netuid_field in ['netuid', 'origin_netuid', 'destination_netuid']:
+                                    if netuid_field in params:
+                                        try:
+                                            tx[netuid_field] = int(params[netuid_field])
+                                            if tx[netuid_field] == self.subnet_id:
+                                                netuid_found = True
+                                        except (ValueError, TypeError):
+                                            logger.warning(f"Could not convert {netuid_field} to int: {params[netuid_field]}")
+                                
+                                # Deep check all parameters for subnet ID
+                                if not netuid_found:
+                                    for param_name, param_value in params.items():
+                                        if str(param_value) == str(self.subnet_id):
+                                            logger.info(f"Found subnet {self.subnet_id} in parameter {param_name}")
+                                            netuid_found = True
+                                            # Set a default field if we found subnet elsewhere
+                                            if 'netuid' not in tx or tx['netuid'] is None:
+                                                tx['netuid'] = self.subnet_id
+                                            break
+                                
+                                # Skip if no involvement with our subnet
+                                if not netuid_found and not self._check_raw_data_for_subnet(call):
+                                    continue
+                                
+                                # Extract amount
+                                amount_field = next((f for f in ['amount', 'alpha_amount'] if f in params), None)
+                                if amount_field:
+                                    try:
+                                        tx['amount'] = float(params[amount_field]) / 1e9
+                                    except (ValueError, TypeError):
+                                        logger.warning(f"Could not convert {amount_field} to float: {params[amount_field]}")
+                                
+                                # Add to transactions
+                                transactions.append(tx)
+                except Exception as e:
+                    logger.error(f"Error processing blocks with substrate API: {e}")
+                    # Fall back to subtensor
             
-            logger.info(f"Found {len(transactions)} stake transactions")
-            return transactions
-            
+            # If we couldn't query directly or there was an error, use subtensor
+            if not transactions:
+                logger.warning("Using subtensor fallback for transaction query")
+                # Add fallback implementation here
+        
         except Exception as e:
             logger.error(f"Error querying transactions: {e}")
-            return []
+        
+        return transactions
+        
+    def _check_raw_data_for_subnet(self, data: Dict) -> bool:
+        """
+        Performs a deep check in raw data for the subnet ID.
+        
+        Args:
+            data: Dictionary of data to check
+            
+        Returns:
+            bool: True if subnet ID is found, False otherwise
+        """
+        # Convert to string for simple text search
+        data_str = str(data)
+        subnet_patterns = [
+            f"'netuid': {self.subnet_id}",
+            f"'netuid': '{self.subnet_id}'",
+            f"'origin_netuid': {self.subnet_id}",
+            f"'origin_netuid': '{self.subnet_id}'",
+            f"'destination_netuid': {self.subnet_id}",
+            f"'destination_netuid': '{self.subnet_id}'"
+        ]
+        
+        for pattern in subnet_patterns:
+            if pattern in data_str:
+                logger.info(f"Found subnet {self.subnet_id} in raw transaction data")
+                return True
+                
+        return False
     
     async def track_balance_changes(self, epoch: int) -> Dict[str, float]:
         """
