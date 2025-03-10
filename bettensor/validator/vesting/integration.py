@@ -1,18 +1,157 @@
 """
 Vesting system integration module.
 
-This module contains hooks and integration points to connect the vesting system 
-with the rest of the Bettensor framework, including the validator and database manager.
+This module contains all integration points to connect the vesting system 
+with the rest of the Bettensor framework, including:
+
+1. ScoringSystem integration for weight adjustments
+2. DatabaseManager integration for schema initialization  
+3. Validator integration for handling deregistration events
+
+It serves as a single entry point for all vesting system integration needs.
 """
 
 import logging
 import functools
 import numpy as np
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Union
 
 from bettensor.validator.vesting.system import VestingSystem
+from bettensor.validator.vesting.database_schema import create_vesting_tables
 
 logger = logging.getLogger(__name__)
+
+# ----------------------
+# Database Integration
+# ----------------------
+
+async def initialize_vesting_tables(db_manager) -> bool:
+    """
+    Initialize vesting system database tables.
+    
+    This function should be called by the DatabaseManager during
+    initialization to create all vesting system tables.
+    
+    Args:
+        db_manager: Database manager instance
+        
+    Returns:
+        bool: True if tables were created successfully
+    """
+    logger.info("Initializing vesting system database schema")
+    return await create_vesting_tables(db_manager)
+
+# ----------------------
+# Validator Integration
+# ----------------------
+
+async def handle_deregistered_miner(vesting_system: Optional[VestingSystem], hotkey: str) -> bool:
+    """
+    Handle deregistration of a miner in the vesting system.
+    
+    This function should be called by the validator when a miner is deregistered
+    to clean up associated vesting data.
+    
+    Args:
+        vesting_system: The vesting system instance
+        hotkey: Hotkey of the deregistered miner
+        
+    Returns:
+        bool: True if cleanup was successful
+    """
+    if not vesting_system:
+        logger.warning("Cannot handle deregistration: vesting_system is None")
+        return False
+    
+    try:
+        logger.info(f"Cleaning up vesting data for deregistered miner: {hotkey}")
+        count = await vesting_system.handle_deregistered_keys(deregistered_hotkeys=[hotkey])
+        return count > 0
+    except Exception as e:
+        logger.error(f"Error handling miner deregistration for {hotkey}: {e}")
+        return False
+
+async def batch_handle_deregistrations(vesting_system: Optional[VestingSystem], 
+                                   deregistered_hotkeys: List[str]) -> int:
+    """
+    Handle batch deregistration of multiple miners.
+    
+    Args:
+        vesting_system: The vesting system instance
+        deregistered_hotkeys: List of hotkeys to deregister
+        
+    Returns:
+        int: Number of successfully cleaned up miners
+    """
+    if not vesting_system or not deregistered_hotkeys:
+        return 0
+    
+    try:
+        logger.info(f"Batch cleaning vesting data for {len(deregistered_hotkeys)} deregistered miners")
+        return await vesting_system.handle_deregistered_keys(deregistered_hotkeys=deregistered_hotkeys)
+    except Exception as e:
+        logger.error(f"Error batch handling deregistrations: {e}")
+        return 0
+
+# ----------------------
+# Factory Functions
+# ----------------------
+
+def get_vesting_system(subtensor, subnet_id, db_manager) -> VestingSystem:
+    """
+    Get or create a vesting system instance.
+    
+    Args:
+        subtensor: Subtensor instance
+        subnet_id: Subnet ID
+        db_manager: Database manager instance
+        
+    Returns:
+        VestingSystem: The vesting system instance
+    """
+    return VestingSystem(
+        subtensor=subtensor,
+        subnet_id=subnet_id,
+        db_manager=db_manager
+    )
+
+async def apply_vesting_multipliers(vesting_system: VestingSystem,
+                               weights: np.ndarray, 
+                               uids: List[int], 
+                               hotkeys: List[str]) -> np.ndarray:
+    """
+    Apply vesting multipliers to weights.
+    
+    This function should be called by the validator during weight setting
+    to apply vesting multipliers to the base weights.
+    
+    Args:
+        vesting_system: The vesting system instance
+        weights: Base weights to apply multipliers to
+        uids: UIDs corresponding to the weights
+        hotkeys: Hotkeys corresponding to the UIDs
+        
+    Returns:
+        np.ndarray: Adjusted weights with vesting multipliers applied
+    """
+    if vesting_system is None:
+        logger.warning("Cannot apply vesting multipliers: vesting_system is None")
+        return weights
+        
+    try:
+        logger.info(f"Applying vesting multipliers to {len(weights)} weights")
+        return await vesting_system.apply_vesting_multipliers(
+            weights=weights,
+            uids=uids,
+            hotkeys=hotkeys
+        )
+    except Exception as e:
+        logger.error(f"Error applying vesting multipliers: {e}", exc_info=True)
+        return weights
+
+# ----------------------
+# Scoring System Integration
+# ----------------------
 
 class VestingIntegration:
     """
@@ -138,7 +277,8 @@ class VestingIntegration:
                 return original_weights
             
             # Apply vesting multipliers
-            adjusted_weights = await self.vesting_system.apply_vesting_multipliers(
+            adjusted_weights = await apply_vesting_multipliers(
+                vesting_system=self.vesting_system,
                 weights=original_weights,
                 uids=uids,
                 hotkeys=hotkeys
@@ -179,84 +319,4 @@ class VestingIntegration:
             
         except Exception as e:
             logger.error(f"Error getting hotkeys for UIDs: {e}")
-            return []
-
-# Import only when needed to avoid circular imports
-def get_vesting_system(subtensor, subnet_id, db_manager):
-    """
-    Get or create a vesting system instance.
-    
-    This is a factory function to get a vesting system instance while avoiding
-    circular imports.
-    
-    Args:
-        subtensor: Subtensor instance
-        subnet_id: Subnet ID
-        db_manager: Database manager instance
-        
-    Returns:
-        VestingSystem: The vesting system instance
-    """
-    from bettensor.validator.vesting.system import VestingSystem
-    return VestingSystem(
-        subtensor=subtensor,
-        subnet_id=subnet_id,
-        db_manager=db_manager
-    )
-
-async def initialize_vesting_tables(db_manager) -> bool:
-    """
-    Initialize vesting system database tables.
-    
-    This function is intended to be called by the DatabaseManager during
-    initialization to create all vesting system tables.
-    
-    Args:
-        db_manager: Database manager instance
-        
-    Returns:
-        bool: True if tables were created successfully
-    """
-    from bettensor.validator.vesting.database_schema import create_vesting_tables
-    return create_vesting_tables(db_manager)
-
-async def handle_deregistered_miner(subtensor, subnet_id, db_manager, hotkey: str) -> bool:
-    """
-    Handle deregistration of a miner in the vesting system.
-    
-    This function should be called by the validator when a miner is deregistered
-    to clean up associated vesting data.
-    
-    Args:
-        subtensor: Subtensor instance
-        subnet_id: Subnet ID
-        db_manager: Database manager instance
-        hotkey: Hotkey of the deregistered miner
-        
-    Returns:
-        bool: True if cleanup was successful
-    """
-    vesting_system = get_vesting_system(subtensor, subnet_id, db_manager)
-    return await vesting_system.cleanup_deregistered_miner(hotkey)
-
-async def apply_vesting_multipliers(subtensor, subnet_id, db_manager, 
-                               weights, uids, hotkeys) -> List[float]:
-    """
-    Apply vesting multipliers to weights.
-    
-    This function should be called by the validator during weight setting
-    to apply vesting multipliers to the base weights.
-    
-    Args:
-        subtensor: Subtensor instance
-        subnet_id: Subnet ID
-        db_manager: Database manager instance
-        weights: Base weights to apply multipliers to
-        uids: UIDs corresponding to the weights
-        hotkeys: Hotkeys corresponding to the weights
-        
-    Returns:
-        List[float]: Weights with vesting multipliers applied
-    """
-    vesting_system = get_vesting_system(subtensor, subnet_id, db_manager)
-    return vesting_system.apply_vesting_multipliers(weights, uids, hotkeys) 
+            return [] 
