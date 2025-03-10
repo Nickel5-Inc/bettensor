@@ -10,7 +10,7 @@ import traceback
 
 import sqlalchemy
 from sqlalchemy import inspect
-from bettensor.validator.utils.database.database_init import initialize_database
+from bettensor.validator.database.database_init import initialize_database
 import async_timeout
 import uuid
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession

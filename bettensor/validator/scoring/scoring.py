@@ -2214,6 +2214,57 @@ class ScoringSystem:
                 await self.db_manager.initialize(force=True)
             
             # 2. Verify ROI columns in miner_stats
+            # Enhanced approach - first check if miner_stats exists
+            if 'miner_stats' in existing_tables:
+                bt.logging.info("Verifying ROI columns in miner_stats table")
+                
+                # Directly check for required columns
+                table_info_query = "PRAGMA table_info(miner_stats)"
+                columns = await self.db_manager.fetch_all(table_info_query)
+                existing_columns = [col['name'] for col in columns]
+                
+                # Define all required ROI columns
+                required_roi_columns = ["miner_15_day_roi", "miner_30_day_roi", "miner_45_day_roi", "miner_current_roi", "miner_lifetime_roi"]
+                missing_columns = [col for col in required_roi_columns if col not in existing_columns]
+                
+                # Add missing columns directly with forced SQL commands
+                if missing_columns:
+                    bt.logging.warning(f"Found missing ROI columns in database schema: {missing_columns}")
+                    
+                    # Force-add each missing column
+                    for col in missing_columns:
+                        try:
+                            bt.logging.info(f"Adding missing column: {col}")
+                            add_column_query = f"ALTER TABLE miner_stats ADD COLUMN {col} REAL DEFAULT 0.0"
+                            
+                            # Execute with multiple retries
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                try:
+                                    await self.db_manager.execute_query(add_column_query)
+                                    bt.logging.info(f"Successfully added column {col}")
+                                    break
+                                except Exception as retry_err:
+                                    if "duplicate column name" in str(retry_err).lower():
+                                        bt.logging.info(f"Column {col} already exists")
+                                        break
+                                    if attempt == max_retries - 1:
+                                        raise
+                                    await asyncio.sleep(1)
+                        except Exception as col_err:
+                            bt.logging.error(f"Error adding column {col}: {col_err}")
+                
+                # Verify columns were added successfully
+                columns_after = await self.db_manager.fetch_all(table_info_query)
+                existing_columns_after = [col['name'] for col in columns_after]
+                still_missing = [col for col in required_roi_columns if col not in existing_columns_after]
+                
+                if still_missing:
+                    bt.logging.error(f"Failed to add columns: {still_missing} even after repair attempt")
+                else:
+                    bt.logging.info("All required ROI columns are present in miner_stats table")
+            
+            # Also call the existing migration method as backup
             await self._migrate_miner_stats_roi_columns()
             
             # 3. Verify miner_stats data integrity
@@ -2719,12 +2770,45 @@ class ScoringSystem:
         """
         bt.logging.info("Updating miner ROI statistics...")
         
-        # Ensure ROI columns exist before updating
+        # Ensure ROI columns exist before updating - use more aggressive approach to handle sync issues
         try:
-            migration_success = await self._migrate_miner_stats_roi_columns()
-            if not migration_success:
-                bt.logging.error("Migration of ROI columns failed, cannot update ROI statistics")
-                return False
+            # First verify if columns exist in the schema
+            table_info_query = "PRAGMA table_info(miner_stats)"
+            columns = await self.db_manager.fetch_all(table_info_query)
+            existing_columns = [col['name'] for col in columns]
+            
+            # Define needed columns
+            roi_columns = ["miner_15_day_roi", "miner_30_day_roi", "miner_45_day_roi"]
+            missing_columns = [col for col in roi_columns if col not in existing_columns]
+            
+            # If columns are missing, add them directly
+            if missing_columns:
+                bt.logging.warning(f"Found missing ROI columns in database schema: {missing_columns}")
+                
+                # Try to add missing columns one by one
+                for col in missing_columns:
+                    try:
+                        bt.logging.info(f"Adding missing column: {col}")
+                        add_column_query = f"ALTER TABLE miner_stats ADD COLUMN {col} REAL DEFAULT 0.0"
+                        await self.db_manager.execute_query(add_column_query)
+                    except Exception as col_err:
+                        bt.logging.error(f"Error adding column {col}: {col_err}")
+                        # Continue trying other columns
+                
+                # Verify columns were added
+                columns_after = await self.db_manager.fetch_all(table_info_query)
+                existing_columns_after = [col['name'] for col in columns_after]
+                
+                # Check if all columns exist now
+                still_missing = [col for col in roi_columns if col not in existing_columns_after]
+                if still_missing:
+                    bt.logging.error(f"Failed to add columns: {still_missing}. Cannot update ROI statistics.")
+                    return False
+                    
+                bt.logging.info("Successfully added missing ROI columns to database schema")
+            
+            # Also try the standard migration as a backup approach
+            await self._migrate_miner_stats_roi_columns()
         except Exception as e:
             bt.logging.error(f"Error ensuring ROI columns exist: {e}")
             bt.logging.error(traceback.format_exc())

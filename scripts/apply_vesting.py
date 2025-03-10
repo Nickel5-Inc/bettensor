@@ -14,8 +14,8 @@ import sys
 from datetime import datetime, timezone
 import bittensor as bt
 
-from bettensor.validator.utils.database import DatabaseManager
-from bettensor.validator.utils.vesting import VestingTracker, VestingSystemIntegration
+from bettensor.validator.database import DatabaseManager
+from bettensor.validator.vesting import VestingTracker, VestingSystemIntegration
 
 
 # Configure logging
@@ -69,7 +69,7 @@ async def enable_vesting_rewards(subnet_id, db_path, scoring_system=None):
     
     # If no scoring system provided, attempt to find and load it
     if scoring_system is None:
-        from bettensor.validator.utils.scoring.scoring import get_active_scoring_system
+        from bettensor.validator.scoring.scoring import get_active_scoring_system
         
         scoring_system = get_active_scoring_system()
         if scoring_system is None:
@@ -95,7 +95,7 @@ async def disable_vesting_rewards(integration=None):
     
     # If no integration provided, attempt to find it
     if integration is None:
-        from bettensor.validator.utils.scoring.scoring import get_active_scoring_system
+        from bettensor.validator.scoring.scoring import get_active_scoring_system
         
         scoring_system = get_active_scoring_system()
         if scoring_system is None:

@@ -7,31 +7,19 @@ import copy
 import traceback
 import signal
 import torch
-import sqlite3
 import bittensor as bt
-import argparse
-from uuid import UUID
+import websocket
 from dotenv import load_dotenv
-from copy import deepcopy
 from datetime import datetime, timezone, timedelta
 import asyncio
-import websocket
-from websocket._exceptions import WebSocketConnectionClosedException
-from bettensor.protocol import GameData, Metadata
+from bettensor.protocol import GameData
 from bettensor.validator.bettensor_validator import BettensorValidator
-from bettensor.validator.utils.ensure_dependencies import ensure_dependencies
-from bettensor.validator.utils.io.sports_data import SportsData
-from bettensor.validator.utils.scoring.watchdog import Watchdog
-from bettensor.validator.utils.io.auto_updater import check_and_install_dependencies, perform_update
-import threading
+from bettensor.validator.scoring.watchdog import Watchdog
+from bettensor.validator.io.auto_updater import check_and_install_dependencies, perform_update
 from functools import partial
 from typing import Optional, Any
 import async_timeout
 from bettensor.validator.utils.state_sync import StateSync
-import math
-from bettensor.validator.utils.database.database_manager import DatabaseManager
-import json
-import numpy as np
 import signal
 
 # Constants for timeouts (in seconds)

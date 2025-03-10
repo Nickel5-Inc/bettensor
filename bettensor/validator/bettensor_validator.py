@@ -21,16 +21,16 @@ from typing import Dict, Tuple
 from datetime import datetime, timedelta, timezone
 from bettensor.base.neuron import BaseNeuron
 from bettensor.protocol import TeamGamePrediction
-from bettensor.validator.utils.io.website_handler import WebsiteHandler
-from bettensor.validator.utils.scoring.scoring import ScoringSystem
-from .utils.scoring.entropy_system import EntropySystem
-from bettensor.validator.utils.io.sports_data import SportsData
-from bettensor.validator.utils.scoring.weights_functions import WeightSetter
-from bettensor.validator.utils.database.database_manager import DatabaseManager
-from bettensor.validator.utils.io.miner_data import MinerDataMixin
-from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
-from bettensor.validator.utils.io.base_api_client import BaseAPIClient
-from bettensor.validator.utils.scoring.watchdog import Watchdog
+from bettensor.validator.io.website_handler import WebsiteHandler
+from bettensor.validator.scoring.scoring import ScoringSystem
+from bettensor.validator.scoring.entropy_system import EntropySystem
+from bettensor.validator.io.sports_data import SportsData
+from bettensor.validator.scoring.weights_functions import WeightSetter
+from bettensor.validator.database.database_manager import DatabaseManager
+from bettensor.validator.io.miner_data import MinerDataMixin
+from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
+from bettensor.validator.io.base_api_client import BaseAPIClient
+from bettensor.validator.scoring.watchdog import Watchdog
 from bettensor import __spec_version__
 from types import SimpleNamespace
 
@@ -202,7 +202,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
     def setup_bittensor_objects(
         self, config
-    ) -> Tuple[bt.wallet, bt.subtensor, bt.dendrite, bt.metagraph]:
+    ) -> Tuple["bt.wallet", "bt.subtensor", "bt.dendrite", "bt.metagraph"]: # type: ignore
         """sets up the bittensor objects"""
         try:
             wallet = bt.wallet(config=config)

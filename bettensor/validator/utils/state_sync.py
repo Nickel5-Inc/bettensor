@@ -418,6 +418,19 @@ class StateSync:
                                     cursor.execute("PRAGMA quick_check")
                                     quick_check = cursor.fetchone()[0]
                                     
+                                    # Also check for required tables and essential columns
+                                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='miner_stats'")
+                                    if cursor.fetchone():
+                                        # Check for essential ROI columns
+                                        cursor.execute("PRAGMA table_info(miner_stats)")
+                                        columns = [row[1] for row in cursor.fetchall()]
+                                        required_roi_columns = ["miner_15_day_roi", "miner_30_day_roi", "miner_45_day_roi"]
+                                        
+                                        missing_columns = [col for col in required_roi_columns if col not in columns]
+                                        if missing_columns:
+                                            bt.logging.warning(f"Downloaded database is missing columns: {missing_columns}")
+                                            bt.logging.info("Columns will be added after the download is complete")
+                                    
                                     cursor.close()
                                     conn.close()
                                     
@@ -477,6 +490,13 @@ class StateSync:
                                     async with db_manager.engine.connect() as conn:
                                         bt.logging.debug("Verifying connection")
                                         await conn.execute(text("SELECT 1"))
+                                        
+                                        # Ensure database schema is up to date after downloading
+                                        bt.logging.info("Ensuring database schema is up to date...")
+                                        if hasattr(self.validator, 'scoring_system') and self.validator.scoring_system:
+                                            await self.validator.scoring_system.verify_and_repair_database_schema()
+                                        else:
+                                            bt.logging.warning("Scoring system not available to repair schema. Will rely on future initialization.")
                                         
                                 except Exception as e:
                                     bt.logging.error(f"Database initialization failed: {e}")
