@@ -12,7 +12,7 @@ import async_timeout
 import pytz
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 from typing import List, Tuple, Dict
 from collections import defaultdict
 import random

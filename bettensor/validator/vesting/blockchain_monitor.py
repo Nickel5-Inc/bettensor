@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple, Any, Set, Union
 import bittensor as bt
 from bittensor.utils.balance import Balance
 import numpy as np
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 from substrateinterface import SubstrateInterface
 from substrateinterface.exceptions import SubstrateRequestException
 

@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 
 import numpy as np
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 

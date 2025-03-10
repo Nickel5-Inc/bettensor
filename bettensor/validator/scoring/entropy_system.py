@@ -16,7 +16,7 @@ import async_timeout
 import copy
 import random
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 
 
 class EntropySystem:

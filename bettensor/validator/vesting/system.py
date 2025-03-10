@@ -14,11 +14,11 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 import bittensor as bt
 import numpy as np
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
-from bettensor.validator.utils.vesting.blockchain_monitor import BlockchainMonitor
-from bettensor.validator.utils.vesting.stake_tracker import StakeTracker
-from bettensor.validator.utils.vesting.transaction_monitor import TransactionMonitor
-from bettensor.validator.utils.vesting.stake_tracker import INFLOW, OUTFLOW, NEUTRAL, EMISSION
+from bettensor.validator.database.database_manager import DatabaseManager
+from bettensor.validator.vesting.blockchain_monitor import BlockchainMonitor
+from bettensor.validator.vesting.stake_tracker import StakeTracker
+from bettensor.validator.vesting.transaction_monitor import TransactionMonitor
+from bettensor.validator.vesting.stake_tracker import INFLOW, OUTFLOW, NEUTRAL, EMISSION
 
 logger = logging.getLogger(__name__)
 
@@ -54,22 +54,22 @@ class VestingSystem:
         Initialize the vesting system.
         
         Args:
-            subtensor: Initialized subtensor instance
-            subnet_id: The subnet ID to monitor
-            db_manager: Database manager for persistent storage
-            minimum_stake: Minimum stake required to receive a multiplier
-            retention_window_days: Window for calculating retention metrics
-            retention_target: Target retention percentage for max multiplier
-            max_multiplier: Maximum multiplier to apply
-            use_background_thread: Whether to run blockchain monitoring in a background thread
-            query_interval_seconds: Interval between blockchain queries in seconds
+            subtensor: Subtensor client for blockchain queries
+            subnet_id: Subnet ID to monitor
+            db_manager: Database manager
+            minimum_stake: Minimum stake required for eligibility (default: 0.3 τ)
+            retention_window_days: Window for calculating retention metrics (default: 30 days)
+            retention_target: Target retention percentage for max multiplier (default: 0.9)
+            max_multiplier: Maximum multiplier to apply (default: 1.5)
+            use_background_thread: Whether to use a background thread for monitoring
+            query_interval_seconds: How often to poll for updates (seconds)
             detailed_transaction_tracking: Whether to use detailed transaction tracking
         """
         self.subtensor = subtensor
         self.subnet_id = subnet_id
         self.db_manager = db_manager
         
-        # Configuration
+        # Configuration parameters
         self.minimum_stake = minimum_stake
         self.retention_window_days = retention_window_days
         self.retention_target = retention_target
@@ -77,7 +77,7 @@ class VestingSystem:
         self.use_background_thread = use_background_thread
         self.detailed_transaction_tracking = detailed_transaction_tracking
         
-        # Components
+        # Create components
         self.blockchain_monitor = BlockchainMonitor(
             subtensor=subtensor,
             subnet_id=subnet_id,
@@ -95,7 +95,7 @@ class VestingSystem:
             self.transaction_monitor = TransactionMonitor(
                 subtensor=subtensor,
                 subnet_id=subnet_id,
-            db_manager=db_manager,
+                db_manager=db_manager,
                 verbose=False
             )
         else:
@@ -124,13 +124,19 @@ class VestingSystem:
             bool: True if initialization was successful
         """
         try:
+            logger.info("Initializing vesting system")
+            
             # Initialize components
             await self.blockchain_monitor.initialize()
             await self.stake_tracker.initialize()
             
             # Initialize transaction monitor if enabled
             if self.detailed_transaction_tracking and self.transaction_monitor:
-                await self.transaction_monitor.initialize()
+                success = await self.transaction_monitor.initialize()
+                if not success:
+                    logger.warning("Failed to initialize transaction monitor, continuing without detailed transaction tracking")
+                    self.detailed_transaction_tracking = False
+                    self.transaction_monitor = None
             
             # Register event handlers for stake changes
             self._register_stake_change_handler()
@@ -142,8 +148,13 @@ class VestingSystem:
             
             # Start transaction monitoring if enabled
             if self.detailed_transaction_tracking and self.transaction_monitor:
-                self.transaction_monitor.start_monitoring()
-                logger.info("Started detailed transaction monitoring")
+                success = self.transaction_monitor.start_monitoring()
+                if not success:
+                    logger.warning("Failed to start transaction monitor, continuing without detailed transaction tracking")
+                    self.detailed_transaction_tracking = False
+                    self.transaction_monitor = None
+                else:
+                    logger.info("Started detailed transaction monitoring")
             
             # Initialize from metagraph if requested
             if auto_init_metagraph:
@@ -191,29 +202,32 @@ class VestingSystem:
     
     async def shutdown(self):
         """
-        Shutdown the vesting system.
+        Shutdown the vesting system and clean up resources.
         
-        This method stops the background thread if it's running.
+        This method stops all monitoring and cleans up resources.
         
         Returns:
-            bool: True if shutdown was successful, False otherwise
+            bool: True if shutdown was successful
         """
         try:
-            # Stop background thread if running
-            if self.use_background_thread and self.blockchain_monitor.is_running:
+            logger.info("Shutting down vesting system")
+            
+            # Stop blockchain monitoring
+            if self.use_background_thread:
+                logger.info("Stopping blockchain monitor background thread")
                 self.blockchain_monitor.stop_background_thread()
-                logger.info("Stopped blockchain monitor background thread")
             
             # Stop transaction monitoring if enabled
-            if self.detailed_transaction_tracking and self.transaction_monitor and self.transaction_monitor.is_running:
-                self.transaction_monitor.stop_monitoring()
-                logger.info("Stopped detailed transaction monitoring")
+            if self.transaction_monitor:
+                logger.info("Stopping transaction monitor")
+                success = self.transaction_monitor.stop_monitoring()
+                if not success:
+                    logger.warning("Failed to cleanly stop transaction monitor")
             
-            logger.info("Vesting system shutdown successfully")
+            logger.info("Vesting system shut down successfully")
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to shutdown vesting system: {e}")
+            logger.error(f"Error shutting down vesting system: {e}")
             return False
     
     async def update(self, epoch: int):

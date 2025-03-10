@@ -373,4 +373,80 @@ The vesting system is designed to be efficient, but can be tuned for performance
 - **Query Interval**: Adjust `query_interval_seconds` to control how often the blockchain is queried
 - **Detailed Transaction Tracking**: Disable `detailed_transaction_tracking=False` for lighter-weight tracking
 - **Metric Caching**: Aggregated tranche metrics are cached for one hour to reduce computation
-- **Numpy Optimizations**: Vector operations use numpy for efficient calculation 
+- **Numpy Optimizations**: Vector operations use numpy for efficient calculation
+
+## Web API Integration
+
+The vesting system can now expose all its data to external web services through the `VestingAPIInterface`. This interface provides methods to collect, format, and push vesting-related data to a web API endpoint. This is useful for:
+
+1. **Dashboards**: Create web dashboards showing vesting stats and multipliers
+2. **Analytics**: Perform advanced analytics on stake data
+3. **Monitoring**: Real-time monitoring of vesting system health
+4. **User Interfaces**: Build user interfaces for miners to check their vesting status
+
+### API Interface Features
+
+- **System Overview**: Push system configuration, stats, and health information
+- **Miner Metrics**: Push stake metrics for all miners, including holding percentages and multipliers
+- **Coldkey Data**: Push aggregated metrics for coldkeys and their associated hotkeys
+- **Transaction History**: Push detailed transaction history with flow categorization
+- **Tranche Data**: Push tranche-level data for detailed retention analysis
+- **Multiplier Data**: Push calculated multipliers for all miners
+- **Incremental Updates**: Support for incremental data updates to minimize bandwidth
+- **Batched Processing**: Support for processing data in batches for large datasets
+- **Background Polling**: Automatically push data updates on a configurable schedule
+
+### Using the API Interface
+
+```python
+from bettensor.validator.utils.vesting.api_interface import VestingAPIInterface
+
+# Create API interface
+api_interface = VestingAPIInterface(
+    vesting_system=vesting_system,
+    api_base_url="https://api.example.com",
+    api_key="your_api_key",
+    poll_interval_seconds=300,
+    push_enabled=True
+)
+
+# Initialize API interface
+await api_interface.initialize()
+
+# Start background polling (if push_enabled=True)
+await api_interface.start()
+
+# Push all data
+await api_interface.push_all_data()
+
+# Or push specific data
+await api_interface.push_system_overview()
+await api_interface.push_all_stake_metrics()
+await api_interface.push_all_coldkey_metrics()
+await api_interface.push_recent_transactions()
+await api_interface.push_vesting_multipliers()
+await api_interface.push_tranche_data()
+
+# Get details for a specific miner
+details = await api_interface.request_miner_details("miner_hotkey")
+
+# Stop the API interface
+await api_interface.stop()
+```
+
+See the example script at `examples/vesting_api_example.py` for a complete example.
+
+### Running as a Daemon
+
+The API interface can be run as a background daemon to continuously push data updates:
+
+```bash
+python examples/vesting_api_example.py \
+    --netuid 30 \
+    --api.url https://api.example.com \
+    --api.key your_api_key \
+    --api.push_enabled \
+    --action daemon
+```
+
+This will start the interface in daemon mode, continuously pushing updates to the API endpoint. 

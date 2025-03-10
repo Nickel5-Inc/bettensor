@@ -10,7 +10,7 @@ import functools
 import numpy as np
 from typing import Dict, List, Optional, Callable, Any
 
-from bettensor.validator.utils.vesting.system import VestingSystem
+from bettensor.validator.vesting.system import VestingSystem
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +197,7 @@ def get_vesting_system(subtensor, subnet_id, db_manager):
     Returns:
         VestingSystem: The vesting system instance
     """
-    from bettensor.validator.utils.vesting.system import VestingSystem
+    from bettensor.validator.vesting.system import VestingSystem
     return VestingSystem(
         subtensor=subtensor,
         subnet_id=subnet_id,
@@ -217,7 +217,7 @@ async def initialize_vesting_tables(db_manager) -> bool:
     Returns:
         bool: True if tables were created successfully
     """
-    from bettensor.validator.utils.vesting.database_schema import create_vesting_tables
+    from bettensor.validator.vesting.database_schema import create_vesting_tables
     return create_vesting_tables(db_manager)
 
 async def handle_deregistered_miner(subtensor, subnet_id, db_manager, hotkey: str) -> bool:

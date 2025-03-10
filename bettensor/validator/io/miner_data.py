@@ -13,10 +13,10 @@ import bittensor as bt
 from pydantic import ValidationError
 import torch
 from bettensor.protocol import GameData, TeamGame, TeamGamePrediction
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 import time
 
-from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
+from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
 
 
 """

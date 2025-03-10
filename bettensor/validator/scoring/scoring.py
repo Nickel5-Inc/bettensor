@@ -28,11 +28,11 @@ import random
 import copy
 import bittensor as bt
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 from .scoring_data import ScoringData
 from .entropy_system import EntropySystem
-from bettensor.validator.utils.database.database_init import initialize_database
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_init import initialize_database
+from bettensor.validator.database.database_manager import DatabaseManager
 
 # Global reference to active scoring system
 _ACTIVE_SCORING_SYSTEM = None

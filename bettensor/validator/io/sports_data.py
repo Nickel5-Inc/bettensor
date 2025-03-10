@@ -7,16 +7,12 @@ import sqlite3
 import requests
 import bittensor as bt
 from dateutil import parser
-from .sports_config import sports_config
 from datetime import datetime, timedelta, timezone
 from ..scoring.entropy_system import EntropySystem
-from .bettensor_api_client import BettensorAPIClient
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 import traceback
 import asyncio
 import async_timeout
-from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.sql.expression import ColumnElement
 from sqlalchemy import text
 
 

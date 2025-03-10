@@ -9,7 +9,7 @@ This module provides hooks for the vesting system to integrate with:
 import logging
 from typing import List, Optional
 
-from bettensor.validator.utils.vesting.database_schema import create_vesting_tables
+from bettensor.validator.vesting.database_schema import create_vesting_tables
 
 logger = logging.getLogger(__name__)
 

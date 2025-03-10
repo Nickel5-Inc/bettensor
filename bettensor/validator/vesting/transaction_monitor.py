@@ -16,7 +16,7 @@ import bittensor as bt
 from substrateinterface import SubstrateInterface
 from substrateinterface.exceptions import SubstrateRequestException
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
@@ -26,26 +26,23 @@ OUTFLOW = "outflow"       # Stake removed from the hotkey
 NEUTRAL = "neutral"       # No net change to the hotkey's stake
 EMISSION = "emission"     # Stake added via network emissions/rewards
 
+# Transaction types
+ADD_STAKE = "add_stake"
+REMOVE_STAKE = "remove_stake"
+TRANSFER_OWNERSHIP = "transfer_ownership"
+BURN_STAKE = "burn_stake"
+MOVE_STAKE = "move_stake"
+SWAP_STAKE = "swap_stake"
+EMISSION_REWARD = "emission"
+UNKNOWN = "unknown"
+
 class TransactionMonitor:
     """
-    Monitors and tracks detailed stake transactions on the Bittensor blockchain.
+    Monitors blockchain for stake-related transactions.
     
-    This class provides precise tracking of:
-    1. Add stake transactions
-    2. Remove stake transactions
-    3. Move stake operations
-    4. Transfer stake operations
-    5. Swap stake operations
-    
-    It matches extrinsics (transaction requests) with their corresponding 
-    events (confirmed transactions) and tracks detailed information including
-    amounts, fees, and involved parties.
-    
-    Transactions are categorized as:
-    - INFLOW: Stake added to the hotkey (AddStake, MoveStake/destination, SwapStake/destination)
-    - OUTFLOW: Stake removed from the hotkey (RemoveStake, MoveStake/origin, TransferStake, SwapStake/origin)
-    - NEUTRAL: No net change to the hotkey's stake (certain TransferStake scenarios)
-    - EMISSION: Stake added via network emissions/rewards
+    This class provides detailed tracking of stake transactions on the Bittensor blockchain,
+    including detecting and matching extrinsics (transaction requests) with their 
+    corresponding blockchain events for accurate transaction validation.
     """
     
     def __init__(
@@ -59,25 +56,28 @@ class TransactionMonitor:
         Initialize the transaction monitor.
         
         Args:
-            subtensor: Initialized subtensor instance
+            subtensor: The subtensor client
             subnet_id: The subnet ID to monitor
-            db_manager: Database manager for persistent storage
-            verbose: Whether to log verbose details of extrinsics and events
+            db_manager: Database manager for storage
+            verbose: Whether to log verbose details
         """
         self.subtensor = subtensor
         self.subnet_id = subnet_id
         self.db_manager = db_manager
         self.verbose = verbose
         
-        # Get substrate from subtensor
-        self.substrate = subtensor.substrate
+        # Initialize substrate interface for direct queries
+        network = self.subtensor.network
+        self.substrate_url = f"wss://entrypoint-{network}.opentensor.ai:443"
+        self.substrate = None  # Will be initialized later
         
-        # Control variables
-        self.should_exit = False
+        # Monitoring state
         self.subscription = None
-        self._is_running = False
+        self.is_monitoring = False
+        self.should_exit = False
         
-        # Transaction tracking variables
+        # Dictionary to store pending stake extrinsic calls
+        # Keys: unique call IDs; Values: dict with call details
         self.pending_calls = {}
         self.call_counter = 0
     
@@ -95,12 +95,18 @@ class TransactionMonitor:
         try:
             logger.info("Initializing TransactionMonitor")
             
+            # Initialize substrate interface
+            try:
+                self.substrate = SubstrateInterface(
+                    url=self.substrate_url
+                )
+                logger.info(f"Connected to substrate endpoint: {self.substrate_url}")
+            except Exception as e:
+                logger.error(f"Failed to connect to substrate endpoint: {e}")
+                return False
+            
             # Load last processed block from database
             await self._load_last_processed_block()
-            
-            # Setup WebSocket event processing
-            if self.monitor_events:
-                self._init_event_processing()
             
             logger.info(f"TransactionMonitor initialized. Last processed block: {self.last_block}")
             return True
@@ -121,105 +127,182 @@ class TransactionMonitor:
     
     def start_monitoring(self):
         """
-        Start monitoring blockchain transactions.
+        Start monitoring blockchain for transactions.
         
-        This starts a subscription to block headers and processes
-        extrinsics and events for each block.
+        This method starts a subscription to the blockchain to monitor
+        for new blocks and process transactions.
         
         Returns:
-            bool: True if monitoring was started successfully
+            bool: True if monitoring started successfully
         """
-        if self._is_running:
-            logger.warning("Transaction monitor is already running")
-            return False
+        if self.is_monitoring:
+            logger.warning("Transaction monitoring is already running")
+            return True
         
         try:
-            logger.info(f"Starting transaction monitoring on {self.subtensor.network}")
+            logger.info(f"Starting transaction monitoring for subnet {self.subnet_id}")
+            
+            if not self.substrate:
+                logger.error("Substrate interface not initialized")
+                return False
+            
+            # Start monitoring in a background thread
+            import threading
+            self.should_exit = False
+            self.monitoring_thread = threading.Thread(
+                target=self._monitoring_thread_loop,
+                daemon=True
+            )
+            self.monitoring_thread.start()
+            
+            self.is_monitoring = True
+            logger.info("Transaction monitoring started")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start transaction monitoring: {e}")
+            self.is_monitoring = False
+            return False
+    
+    def stop_monitoring(self):
+        """
+        Stop monitoring blockchain for transactions.
+        
+        Returns:
+            bool: True if monitoring stopped successfully
+        """
+        if not self.is_monitoring:
+            return True
+        
+        try:
+            logger.info("Stopping transaction monitoring")
+            self.should_exit = True
+            
+            # Unsubscribe if subscription is active
+            if self.subscription:
+                try:
+                    self.subscription.unsubscribe()
+                except Exception as e:
+                    logger.warning(f"Error unsubscribing from blockchain: {e}")
+                self.subscription = None
+            
+            # Wait for monitoring thread to exit
+            if hasattr(self, 'monitoring_thread') and self.monitoring_thread.is_alive():
+                self.monitoring_thread.join(timeout=5)
+            
+            self.is_monitoring = False
+            logger.info("Transaction monitoring stopped")
+            return True
+        except Exception as e:
+            logger.error(f"Error stopping transaction monitoring: {e}")
+            return False
+    
+    def _monitoring_thread_loop(self):
+        """
+        Main loop for the monitoring thread.
+        """
+        try:
+            logger.info("Starting blockchain monitoring thread")
             
             # Subscribe to block headers
             self.subscription = self.substrate.subscribe_block_headers(
                 self._block_header_handler
             )
             
-            self._is_running = True
-            return True
+            # Keep thread alive until should_exit is set
+            while not self.should_exit:
+                time.sleep(1)
+                
+            logger.info("Blockchain monitoring thread exiting")
         except Exception as e:
-            logger.error(f"Error starting transaction monitoring: {e}")
-            return False
-    
-    def stop_monitoring(self):
-        """
-        Stop monitoring blockchain transactions.
-        
-        Returns:
-            bool: True if monitoring was stopped successfully
-        """
-        if not self._is_running:
-            logger.warning("Transaction monitor is not running")
-            return False
-        
-        try:
-            logger.info("Stopping transaction monitoring")
-            
-            # Signal to exit and unsubscribe
-            self.should_exit = True
-            
+            logger.error(f"Error in blockchain monitoring thread: {e}")
+        finally:
+            # Ensure subscription is unsubscribed
             if self.subscription:
-                self.subscription.unsubscribe()
+                try:
+                    self.subscription.unsubscribe()
+                except:
+                    pass
                 self.subscription = None
             
-            self._is_running = False
-            return True
-        except Exception as e:
-            logger.error(f"Error stopping transaction monitoring: {e}")
-            return False
+            self.is_monitoring = False
     
     def _block_header_handler(self, block_header, update_nr, subscription_id):
         """
-        Handle incoming block headers.
+        Handler for new block headers from subscription.
         
         Args:
-            block_header: Block header data
+            block_header: The block header
             update_nr: Update number
             subscription_id: Subscription ID
         """
         try:
             # Extract block number
             block_num_val = block_header.get("header", {}).get("number")
-            if isinstance(block_num_val, str) and block_num_val.startswith("0x"):
-                block_num = int(block_num_val, 16)
-            else:
-                block_num = int(block_num_val) if block_num_val else None
-            
-            if not block_num:
-                logger.error("Could not determine block number")
-                return
+            block_num = int(block_num_val, 16) if isinstance(block_num_val, str) else block_num_val
             
             if self.verbose:
-                logger.info(f"Processing block {block_num}")
+                logger.info(f"Block header received: {block_num}")
+            else:
+                logger.debug(f"Block header received: {block_num}")
             
             # Get block hash
             block_hash = self.substrate.get_block_hash(block_num)
             if not block_hash:
-                logger.error(f"Could not compute block hash for block {block_num}")
+                logger.error(f"Could not compute block hash for block number {block_num}")
                 return
             
-            # Get and process extrinsics
+            # Process block
+            self._process_block(block_num, block_hash)
+        except Exception as e:
+            logger.error(f"Error handling block header: {e}")
+    
+    def _process_block(self, block_num: int, block_hash: str):
+        """
+        Process a block for transactions and events.
+        
+        Args:
+            block_num: Block number
+            block_hash: Block hash
+        """
+        try:
+            # Get block timestamp
+            try:
+                timestamp = self.substrate.query(
+                    module='Timestamp',
+                    storage_function='Now',
+                    block_hash=block_hash
+                ).value
+                block_time = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
+            except Exception as e:
+                logger.warning(f"Error getting block timestamp: {e}")
+                block_time = datetime.now(timezone.utc)
+            
+            # Get extrinsics
             extrinsics = self._get_extrinsics(block_hash)
+            
+            # Process extrinsics
             self._process_extrinsics(block_num, extrinsics)
             
-            # Get and process events
+            # Get events
             try:
-                events_decoded = self.substrate.query("System", "Events", block_hash=block_hash)
+                events_decoded = self.substrate.query(
+                    module="System",
+                    storage_function="Events",
+                    block_hash=block_hash
+                )
+                
+                # Process events
                 self._process_events(block_num, events_decoded)
             except Exception as e:
                 logger.error(f"Error querying events for block {block_hash}: {e}")
             
-            # Purge old pending calls
+            # Purge old calls
             self._purge_old_calls(block_num)
             
+            # Update last processed block
+            self.last_block = block_num
         except Exception as e:
-            logger.error(f"Error processing block header: {e}")
+            logger.error(f"Error processing block {block_num}: {e}")
     
     def _get_extrinsics(self, block_hash):
         """
@@ -263,7 +346,7 @@ class TransactionMonitor:
                 
                 # Prepare a pending call record.
                 pending = {
-                    'block_num': block_num,
+                    'block_number': block_num,
                     'call_function': call_function,
                     'coldkey': coldkey,
                     'hotkey': None,
@@ -277,7 +360,9 @@ class TransactionMonitor:
                     'validated': False,
                     'raw': call_info,
                     'timestamp': datetime.now(timezone.utc),
-                    'flow_type': None  # Will be determined when event is matched
+                    'flow_type': None,  # Will be determined when event is matched
+                    'fee': None,
+                    'tx_hash': None
                 }
                 
                 params = call_info.get('call_args', [])
@@ -355,7 +440,7 @@ class TransactionMonitor:
                             except Exception as conv_e:
                                 logger.error(f"Error converting alpha_amount: {conv_e}")
                     
-                    # This is an outflow from the origin hotkey's perspective
+                    # From the perspective of the origin hotkey/netuid, this is an outflow
                     pending['flow_type'] = OUTFLOW
                     
                 elif call_function == 'swap_stake':
@@ -380,16 +465,10 @@ class TransactionMonitor:
                             except Exception as conv_e:
                                 logger.error(f"Error converting alpha_amount: {conv_e}")
                     
-                    # Set initial flow type based on the netuid direction
-                    if pending.get('origin_netuid') == self.subnet_id:
-                        # Swapping out of our subnet
-                        pending['flow_type'] = OUTFLOW
-                    elif pending.get('destination_netuid') == self.subnet_id:
-                        # Swapping into our subnet
-                        pending['flow_type'] = INFLOW
-                    else:
-                        # Neither origin nor destination is our subnet
-                        pending['flow_type'] = NEUTRAL
+                    # From the perspective of the origin netuid, this is an outflow
+                    # From the perspective of the destination netuid, this is an inflow
+                    # We'll mark it as outflow for now and handle the destination separately
+                    pending['flow_type'] = OUTFLOW
                 else:
                     continue
                 
@@ -586,15 +665,14 @@ class TransactionMonitor:
                         logger.debug(f"Skipping event not involving our subnet {self.subnet_id}")
                     continue
                 
+                # Log event details
                 logger.info(
                     f"Event {idx} in block {block_num}: {event_id} - "
-                    f"Coldkey: {event_coldkey}, Hotkey: {event_hotkey}, "
-                    f"Event Amount: {event_amount if event_amount is not None else 'None'}, "
-                    f"Origin Netuid: {event_origin_netuid}, "
-                    f"Destination Netuid: {event_destination_netuid if event_destination_netuid is not None else 'N/A'}"
+                    f"Hotkey: {event_hotkey}, Amount: {event_amount}, "
+                    f"Origin Netuid: {event_origin_netuid}, Destination Netuid: {event_destination_netuid}"
                 )
                 
-                # Try to match with pending calls
+                # Map event types to call functions
                 mapping = {
                     'add_stake': 'StakeAdded',
                     'add_stake_limit': 'StakeAdded',
@@ -605,16 +683,18 @@ class TransactionMonitor:
                     'swap_stake': 'StakeSwapped'
                 }
                 
+                # Try to match event with pending calls
                 for call_id, call_data in list(self.pending_calls.items()):
+                    # Check if expected event matches actual event
                     expected_event_id = mapping.get(call_data['call_function'])
                     if expected_event_id != event_id:
                         continue
                     
-                    # Match based on hotkey and netuid
+                    # Match hotkey
                     if call_data['hotkey'] != event_hotkey:
                         continue
                     
-                    # For call types with origin_netuid, match that
+                    # Match netuid
                     if call_data['call_function'] in ['move_stake', 'transfer_stake', 'swap_stake']:
                         if call_data.get('origin_netuid') is None or int(call_data.get('origin_netuid')) != event_origin_netuid:
                             continue
@@ -625,74 +705,36 @@ class TransactionMonitor:
                     # Calculate final amount and fee
                     if call_data['call_function'] in ['add_stake', 'add_stake_limit', 'move_stake', 'transfer_stake', 'swap_stake']:
                         final_amount = event_amount
-                        fee = None
-                        if call_data['call_amount'] is not None and event_amount is not None:
-                            fee = call_data['call_amount'] - event_amount
                     else:
                         final_amount = call_data['call_amount']
-                        fee = 0.0
                     
                     call_data['final_amount'] = final_amount
+                    fee = None
+                    if call_data['call_function'] in ['add_stake', 'add_stake_limit', 'move_stake', 'transfer_stake', 'swap_stake'] and call_data['call_amount'] is not None and event_amount is not None:
+                        fee = call_data['call_amount'] - event_amount
                     call_data['fee'] = fee
-                    call_data['validated'] = True
                     
-                    # Update destination information from event if available
-                    if event_destination_hotkey:
-                        call_data['destination_hotkey'] = event_destination_hotkey
-                    if event_destination_netuid is not None:
-                        call_data['destination_netuid'] = event_destination_netuid
-                    if event_destination_coldkey:
-                        call_data['destination_coldkey'] = event_destination_coldkey
-                    
-                    # For events that have origin and destination, determine flow type based on subnet_id
-                    if event_id in ['StakeMoved', 'StakeSwapped', 'StakeTransferred']:
-                        # Refine flow type based on the event information
-                        if event_id == 'StakeMoved':
-                            # For MoveStake, it's an outflow for the origin hotkey
-                            # If we're monitoring for the origin hotkey, it's an outflow
-                            # If we ever need to track for destination hotkey, we'd need to create a new record
-                            call_data['flow_type'] = OUTFLOW
-                            
-                        elif event_id == 'StakeTransferred':
-                            # For TransferStake:
-                            if event_origin_netuid == self.subnet_id and event_destination_netuid != self.subnet_id:
-                                # Moving out of our subnet - outflow
-                                call_data['flow_type'] = OUTFLOW
-                            elif event_origin_netuid != self.subnet_id and event_destination_netuid == self.subnet_id:
-                                # Moving into our subnet - inflow
-                                call_data['flow_type'] = INFLOW
-                            else:
-                                # Could be within same subnet but different coldkey
-                                # This is the case where a validator stake replaces miner stake
-                                # Considered an outflow for the hotkey
-                                call_data['flow_type'] = OUTFLOW
-                                
-                        elif event_id == 'StakeSwapped':
-                            if event_origin_netuid == self.subnet_id:
-                                # Swapping out of our subnet
-                                call_data['flow_type'] = OUTFLOW
-                            elif event_destination_netuid == self.subnet_id:
-                                # Swapping into our subnet
-                                call_data['flow_type'] = INFLOW
-                    
+                    # Log match details
                     logger.info(
-                        f"Validated pending call {call_id} (from block {call_data['block_num']}) with event {event_id} in block {block_num}: "
-                        f"Coldkey: {call_data['coldkey']}, Hotkey: {event_hotkey}, Final Amount: {final_amount:.9f}"
-                        f"{', Fee: ' + str(fee) if fee is not None else ''}, Flow Type: {call_data['flow_type']}"
+                        f"Validated pending call {call_id} (from block {call_data['block_number']}) with event {event_id} in block {block_num}: "
+                        f"Coldkey: {call_data['coldkey']}, Hotkey: {event_hotkey}, "
+                        f"Final Amount: {final_amount:.9f}"
+                        f"{', Fee: ' + str(fee) if fee is not None else ''}, "
+                        f"Origin Netuid: {event_origin_netuid}"
                     )
                     
-                    # Store the matched transaction in the database
+                    # Store the transaction
                     self._store_transaction(call_data)
                     
-                    # Mark for removal
-                    matched_calls.append(call_id)
-                
-                # Remove matched calls
-                for call_id in matched_calls:
+                    # Remove from pending calls
                     del self.pending_calls[call_id]
-                
+                    matched_calls.append(call_id)
             except Exception as e:
                 logger.error(f"Error processing event {idx} in block {block_num}: {e}")
+        
+        # Log matches
+        if matched_calls:
+            logger.info(f"Matched {len(matched_calls)} calls with events in block {block_num}")
     
     def _store_transaction(self, transaction_data):
         """
@@ -702,76 +744,41 @@ class TransactionMonitor:
             transaction_data: Transaction data to store
         """
         try:
-            # Convert transaction type to a standard format
-            transaction_type = transaction_data['call_function']
-            if transaction_type.startswith('add_stake'):
-                transaction_type = 'add_stake'
-            elif transaction_type.startswith('remove_stake'):
-                transaction_type = 'remove_stake'
-            
-            # Create a dictionary with all the transaction data
+            # Collect necessary data
             db_data = {
-                'block_number': transaction_data['block_num'],
-                'timestamp': transaction_data['timestamp'],
-                'transaction_type': transaction_type,
+                'block_number': transaction_data['block_number'],
+                'timestamp': int(transaction_data['timestamp'].timestamp()),
+                'transaction_type': transaction_data['call_function'],
                 'flow_type': transaction_data['flow_type'],
-                'coldkey': transaction_data['coldkey'],
                 'hotkey': transaction_data['hotkey'],
+                'coldkey': transaction_data['coldkey'],
                 'call_amount': transaction_data['call_amount'],
                 'final_amount': transaction_data['final_amount'],
-                'fee': transaction_data.get('fee'),
+                'fee': transaction_data['fee'],
                 'origin_netuid': transaction_data.get('origin_netuid') or transaction_data.get('netuid'),
                 'destination_netuid': transaction_data.get('destination_netuid'),
                 'destination_coldkey': transaction_data.get('destination_coldkey'),
                 'destination_hotkey': transaction_data.get('destination_hotkey'),
-                'tx_hash': None,  # tx_hash not available in current implementation
-                'validated': transaction_data['validated']
+                'validated': 1  # True
             }
             
-            # Queue the transaction for insertion
-            # The database manager will handle this asynchronously
-            self.db_manager.queue_query(
-                """
-                INSERT INTO detailed_stake_transactions (
-                    block_number,
-                    timestamp,
-                    transaction_type,
-                    flow_type,
-                    coldkey,
-                    hotkey,
-                    call_amount,
-                    final_amount,
-                    fee,
-                    origin_netuid,
-                    destination_netuid,
-                    destination_coldkey,
-                    destination_hotkey,
-                    tx_hash,
-                    validated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, 
-                (
-                    db_data['block_number'],
-                    db_data['timestamp'],
-                    db_data['transaction_type'],
-                    db_data['flow_type'],
-                    db_data['coldkey'],
-                    db_data['hotkey'],
-                    db_data['call_amount'],
-                    db_data['final_amount'],
-                    db_data['fee'],
-                    db_data['origin_netuid'],
-                    db_data['destination_netuid'],
-                    db_data['destination_coldkey'],
-                    db_data['destination_hotkey'],
-                    db_data['tx_hash'],
-                    db_data['validated']
+            # Queue insertion in database
+            query = """
+                INSERT INTO stake_transactions (
+                    block_number, timestamp, transaction_type, flow_type, hotkey, coldkey,
+                    call_amount, final_amount, fee, origin_netuid, destination_netuid,
+                    destination_coldkey, destination_hotkey, validated
+                ) VALUES (
+                    :block_number, :timestamp, :transaction_type, :flow_type, :hotkey, :coldkey,
+                    :call_amount, :final_amount, :fee, :origin_netuid, :destination_netuid,
+                    :destination_coldkey, :destination_hotkey, :validated
                 )
-            )
+            """
+            self.db_manager.queue_query(query, db_data)
             
-            logger.info(f"Queued transaction for database: {transaction_type} ({transaction_data['flow_type']}) for hotkey {transaction_data['hotkey']}")
+            logger.info(f"Queued transaction for DB: {transaction_data['call_function']} - {transaction_data['flow_type']} for {transaction_data['hotkey']}")
         except Exception as e:
-            logger.error(f"Error storing transaction in database: {e}")
+            logger.error(f"Error storing transaction: {e}")
     
     def _purge_old_calls(self, current_block):
         """
@@ -780,23 +787,45 @@ class TransactionMonitor:
         Args:
             current_block: Current block number
         """
-        threshold = 20  # 20 blocks is a reasonable threshold
+        threshold = 20
         to_delete = []
-        
         for call_id, call_data in self.pending_calls.items():
-            if current_block - call_data['block_num'] >= threshold:
-                logger.info(f"Discarding pending call {call_id} from block {call_data['block_num']} (older than {threshold} blocks)")
+            if current_block - call_data['block_number'] >= threshold:
+                logger.info(f"Discarding pending call {call_id} from block {call_data['block_number']} (older than {threshold} blocks)")
                 to_delete.append(call_id)
-        
         for call_id in to_delete:
             del self.pending_calls[call_id]
     
+    async def _load_last_processed_block(self):
+        """
+        Load last processed block from database.
+        """
+        try:
+            result = await self.db_manager.fetch_one("""
+                SELECT value FROM vesting_module_state
+                WHERE module_name = 'transaction_monitor_last_block'
+            """)
+            
+            if result:
+                self.last_block = result['value']
+            else:
+                # Default to current block
+                self.last_block = self.subtensor.get_current_block()
+                # Store in database
+                await self.db_manager.execute_query("""
+                    INSERT INTO vesting_module_state (module_name, last_block, last_timestamp)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(module_name) DO UPDATE SET
+                    last_block = excluded.last_block,
+                    last_timestamp = excluded.last_timestamp
+                """, ('transaction_monitor_last_block', self.last_block, int(time.time())))
+            
+            logger.info(f"Loaded last processed block: {self.last_block}")
+        except Exception as e:
+            logger.error(f"Error loading last processed block: {e}")
+            self.last_block = self.subtensor.get_current_block()
+    
     @property
     def is_running(self):
-        """
-        Check if the transaction monitor is running.
-        
-        Returns:
-            bool: True if running, False otherwise
-        """
-        return self._is_running 
+        """Check if monitoring is running."""
+        return self.is_monitoring 
