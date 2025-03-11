@@ -149,6 +149,59 @@ def get_vesting_tables() -> Dict[str, Dict[str, Any]]:
                 ("module_data", "TEXT")  # JSON serialized state
             ],
             "indices": []
+        },
+        
+        # Table for tracking stake tranches (individual stake deposits)
+        "stake_tranches": {
+            "columns": [
+                ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+                ("hotkey", "TEXT NOT NULL"),
+                ("coldkey", "TEXT"),
+                ("initial_amount", "REAL NOT NULL"),
+                ("remaining_amount", "REAL NOT NULL"),
+                ("entry_timestamp", "INTEGER NOT NULL"),
+                ("is_emission", "INTEGER NOT NULL"),
+                ("last_update", "INTEGER NOT NULL")
+            ],
+            "indices": [
+                ("idx_stake_tranches_hotkey", "hotkey")
+            ]
+        },
+        
+        # Table for tracking tranche exits (withdrawals from tranches)
+        "stake_tranche_exits": {
+            "columns": [
+                ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+                ("tranche_id", "INTEGER NOT NULL"),
+                ("exit_timestamp", "INTEGER NOT NULL"),
+                ("exit_amount", "REAL NOT NULL"),
+                ("exit_reason", "TEXT NOT NULL"),
+                ("FOREIGN KEY (tranche_id) REFERENCES stake_tranches(id) ON DELETE CASCADE", "")
+            ],
+            "indices": [
+                ("idx_stake_tranche_exits_tranche_id", "tranche_id")
+            ]
+        },
+        
+        # Table for tracking aggregated tranche metrics per hotkey
+        "aggregated_tranche_metrics": {
+            "columns": [
+                ("hotkey", "TEXT PRIMARY KEY"),
+                ("coldkey", "TEXT"),
+                ("total_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("active_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("avg_tranche_age", "INTEGER NOT NULL DEFAULT 0"),
+                ("oldest_tranche_age", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_tranche_amount", "REAL NOT NULL DEFAULT 0"),
+                ("manual_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("emission_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("emission_amount", "REAL NOT NULL DEFAULT 0"),
+                ("manual_amount", "REAL NOT NULL DEFAULT 0"),
+                ("last_update", "INTEGER NOT NULL")
+            ],
+            "indices": [
+                ("idx_aggregated_tranche_metrics_coldkey", "coldkey")
+            ]
         }
     }
     
@@ -189,7 +242,28 @@ def create_vesting_tables(db_manager) -> bool:
     try:
         statements = get_create_table_statements()
         for stmt in statements:
-            db_manager.execute(stmt)
+            db_manager.execute_query(stmt)
+        
+        logger.info(f"Created {len(statements)} vesting system tables and indices")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to create vesting system tables: {e}")
+        return False
+
+async def create_vesting_tables_async(db_manager) -> bool:
+    """
+    Asynchronously create all vesting system tables in the database.
+    
+    Args:
+        db_manager: Database manager instance
+        
+    Returns:
+        bool: True if all tables were created successfully
+    """
+    try:
+        statements = get_create_table_statements()
+        for stmt in statements:
+            await db_manager.execute_query(stmt)
         
         logger.info(f"Created {len(statements)} vesting system tables and indices")
         return True

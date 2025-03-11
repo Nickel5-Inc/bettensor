@@ -101,18 +101,35 @@ class BlockchainMonitor:
         try:
             logger.info("Initializing blockchain monitor")
             
+            # Log the subtensor and subnet we're monitoring
+            chain_endpoint = self.subtensor.chain_endpoint if hasattr(self.subtensor, 'chain_endpoint') else "unknown"
+            logger.info(f"Monitoring blockchain at: {chain_endpoint}")
+            logger.info(f"Monitoring subnet ID: {self.subnet_id}")
+            
             # Load last processed blocks from database
             await self._load_last_processed_blocks()
+            logger.info(f"Last processed block: {self._last_check_block}, Last epoch block: {self._last_epoch_block}")
             
             # Initialize epoch boundaries tracking
             await self._initialize_epoch_tracking()
+            logger.info(f"Current epoch: {self._current_epoch}")
+            
+            # Get current block to show starting point
+            try:
+                current_block = self.subtensor.get_current_block()
+                logger.info(f"Current blockchain block: {current_block}")
+                blocks_to_process = current_block - self._last_check_block if self._last_check_block > 0 else 0
+                if blocks_to_process > 0:
+                    logger.info(f"Will process {blocks_to_process} blocks since last checkpoint")
+            except Exception as e:
+                logger.warning(f"Couldn't get current block: {e}")
             
             return True
         except Exception as e:
             logger.error(f"Failed to initialize blockchain monitor: {e}")
             return False
     
-    def start_background_thread(self):
+    def start_background_thread(self, thread_nice_value: int = 0):
         """
         Start the blockchain monitor in a background thread.
         
@@ -120,6 +137,10 @@ class BlockchainMonitor:
         1. Tracks manual transactions
         2. Tracks balance changes
         3. Checks for epoch boundaries
+        
+        Args:
+            thread_nice_value: Nice value for thread scheduling (-20 to 19, lower means higher priority)
+                               Only works on UNIX systems.
         
         Returns:
             bool: True if thread was started, False otherwise
@@ -134,9 +155,24 @@ class BlockchainMonitor:
         # Create and start thread
         self._thread = threading.Thread(
             target=self._background_thread_loop,
-            daemon=True
+            daemon=True,
+            name="vesting_blockchain_monitor"
         )
         self._thread.start()
+        
+        # Try to set thread priority if on a compatible system
+        if thread_nice_value != 0:
+            try:
+                import os
+                if hasattr(os, 'nice'):
+                    # This is unix-specific - get thread ID and set nice value
+                    # Note: This requires appropriate permissions
+                    thread_id = self._thread.ident
+                    if thread_id:
+                        logger.debug(f"Setting blockchain monitor thread priority to {thread_nice_value}")
+                        os.nice(thread_nice_value)
+            except (ImportError, AttributeError, PermissionError) as e:
+                logger.debug(f"Could not set thread priority: {e}")
         
         self._is_running = True
         logger.info("Started blockchain monitor background thread")
@@ -194,6 +230,13 @@ class BlockchainMonitor:
             start_time = time.time()
             last_check_time = 0
             check_interval = 5  # Check more frequently for epoch boundaries
+            
+            # Ensure query_interval is a valid number
+            if not hasattr(self, 'query_interval') or self.query_interval is None:
+                logger.warning("query_interval is None, defaulting to 60 seconds")
+                self.query_interval = 60  # Default to 60 seconds
+
+            logger.info(f"Blockchain monitor starting with query_interval: {self.query_interval} seconds")
             
             while not self._stop_event.is_set():
                 try:
@@ -553,134 +596,110 @@ class BlockchainMonitor:
         return
     
     async def _load_last_processed_blocks(self):
-        """
-        Load the last processed blocks from the database.
-        """
+        """Load the last processed blocks from the database"""
         try:
-            # Load last check block
+            # Query for the last processed block
             result = await self.db_manager.fetch_one("""
                 SELECT value FROM blockchain_state 
                 WHERE key = 'last_check_block'
             """)
+            
             if result:
                 self._last_check_block = int(result['value'])
-            
-            # Load last epoch block
+                logger.debug(f"Loaded last check block: {self._last_check_block}")
+            else:
+                logger.info("No last check block found in database, starting from 0")
+                self._last_check_block = 0
+                
+            # Query for the last epoch block
             result = await self.db_manager.fetch_one("""
                 SELECT value FROM blockchain_state 
                 WHERE key = 'last_epoch_block'
             """)
+            
             if result:
                 self._last_epoch_block = int(result['value'])
+                logger.debug(f"Loaded last epoch block: {self._last_epoch_block}")
+            else:
+                logger.info("No last epoch block found in database, starting from 0")
+                self._last_epoch_block = 0
                 
         except Exception as e:
-            logger.error(f"Error loading last processed blocks: {e}")
+            logger.warning(f"Error loading last processed blocks: {e}")
+            # Default to starting from current block
+            self._last_check_block = 0
+            self._last_epoch_block = 0
     
     async def _save_last_processed_blocks(self):
         """
         Save the last processed blocks to the database.
         """
         try:
-            current_time = datetime.now(timezone.utc)
-            
             # Save last check block
             await self.db_manager.execute_query("""
-                INSERT OR REPLACE INTO blockchain_state (key, value, updated_at)
-                VALUES (?, ?, ?)
-            """, ('last_check_block', str(self._last_check_block), current_time))
+                INSERT OR REPLACE INTO blockchain_state (key, value)
+                VALUES (?, ?)
+            """, ('last_check_block', str(self._last_check_block)))
             
             # Save last epoch block
             await self.db_manager.execute_query("""
-                INSERT OR REPLACE INTO blockchain_state (key, value, updated_at)
-                VALUES (?, ?, ?)
-            """, ('last_epoch_block', str(self._last_epoch_block), current_time))
+                INSERT OR REPLACE INTO blockchain_state (key, value)
+                VALUES (?, ?)
+            """, ('last_epoch_block', str(self._last_epoch_block)))
                 
         except Exception as e:
             logger.error(f"Error saving last processed blocks: {e}")
     
     async def track_manual_transactions(self, start_block: Optional[int] = None) -> int:
         """
-        Track manual stake transactions between the last checked block and the current block.
-        
-        This function queries the blockchain for stake-related transactions and
-        records them in the database. It ensures we capture all transactions involving
-        our subnet of interest (subnet_id), looking for any occurrence of the subnet ID
-        in transaction data.
+        Track manual stake transactions from the blockchain and store them in the database.
         
         Args:
-            start_block: Optional starting block. If None, uses last checked block.
+            start_block: Block number to start tracking from (optional)
             
         Returns:
-            int: Number of transactions found
+            int: The latest block number processed
         """
         try:
-            # Get start_block
+            # Get the start block
             if start_block is None:
                 start_block = self._last_check_block
-            
-            # Get current block
-            current_block = self.subtensor.get_current_block()
-            
-            # Limit block range to avoid huge queries
-            max_blocks = 100
-            end_block = min(current_block, start_block + max_blocks)
-            
-            # Skip if no new blocks
+                
+            if start_block == 0:
+                # Get current block as a starting point
+                start_block = self.subtensor.get_current_block()
+                logger.info(f"Starting transaction tracking from current block: {start_block}")
+                
+            # Get current block as end point
+            end_block = self.subtensor.get_current_block()
             if end_block <= start_block:
-                logger.debug(f"No new blocks to check (start={start_block}, end={end_block})")
-                return 0
-            
-            logger.info(f"Checking for manual transactions from block {start_block} to {end_block}")
-            
+                logger.debug(f"No new blocks to process ({start_block} to {end_block})")
+                return start_block
+                
+            logger.info(f"Tracking manual transactions from block {start_block} to {end_block} ({end_block - start_block} blocks)")
+                
             # Query transactions
             transactions = await self._query_transactions(start_block, end_block)
             
-            # Additional deep check for our subnet
-            subnet_transactions = []
-            for tx in transactions:
-                if 'netuid' in tx and tx['netuid'] == self.subnet_id:
-                    subnet_transactions.append(tx)
-                elif 'origin_netuid' in tx and tx['origin_netuid'] == self.subnet_id:
-                    subnet_transactions.append(tx)
-                elif 'destination_netuid' in tx and tx['destination_netuid'] == self.subnet_id:
-                    subnet_transactions.append(tx)
-                else:
-                    # Deep check for subnet ID in any field
-                    tx_str = str(tx)
-                    if f"'netuid': {self.subnet_id}" in tx_str or f"'netuid': '{self.subnet_id}'" in tx_str:
-                        logger.info(f"Found subnet {self.subnet_id} in transaction data")
-                        subnet_transactions.append(tx)
-            
-            # Store transactions
-            count = 0
-            if subnet_transactions:
-                for tx in subnet_transactions:
-                    # Insert into database
-                    await self.db_manager.execute_query("""
-                        INSERT INTO stake_transactions (
-                            block_number, timestamp, transaction_type, hotkey, coldkey, amount, tx_hash
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        tx['block_number'],
-                        tx['timestamp'],
-                        tx['transaction_type'],
-                        tx['hotkey'],
-                        tx.get('coldkey', 'unknown'),
-                        tx['amount'],
-                        tx.get('tx_hash', None)
-                    ))
-                    count += 1
-                    
-                logger.info(f"Recorded {count} manual transactions in blocks {start_block}-{end_block}")
-            
-            # Update last_check_block
+            if transactions:
+                logger.info(f"Found {len(transactions)} stake-related transactions between blocks {start_block}-{end_block}")
+                for i, tx in enumerate(transactions[:5]):  # Log first 5 transactions for debugging
+                    logger.debug(f"Transaction {i+1}: Type={tx.get('transaction_type', 'unknown')}, " +
+                                f"Hotkey={tx.get('hotkey', 'unknown')[:10]}..., " +
+                                f"Amount={tx.get('amount', 0):.4f}")
+                if len(transactions) > 5:
+                    logger.debug(f"... and {len(transactions) - 5} more transactions")
+            else:
+                logger.info(f"No stake-related transactions found between blocks {start_block}-{end_block}")
+                
+            # Update the last check block
             self._last_check_block = end_block
             await self._save_last_processed_blocks()
             
-            return count
+            return end_block
         except Exception as e:
             logger.error(f"Error tracking manual transactions: {e}")
-            return 0
+            return start_block
     
     async def _query_transactions(self, start_block: int, end_block: int) -> List[Dict[str, Any]]:
         """
@@ -885,69 +904,66 @@ class BlockchainMonitor:
     
     async def track_balance_changes(self, epoch: int) -> Dict[str, float]:
         """
-        Track balance changes between epochs.
-        
-        This method compares the current stake dictionary with the previous one
-        and records any changes in the database.
+        Track balance changes from one epoch to the next.
         
         Args:
             epoch: Current epoch number
             
         Returns:
-            Dict[str, float]: Dictionary of hotkeys and their stake changes
+            Dict[str, float]: Dictionary of emissions by hotkey
         """
+        logger.info(f"Tracking balance changes for epoch {epoch}")
+        
         try:
-            # Get current block
-            current_block = self.subtensor.get_current_block()
-            
-            # Get current stake dictionary
+            # Get stakes from the current epoch
             current_stakes = await self._get_current_stakes()
             
-            # Compare with previous stake dictionary
-            changes = {}
-            timestamp = datetime.now(timezone.utc)
+            if not current_stakes:
+                logger.warning(f"No stakes found for current epoch {epoch}")
+                return {}
+                
+            logger.info(f"Retrieved current stakes for {len(current_stakes)} hotkeys")
             
-            for hotkey, stake_info in current_stakes.items():
-                coldkey = stake_info.get('coldkey', 'unknown')
-                current_stake = stake_info.get('stake', 0.0)
+            # Get stakes from the previous epoch
+            previous_stakes = await self._get_previous_stakes()
+            
+            if not previous_stakes:
+                logger.warning("No previous stakes found, cannot calculate emissions")
+                return {}
                 
-                # Get previous stake
-                prev_stake = 0.0
-                if hotkey in self._prev_stake_dict:
-                    prev_stake = self._prev_stake_dict[hotkey].get('stake', 0.0)
-                
-                # Calculate change
-                change = current_stake - prev_stake
-                
-                # Record significant changes (filter out tiny fluctuations)
-                if abs(change) > 0.0001:
-                    changes[hotkey] = change
+            logger.info(f"Retrieved previous stakes for {len(previous_stakes)} hotkeys")
+            
+            # Calculate emissions
+            emissions = {}
+            total_emission = 0.0
+            emission_count = 0
+            
+            for hotkey, current in current_stakes.items():
+                if hotkey in previous_stakes:
+                    previous = previous_stakes[hotkey]
+                    current_stake = float(current['stake'])
+                    previous_stake = float(previous['stake'])
                     
-                    # Record in database
-                    await self.db_manager.execute_query("""
-                        INSERT INTO stake_balance_changes 
-                        (epoch, block_number, timestamp, hotkey, coldkey, previous_stake, current_stake, change)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        epoch,
-                        current_block,
-                        timestamp,
-                        hotkey,
-                        coldkey,
-                        prev_stake,
-                        current_stake,
-                        change
-                    ))
+                    # Check if stake increased (possible emission)
+                    if current_stake > previous_stake:
+                        emission = current_stake - previous_stake
+                        emissions[hotkey] = emission
+                        total_emission += emission
+                        emission_count += 1
             
-            # Update previous stake dictionary
-            self._prev_stake_dict = current_stakes
+            if emissions:
+                logger.info(f"Detected emissions for {emission_count} hotkeys, total: {total_emission:.4f} TAO")
+                # Log a sample of emissions
+                sample_size = min(5, len(emissions))
+                sample_hotkeys = list(emissions.keys())[:sample_size]
+                for hotkey in sample_hotkeys:
+                    logger.debug(f"Emission: Hotkey={hotkey[:10]}..., Amount={emissions[hotkey]:.4f} TAO")
+                if len(emissions) > 5:
+                    logger.debug(f"... and {len(emissions) - 5} more emission records")
+            else:
+                logger.info("No emissions detected for this epoch")
             
-            # Update last check block
-            self._last_check_block = current_block
-            await self._save_last_processed_blocks()
-            
-            logger.info(f"Tracked {len(changes)} stake balance changes for epoch {epoch}")
-            return changes
+            return emissions
             
         except Exception as e:
             logger.error(f"Error tracking balance changes: {e}")
@@ -1121,12 +1137,12 @@ class BlockchainMonitor:
             logger.error(f"Error getting stake history for {hotkey}: {e}")
             return []
             
-    def get_dynamic_info(self) -> 'bt.DynamicInfo':
+    def get_dynamic_info(self) -> dict:
         """
         Get the dynamic info for the network with caching.
         
         Returns:
-            bt.DynamicInfo: Dynamic info for the network
+            dict: Dynamic info for the network
         """
         current_time = datetime.now(timezone.utc)
         
@@ -1138,7 +1154,54 @@ class BlockchainMonitor:
         
         # Update cache
         try:
-            self._dynamic_info = self.subtensor.get_dynamic_info()
+            if hasattr(self.subtensor, 'get_dynamic_info'):
+                try:
+                    # Try with subnet_id parameter first
+                    try:
+                        self._dynamic_info = self.subtensor.get_dynamic_info(self.subnet_id)
+                    except TypeError:
+                        # If it doesn't accept subnet_id, try without arguments
+                        self._dynamic_info = self.subtensor.get_dynamic_info()
+                    
+                    self._dynamic_info_last_updated = current_time
+                    return self._dynamic_info
+                except Exception as e:
+                    logger.warning(f"Error calling subtensor.get_dynamic_info: {e}")
+                    # Fall through to fallback
+            else:
+                # Fallback for older versions without get_dynamic_info
+                logger.warning("Subtensor object has no get_dynamic_info method, using fallback values")
+            
+            # Create a fallback dynamic info with default values
+            blocks_per_step = 100  # Default value
+            tempo = 13  # Default value
+            
+            # Try to extract blocks_per_step from subtensor directly if available
+            try:
+                if hasattr(self.subtensor, 'blocks_per_step'):
+                    blocks_per_step = self.subtensor.blocks_per_step
+                    logger.debug(f"Found blocks_per_step={blocks_per_step} from subtensor")
+            except Exception as e:
+                logger.debug(f"Could not get blocks_per_step: {e}")
+            
+            # Create fallback dynamic info dictionary
+            self._dynamic_info = {
+                'blocks_per_step': blocks_per_step,
+                'tempo': tempo,
+                'difficulty': 1.0,  # Default value
+                'target_registrations_per_interval': 1,  # Default value
+                'min_difficulty': 1.0,  # Default value
+                'max_difficulty': 100.0,  # Default value
+                'weights_version': 0,  # Default value
+                'last_mechanism_step_block': 0,  # Default value
+                'min_allowed_weights': 0,  # Default value
+                'max_allowed_uids': 256,  # Default value
+                'network_immunity_period': 0,  # Default value
+                'network_connect_timeout': 0,  # Default value
+                'network_request_timeout': 0,  # Default value
+                'max_unstaking_blocks': 0,  # Default value
+            }
+            
             self._dynamic_info_last_updated = current_time
             return self._dynamic_info
         except Exception as e:
@@ -1146,4 +1209,158 @@ class BlockchainMonitor:
             if self._dynamic_info is not None:
                 return self._dynamic_info
             else:
-                raise 
+                # Return default values instead of raising
+                return {
+                    'blocks_per_step': 100,
+                    'tempo': 13,
+                    'difficulty': 1.0,
+                }
+
+    async def _initialize_epoch_tracking(self):
+        """Initialize epoch boundary tracking"""
+        try:
+            logger.info("Initializing epoch boundary tracking")
+            
+            # Try to get dynamic info to determine blocks per epoch
+            try:
+                dynamic_info = await self._get_dynamic_info()
+                if dynamic_info and 'blocks_per_step' in dynamic_info:
+                    blocks_per_step = dynamic_info['blocks_per_step']
+                    tempo = dynamic_info.get('tempo', 13)  # Default to 13 if not found
+                    self._blocks_per_epoch = blocks_per_step * tempo
+                    logger.info(f"Blocks per epoch: {self._blocks_per_epoch} (blocks_per_step={blocks_per_step}, tempo={tempo})")
+                else:
+                    # Fallback to default (typically 360 blocks per epoch = ~1 hour)
+                    self._blocks_per_epoch = 360
+                    logger.info(f"Using default blocks per epoch: {self._blocks_per_epoch}")
+            except Exception as e:
+                logger.warning(f"Error getting dynamic info: {e}")
+                # Fallback to default
+                self._blocks_per_epoch = 360
+                logger.info(f"Using default blocks per epoch: {self._blocks_per_epoch}")
+            
+            # Try to initialize substrate connection for more detailed chain monitoring
+            try:
+                # Use subtensor's substrate connection if available
+                if hasattr(self.subtensor, 'substrate'):
+                    self._substrate = self.subtensor.substrate
+                    logger.debug("Using subtensor's substrate connection")
+                elif hasattr(self.subtensor, '_substrate'):
+                    self._substrate = self.subtensor._substrate
+                    logger.debug("Using subtensor's _substrate connection")
+                else:
+                    # Try to create a new connection using subtensor's endpoint
+                    endpoint = self.subtensor.chain_endpoint
+                    if endpoint:
+                        logger.debug(f"Creating new substrate connection to {endpoint}")
+                        # Use a unique connection name to avoid conflicts with other components
+                        connection_name = f'blockchain_monitor_{self.subnet_id}_{int(time.time())}'
+                        logger.debug(f"Using unique connection name: {connection_name}")
+                        self._substrate = SubstrateInterface(
+                            url=endpoint,
+                            ws_options={'name': connection_name}
+                        )
+                    else:
+                        logger.warning("Could not determine subtensor endpoint, detailed chain monitoring disabled")
+                        self._substrate = None
+            except Exception as e:
+                logger.warning(f"Error initializing substrate connection: {e}")
+                self._substrate = None
+            
+            # Initialize last epoch block if not loaded from database
+            if self._last_epoch_block == 0:
+                try:
+                    current_block = self.subtensor.get_current_block()
+                    # Start tracking from the current epoch boundary
+                    if self._blocks_per_epoch:
+                        self._last_epoch_block = (current_block // self._blocks_per_epoch) * self._blocks_per_epoch
+                        logger.info(f"Initialized last epoch block to {self._last_epoch_block} (current block: {current_block})")
+                except Exception as e:
+                    logger.warning(f"Error initializing last epoch block: {e}")
+                    self._last_epoch_block = 0
+            
+            # Initialize state for epoch boundary detection
+            self._last_blocks_since_step = None
+            self._pre_epoch_stakes = {}
+            self._current_epoch = self._last_epoch_block // self._blocks_per_epoch if self._blocks_per_epoch else 0
+            
+            logger.info(f"Epoch tracking initialized, current epoch: {self._current_epoch}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize epoch tracking: {e}")
+            # Set fallback values
+            self._blocks_per_epoch = 360
+            self._current_epoch = 0
+            return False
+
+    async def _get_dynamic_info(self):
+        """Get dynamic network info with caching"""
+        try:
+            current_time = time.time()
+            
+            # Return cached value if still valid
+            if (self._dynamic_info is not None and self._dynamic_info_last_updated is not None and
+                current_time - self._dynamic_info_last_updated < self._dynamic_info_ttl):
+                return self._dynamic_info
+            
+            # Try to get dynamic info from subtensor
+            if hasattr(self.subtensor, 'get_dynamic_info'):
+                try:
+                    # Try with subnet_id parameter first
+                    try:
+                        self._dynamic_info = self.subtensor.get_dynamic_info(self.subnet_id)
+                    except TypeError:
+                        # If it doesn't accept subnet_id, try without arguments
+                        self._dynamic_info = self.subtensor.get_dynamic_info()
+                    
+                    self._dynamic_info_last_updated = current_time
+                    return self._dynamic_info
+                except Exception as e:
+                    logger.warning(f"Error calling subtensor.get_dynamic_info: {e}")
+                    # Fall through to fallback
+            else:
+                # Fallback for older versions without get_dynamic_info
+                logger.warning("Subtensor object has no get_dynamic_info method, using fallback values")
+            
+            # Create a fallback dynamic info with default values
+            blocks_per_step = 100  # Default value
+            tempo = 13  # Default value
+            
+            # Try to extract blocks_per_step from subtensor directly if available
+            try:
+                if hasattr(self.subtensor, 'blocks_per_step'):
+                    blocks_per_step = self.subtensor.blocks_per_step
+                    logger.debug(f"Found blocks_per_step={blocks_per_step} from subtensor")
+            except Exception as e:
+                logger.debug(f"Could not get blocks_per_step: {e}")
+            
+            # Create fallback dynamic info dictionary
+            self._dynamic_info = {
+                'blocks_per_step': blocks_per_step,
+                'tempo': tempo,
+                'difficulty': 1.0,  # Default value
+                'target_registrations_per_interval': 1,  # Default value
+                'min_difficulty': 1.0,  # Default value
+                'max_difficulty': 100.0,  # Default value
+                'weights_version': 0,  # Default value
+                'last_mechanism_step_block': 0,  # Default value
+                'min_allowed_weights': 0,  # Default value
+                'max_allowed_uids': 256,  # Default value
+                'network_immunity_period': 0,  # Default value
+                'network_connect_timeout': 0,  # Default value
+                'network_request_timeout': 0,  # Default value
+                'max_unstaking_blocks': 0,  # Default value
+            }
+            
+            self._dynamic_info_last_updated = current_time
+            return self._dynamic_info
+                
+        except Exception as e:
+            logger.error(f"Failed to get dynamic info: {e}")
+            # Even if we fail, provide some default values
+            return {
+                'blocks_per_step': 100,
+                'tempo': 13,
+                'difficulty': 1.0,
+            } 

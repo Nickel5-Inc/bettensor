@@ -60,7 +60,7 @@ async def check_and_install_dependencies():
     try:
         # Check if UV is available
         use_uv = await is_uv_installed()
-        bt.logging.info(f"Using {'UV' if use_uv else 'pip'} package manager")
+        bt.logging.trace(f"Using {'UV' if use_uv else 'pip'} package manager")
         
         if not use_uv:
             # If UV is not available, we'll try to use pip

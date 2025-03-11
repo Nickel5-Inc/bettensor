@@ -28,13 +28,14 @@ import random
 import weakref
 
 class DatabaseManager:
-    _instance = None
+    _instances = {}  # Change from single instance to dictionary of instances by path
 
     def __new__(cls, db_path):
-        if cls._instance is None:
-            cls._instance = super(DatabaseManager, cls).__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
+        if db_path not in cls._instances:
+            instance = super(DatabaseManager, cls).__new__(cls)
+            instance._initialized = False
+            cls._instances[db_path] = instance
+        return cls._instances[db_path]
 
     def __init__(self, database_path: str):
         """Initialize the database manager with WAL mode and optimized concurrency settings"""
@@ -50,6 +51,9 @@ class DatabaseManager:
             self._connection_attempt_reset = time.time()
             self._connection_reset_interval = 60
             self.default_timeout = 30
+            
+            # Log the actual path being used
+            bt.logging.info(f"Initializing DatabaseManager with path: {database_path}")
             
             # Initialize engine with WAL mode and optimized settings
             self.engine = create_async_engine(
@@ -452,26 +456,50 @@ class DatabaseManager:
 
     async def execute_query(self, query, params=None):
         """Execute query with retry logic"""
-        async with self.get_session() as session:
-            if params is None:
-                params = {}
-            elif isinstance(params, list):
-                # Convert list of values to list of dictionaries
-                if params and not isinstance(params[0], (tuple, dict)):
-                    params = [{"param": p} for p in params]
-                    query = query.replace("?", ":param")
-            elif isinstance(params, (list, tuple)):
-                # Convert single tuple to dict
-                counter = itertools.count()
-                params = {f"p{i}": val for i, val in enumerate(params)}
-                query = re.sub(r'\?', lambda m: f":p{next(counter)}", query)
-            
-            cursor = await session.execute(text(query), params)
-            await session.commit()
-            
-            if query.strip().upper().startswith('SELECT'):
-                return cursor
-            return None
+        success = False
+        result = None
+        retry_count = 0
+        max_retries = 3
+        
+        while not success and retry_count < max_retries:
+            try:
+                async with self.get_session() as session:
+                    if params is None:
+                        params = {}
+                    elif isinstance(params, list):
+                        # Convert list of values to list of dictionaries
+                        if params and not isinstance(params[0], (tuple, dict)):
+                            params = [{"param": p} for p in params]
+                            query = query.replace("?", ":param")
+                    elif isinstance(params, (list, tuple)):
+                        # Convert single tuple to dict
+                        counter = itertools.count()
+                        params = {f"p{i}": val for i, val in enumerate(params)}
+                        query = re.sub(r'\?', lambda m: f":p{next(counter)}", query)
+                    
+                    cursor = await session.execute(text(query), params)
+                    await session.commit()
+                    
+                    if query.strip().upper().startswith('SELECT'):
+                        result = cursor
+                    
+                    success = True
+                    break
+            except Exception as e:
+                retry_count += 1
+                if "database is locked" in str(e) and retry_count < max_retries:
+                    # Exponential backoff with jitter for database locked errors
+                    delay = (2 ** retry_count) * 0.1 + random.uniform(0, 0.5)
+                    bt.logging.warning(f"Database locked, retrying in {delay:.2f}s (attempt {retry_count}/{max_retries})")
+                    await asyncio.sleep(delay)
+                else:
+                    if retry_count >= max_retries:
+                        bt.logging.error(f"Failed to execute query after {max_retries} attempts: {e}")
+                    else:
+                        bt.logging.error(f"Database error: {e}")
+                    raise
+        
+        return result
 
     async def fetch_all(self, query, params=None):
         """Execute a SELECT query and return all results."""
@@ -1073,7 +1101,10 @@ class DatabaseManager:
                 await session.commit()
             
             # Then create/update tables
+            bt.logging.info("Initializing database tables")
             statements = initialize_database()
+            bt.logging.info(f"Executing {len(statements)} database initialization statements, including vesting tables")
+            
             async with self.async_session() as session:
                 for statement in statements:
                     try:
@@ -1108,6 +1139,37 @@ class DatabaseManager:
                             bt.logging.debug(f"Column {column} already exists in miner_stats table")
                     except Exception as e:
                         bt.logging.error(f"Error checking/adding column {column}: {e}")
+                
+                # Verify vesting tables exist
+                bt.logging.info("Verifying vesting tables were created...")
+                required_vesting_tables = [
+                    'blockchain_state', 'stake_transactions', 'stake_balance_changes', 
+                    'stake_metrics', 'coldkey_metrics', 'stake_change_history', 
+                    'vesting_module_state', 'stake_tranches', 'stake_tranche_exits',
+                    'aggregated_tranche_metrics'
+                ]
+                
+                missing_tables = []
+                for table in required_vesting_tables:
+                    try:
+                        result = await session.execute(text(
+                            f"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                        ))
+                        count = result.scalar()
+                        
+                        if count == 0:
+                            bt.logging.warning(f"Vesting table {table} was not created during initialization")
+                            missing_tables.append(table)
+                        else:
+                            bt.logging.debug(f"Vesting table {table} exists")
+                    except Exception as e:
+                        bt.logging.error(f"Error checking vesting table {table}: {e}")
+
+                if missing_tables:
+                    bt.logging.warning(f"Missing vesting tables: {missing_tables}")
+                    # We'll create these during the VestingSystem initialization
+                else:
+                    bt.logging.info("All required vesting tables exist")
                 
                 await session.commit()
                 

@@ -4,6 +4,192 @@ database_init.py
 This file contains the code for initializing the database for the validator.
 """
 
+def get_vesting_tables_statements():
+    """
+    Get SQL statements to create vesting system tables.
+    
+    Returns:
+        list: List of SQL CREATE TABLE statements for vesting system tables
+    """
+    statements = []
+    
+    # Create blockchain_state table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS blockchain_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Create stake_transactions table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS stake_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_number INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            transaction_type TEXT NOT NULL,
+            flow_type TEXT NOT NULL,
+            hotkey TEXT NOT NULL,
+            coldkey TEXT,
+            call_amount REAL,
+            final_amount REAL,
+            fee REAL,
+            tx_hash TEXT,
+            origin_netuid INTEGER,
+            destination_netuid INTEGER,
+            destination_coldkey TEXT,
+            destination_hotkey TEXT,
+            validated INTEGER DEFAULT 0
+        )
+    """)
+    
+    # Create indices for stake_transactions
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_transactions_hotkey ON stake_transactions(hotkey)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_transactions_coldkey ON stake_transactions(coldkey)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_transactions_block ON stake_transactions(block_number)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_transactions_timestamp ON stake_transactions(timestamp)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_transactions_type ON stake_transactions(transaction_type)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_transactions_flow ON stake_transactions(flow_type)")
+    
+    # Create stake_balance_changes table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS stake_balance_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_number INTEGER NOT NULL,
+            timestamp INTEGER NOT NULL,
+            hotkey TEXT NOT NULL,
+            coldkey TEXT,
+            stake REAL NOT NULL,
+            stake_change REAL,
+            change_type TEXT,
+            epoch INTEGER
+        )
+    """)
+    
+    # Create indices for stake_balance_changes
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_balance_changes_hotkey ON stake_balance_changes(hotkey)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_balance_changes_coldkey ON stake_balance_changes(coldkey)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_balance_changes_block ON stake_balance_changes(block_number)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_balance_changes_timestamp ON stake_balance_changes(timestamp)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_balance_changes_epoch ON stake_balance_changes(epoch)")
+    
+    # Create stake_metrics table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS stake_metrics (
+            hotkey TEXT PRIMARY KEY,
+            coldkey TEXT,
+            total_stake REAL NOT NULL DEFAULT 0,
+            manual_stake REAL NOT NULL DEFAULT 0,
+            earned_stake REAL NOT NULL DEFAULT 0,
+            first_stake_timestamp INTEGER,
+            last_update INTEGER NOT NULL
+        )
+    """)
+    
+    # Create index for stake_metrics
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_metrics_coldkey ON stake_metrics(coldkey)")
+    
+    # Create coldkey_metrics table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS coldkey_metrics (
+            coldkey TEXT PRIMARY KEY,
+            total_stake REAL NOT NULL DEFAULT 0,
+            manual_stake REAL NOT NULL DEFAULT 0,
+            earned_stake REAL NOT NULL DEFAULT 0,
+            hotkey_count INTEGER NOT NULL DEFAULT 0,
+            last_update INTEGER NOT NULL
+        )
+    """)
+    
+    # Create stake_change_history table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS stake_change_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            hotkey TEXT NOT NULL,
+            coldkey TEXT,
+            change_type TEXT NOT NULL,
+            flow_type TEXT NOT NULL,
+            amount REAL NOT NULL,
+            total_stake_after REAL NOT NULL,
+            manual_stake_after REAL NOT NULL,
+            earned_stake_after REAL NOT NULL
+        )
+    """)
+    
+    # Create indices for stake_change_history
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_change_history_hotkey ON stake_change_history(hotkey)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_change_history_coldkey ON stake_change_history(coldkey)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_change_history_timestamp ON stake_change_history(timestamp)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_change_history_type ON stake_change_history(change_type)")
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_change_history_flow ON stake_change_history(flow_type)")
+    
+    # Create vesting_module_state table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS vesting_module_state (
+            module_name TEXT PRIMARY KEY,
+            last_block INTEGER,
+            last_timestamp INTEGER,
+            last_epoch INTEGER,
+            module_data TEXT
+        )
+    """)
+    
+    # Create stake_tranches table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS stake_tranches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hotkey TEXT NOT NULL,
+            coldkey TEXT,
+            initial_amount REAL NOT NULL,
+            remaining_amount REAL NOT NULL,
+            entry_timestamp INTEGER NOT NULL,
+            is_emission INTEGER NOT NULL,
+            last_update INTEGER NOT NULL
+        )
+    """)
+    
+    # Create index for stake_tranches
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_tranches_hotkey ON stake_tranches(hotkey)")
+    
+    # Create stake_tranche_exits table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS stake_tranche_exits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tranche_id INTEGER NOT NULL,
+            exit_timestamp INTEGER NOT NULL,
+            exit_amount REAL NOT NULL,
+            exit_reason TEXT NOT NULL,
+            FOREIGN KEY (tranche_id) REFERENCES stake_tranches(id) ON DELETE CASCADE
+        )
+    """)
+    
+    # Create index for stake_tranche_exits
+    statements.append("CREATE INDEX IF NOT EXISTS idx_stake_tranche_exits_tranche_id ON stake_tranche_exits(tranche_id)")
+    
+    # Create aggregated_tranche_metrics table
+    statements.append("""
+        CREATE TABLE IF NOT EXISTS aggregated_tranche_metrics (
+            hotkey TEXT PRIMARY KEY,
+            coldkey TEXT,
+            total_tranches INTEGER NOT NULL DEFAULT 0,
+            active_tranches INTEGER NOT NULL DEFAULT 0,
+            avg_tranche_age INTEGER NOT NULL DEFAULT 0,
+            oldest_tranche_age INTEGER NOT NULL DEFAULT 0,
+            total_tranche_amount REAL NOT NULL DEFAULT 0,
+            manual_tranches INTEGER NOT NULL DEFAULT 0,
+            emission_tranches INTEGER NOT NULL DEFAULT 0,
+            emission_amount REAL NOT NULL DEFAULT 0,
+            manual_amount REAL NOT NULL DEFAULT 0,
+            last_update INTEGER NOT NULL
+        )
+    """)
+    
+    # Create index for aggregated_tranche_metrics
+    statements.append("CREATE INDEX IF NOT EXISTS idx_aggregated_tranche_metrics_coldkey ON aggregated_tranche_metrics(coldkey)")
+    
+    return statements
+
 def initialize_database():
     statements = []
     
@@ -16,6 +202,12 @@ def initialize_database():
             version INTEGER PRIMARY KEY,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+    
+    # Ensure there's at least one version entry
+    statements.append("""
+        INSERT OR IGNORE INTO db_version (version)
+        VALUES (1)
     """)
     
     # 2. Create main miner_stats table first
@@ -458,6 +650,10 @@ def initialize_database():
     statements.append(
         """INSERT OR IGNORE INTO db_version (version) VALUES (1)"""
     )
+    
+    # Add vesting system tables 
+    vesting_statements = get_vesting_tables_statements()
+    statements.extend(vesting_statements)
     
     return statements
 

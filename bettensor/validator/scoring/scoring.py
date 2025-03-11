@@ -998,35 +998,99 @@ class ScoringSystem:
             return weights
 
     async def scoring_run(self, date, invalid_uids, valid_uids):
+        """Run the scoring system for a particular date."""
         bt.logging.info(f"=== Starting scoring run for date: {date} ===")
-
-        # Update invalid, valid, and empty UIDs
+        
+        # Add debugging and shape correction for self.tiers
+        original_shape = self.tiers.shape
+        bt.logging.info(f"Original tiers shape: {original_shape}")
+        
+        # Ensure current_day is initialized
+        if self.current_day is None:
+            bt.logging.warning("current_day is None, initializing to 0")
+            self.current_day = 0
+            
+        bt.logging.info(f"Current day: {self.current_day}")
+        
+        # Check and fix tiers shape if needed
+        if len(original_shape) != 2:
+            bt.logging.warning(f"Incorrect tiers shape detected: {original_shape}, reshaping to 2D")
+            try:
+                # If it's 3D, take just the first "channel" or recreate from scratch
+                if len(original_shape) == 3:
+                    self.tiers = self.tiers[:, :, 0] if original_shape[2] > 0 else np.ones((self.num_miners, self.max_days), dtype=int)
+                else:
+                    # For any other unexpected shape, recreate from scratch
+                    self.tiers = np.ones((self.num_miners, self.max_days), dtype=int)
+                bt.logging.info(f"Corrected tiers shape: {self.tiers.shape}")
+            except Exception as e:
+                bt.logging.error(f"Error reshaping tiers: {e}")
+                # Last resort fallback
+                self.tiers = np.ones((self.num_miners, self.max_days), dtype=int)
+                bt.logging.info(f"Recreated tiers with shape: {self.tiers.shape}")
+        
+        # Initialize current day's tiers for invalid UIDs
+        self.empty_uids = set(range(self.num_miners)) - set(invalid_uids) - set(valid_uids)
         self.invalid_uids = set(invalid_uids)
         self.valid_uids = set(valid_uids)
-        self.empty_uids = set(range(self.num_miners)) - self.valid_uids - self.invalid_uids
-
-        # Create boolean masks for each category
-        empty_mask = np.zeros(self.num_miners, dtype=bool)
-        empty_mask[list(self.empty_uids)] = True
-
-        invalid_mask = np.zeros(self.num_miners, dtype=bool)
-        invalid_mask[list(self.invalid_uids)] = True
-
-        valid_mask = np.zeros(self.num_miners, dtype=bool)
-        valid_mask[list(self.valid_uids)] = True
+        empty_mask = np.array([uid in self.empty_uids for uid in range(self.num_miners)])
+        invalid_mask = np.array([uid in self.invalid_uids for uid in range(self.num_miners)])
+        valid_mask = np.array([uid in self.valid_uids for uid in range(self.num_miners)])
 
         # Set tiers using boolean masks
         if self.init:
-            self.tiers[:, self.current_day] = 2  # Initialize valid UIDs to tier 2
+            # Initial setup: Set valid UIDs to tier 2
+            self.tiers[:, self.current_day] = 1  # Start with tier 1 for everyone
+            for uid in self.valid_uids:
+                if uid is not None and isinstance(uid, (int, np.integer, float, str)) and self.current_day is not None:
+                    uid_value = int(uid)
+                    day_value = int(self.current_day)
+                    if 0 <= uid_value < self.num_miners and 0 <= day_value < self.max_days:
+                        self.tiers[uid_value, day_value] = 2  # Initialize valid UIDs to tier 2
             bt.logging.info(f"Assigned {len(self.valid_uids)} valid UIDs to tier 2.")
             self.init = False
 
-        # Assign empty and invalid UIDs
-        self.tiers[empty_mask, self.current_day] = 0
-        self.tiers[invalid_mask, self.current_day] = 1
+        # Assign empty and invalid UIDs - Make sure all indices are integers
+        for uid in self.empty_uids:
+            if uid is not None and isinstance(uid, (int, np.integer, float, str)) and self.current_day is not None:
+                try:
+                    uid_value = int(uid)
+                    day_value = int(self.current_day)
+                    if 0 <= uid_value < self.num_miners and 0 <= day_value < self.max_days:
+                        self.tiers[uid_value, day_value] = 0
+                except (ValueError, TypeError, IndexError) as e:
+                    bt.logging.warning(f"Error setting tier for empty UID {uid}: {e}")
+        
+        for uid in self.invalid_uids:
+            if uid is not None and isinstance(uid, (int, np.integer, float, str)) and self.current_day is not None:
+                try:
+                    uid_value = int(uid)
+                    day_value = int(self.current_day)
+                    if 0 <= uid_value < self.num_miners and 0 <= day_value < self.max_days:
+                        self.tiers[uid_value, day_value] = 1
+                except (ValueError, TypeError, IndexError) as e:
+                    bt.logging.warning(f"Error setting tier for invalid UID {uid}: {e}")
 
         # Ensure valid UIDs are at least in tier 2
-        self.tiers[valid_mask & (self.tiers[:, self.current_day] < 2)] = 2  
+        for uid in self.valid_uids:
+            if uid is not None and isinstance(uid, (int, np.integer, float, str)) and self.current_day is not None:
+                try:
+                    uid_value = int(uid)
+                    day_value = int(self.current_day)
+                    if 0 <= uid_value < self.num_miners and 0 <= day_value < self.max_days:
+                        current_tier = self.tiers[uid_value, day_value]
+                        if isinstance(current_tier, np.ndarray):
+                            bt.logging.warning(f"Unexpected array for uid={uid_value}, current_day={day_value}: {current_tier}")
+                            # Try to get a scalar value
+                            if current_tier.size > 0:
+                                current_tier = current_tier.item(0)
+                            else:
+                                current_tier = 0
+                        
+                        if isinstance(current_tier, (int, np.integer, float, np.floating)) and current_tier < 2:
+                            self.tiers[uid_value, day_value] = 2
+                except (ValueError, TypeError, IndexError) as e:
+                    bt.logging.warning(f"Error checking/setting tier for valid UID {uid}: {e}")
 
         bt.logging.info(f"Assigned {len(self.empty_uids)} empty slots to tier 0.")
         bt.logging.info(f"Assigned {len(self.invalid_uids)} invalid UIDs to tier 1.")

@@ -72,6 +72,11 @@ class StateSync:
             "state_hashes.txt",
             "state_metadata.json"
         ]
+        
+        # Files to exclude from sync operations (preserve local versions)
+        self.excluded_files = [
+            "vesting.db"
+        ]
 
         self.hash_file = self.state_dir / "state_hashes.txt"
         self.metadata_file = self.state_dir / "state_metadata.json"
@@ -358,6 +363,10 @@ class StateSync:
                 try:
                     # Download files to temp directory first
                     for filename in self.state_files:
+                        if filename in self.excluded_files:
+                            bt.logging.info(f"Skipping download of {filename} as it's in the excluded files list")
+                            continue
+                            
                         blob_client = self.container.get_blob_client(filename)
                         temp_file = temp_dir / filename
                         
@@ -398,7 +407,7 @@ class StateSync:
                         except Exception as e:
                             bt.logging.error(f"Error downloading {filename}: {str(e)}")
                             raise
-                    
+                        
                     # Special handling for database file
                     temp_db = temp_dir / "validator.db"
                     if temp_db.exists():
@@ -477,7 +486,7 @@ class StateSync:
                                 
                                 # Move other state files
                                 for filename in self.state_files:
-                                    if filename != "validator.db":
+                                    if filename != "validator.db" and filename not in self.excluded_files:
                                         src = temp_dir / filename
                                         dst = self.state_dir / filename
                                         if src.exists():
@@ -515,6 +524,12 @@ class StateSync:
                                 # Update last pull block
                                 if hasattr(self.validator, 'subtensor'):
                                     self.validator.last_state_pull = self.validator.subtensor.block
+                                
+                                # Check if excluded files exist after sync
+                                for excluded_file in self.excluded_files:
+                                    excluded_file_path = self.state_dir / excluded_file
+                                    if not excluded_file_path.exists():
+                                        bt.logging.warning(f"Excluded file {excluded_file} does not exist after state sync. It will need to be created during initialization.")
                                 
                                 bt.logging.info("State pull method done")
                                 return True
@@ -773,6 +788,10 @@ class StateSync:
 
             # Upload all state files to Azure
             for filename in self.state_files:
+                if filename in self.excluded_files:
+                    bt.logging.info(f"Skipping {filename} as it's in the excluded files list")
+                    continue
+                    
                 filepath = self.state_dir / filename
                 if not filepath.exists():
                     bt.logging.warning(f"State file {filename} does not exist, skipping.")

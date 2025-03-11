@@ -696,18 +696,24 @@ class VestingAPIInterface:
             cutoff_time = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp())
             query = """
                 SELECT * FROM stake_transactions
-                WHERE timestamp > ? AND hotkey = ?
+                WHERE timestamp > :cutoff_time AND hotkey = :hotkey
                 ORDER BY timestamp DESC
             """
-            transactions = await self.vesting_system.db_manager.fetch_all(query, (cutoff_time, hotkey))
+            transactions = await self.vesting_system.db_manager.fetch_all(query, {
+                "cutoff_time": cutoff_time, 
+                "hotkey": hotkey
+            })
             
             # Get stake change history
             query = """
                 SELECT * FROM stake_change_history
-                WHERE timestamp > ? AND hotkey = ?
+                WHERE timestamp > :cutoff_time AND hotkey = :hotkey
                 ORDER BY timestamp DESC
             """
-            stake_changes = await self.vesting_system.db_manager.fetch_all(query, (cutoff_time, hotkey))
+            stake_changes = await self.vesting_system.db_manager.fetch_all(query, {
+                "cutoff_time": cutoff_time, 
+                "hotkey": hotkey
+            })
             
             # Get tranche data
             tranches = await self.vesting_system.stake_tracker.get_tranche_details(hotkey, include_exits=True)

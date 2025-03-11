@@ -78,198 +78,111 @@ class StakeTracker:
         timestamp: Optional[datetime] = None
     ):
         """
-        Record a change in stake and update metrics.
+        Record a stake change and update metrics.
         
         Args:
-            hotkey: Hotkey for which the stake changed
+            hotkey: Miner hotkey
             coldkey: Associated coldkey
-            amount: Amount of the change (positive for additions, negative for removals)
-            change_type: Type of change (e.g., 'add_stake', 'remove_stake', 'reward', 'transfer')
-            flow_type: Flow categorization (INFLOW, OUTFLOW, NEUTRAL, EMISSION)
-            timestamp: Timestamp of the change (defaults to current time)
-        
-        Returns:
-            bool: True if successful
+            amount: Stake amount changed (positive or negative)
+            change_type: Type of change (add_stake, remove_stake, etc.)
+            flow_type: Direction of flow (inflow, outflow, neutral, emission)
+            timestamp: When the change occurred (defaults to now)
         """
-        try:
-            # Set default timestamp
-            if timestamp is None:
-                timestamp = datetime.now(timezone.utc)
+        # Use current time if not provided
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
             
-            # Determine flow type if not provided
-            if flow_type is None:
-                # Default flow type based on change_type and amount
-                if change_type in ['add_stake', 'reward', 'emission']:
-                    flow_type = INFLOW if change_type != 'emission' else EMISSION
-                elif change_type in ['remove_stake', 'penalty']:
-                    flow_type = OUTFLOW
-                else:
-                    # For other types, base on amount
-                    flow_type = INFLOW if amount > 0 else OUTFLOW if amount < 0 else NEUTRAL
+        # Log detailed information about the stake change
+        logger.info(f"Recording stake change: hotkey={hotkey[:10]}..., type={change_type}, amount={amount:.4f} TAO, flow={flow_type}")
+        
+        # Get current stake metrics for this hotkey
+        metrics = await self.get_stake_metrics(hotkey)
+        if metrics is None:
+            logger.info(f"First stake record for hotkey {hotkey[:10]}..., initializing metrics")
+            # Initialize new stake metrics record
+            metrics = {
+                'hotkey': hotkey,
+                'coldkey': coldkey,
+                'total_stake': 0.0,
+                'manual_stake': 0.0,
+                'earned_stake': 0.0,
+                'first_stake_timestamp': int(timestamp.timestamp()),
+                'last_update': int(timestamp.timestamp())
+            }
             
-            # Get current metrics for hotkey
-            metrics = await self.get_stake_metrics(hotkey)
-            
-            # If no existing metrics, create new entry
-            if not metrics:
-                metrics = {
-                    'hotkey': hotkey,
-                    'coldkey': coldkey,
-                    'total_stake': 0.0,
-                    'manual_stake': 0.0,
-                    'earned_stake': 0.0,
-                    'last_update': timestamp
-                }
-            
-            # Store previous values
-            prev_total_stake = metrics['total_stake']
-            prev_manual_stake = metrics['manual_stake']
-            prev_earned_stake = metrics['earned_stake']
-            
-            # Process stake change via the tranche system
-            
-            # 1. For inflows and emissions, create new tranches
-            if flow_type == INFLOW or flow_type == EMISSION:
-                # For inflows (add_stake etc.) or emissions, create a new tranche
-                is_emission = (flow_type == EMISSION)
+        # Process stake change based on flow type
+        if flow_type == INFLOW:
+            # Record a stake addition
+            if change_type != EMISSION:
+                logger.debug(f"Adding {amount:.4f} TAO manual stake to {hotkey[:10]}...")
+                metrics['manual_stake'] += amount
+            else:
+                logger.debug(f"Adding {amount:.4f} TAO earned stake to {hotkey[:10]}...")
+                metrics['earned_stake'] += amount
                 
-                # Create new tranche
-                tranche_id = await self._create_new_tranche(
-                    hotkey=hotkey,
-                    coldkey=coldkey,
-                    amount=abs(amount),
-                    is_emission=is_emission,
-                    timestamp=timestamp
-                )
+            metrics['total_stake'] += amount
+            
+            # Create a new stake tranche
+            await self._create_new_tranche(
+                hotkey=hotkey,
+                coldkey=coldkey,
+                amount=amount,
+                is_emission=(change_type == EMISSION),
+                timestamp=timestamp
+            )
+            
+        elif flow_type == OUTFLOW:
+            # Record a stake removal
+            logger.debug(f"Removing {amount:.4f} TAO stake from {hotkey[:10]}...")
+            
+            # Update metrics - never let values go below zero
+            remaining = amount
+            
+            # Check if we're consuming tranches
+            success = await self._consume_tranches_filo(
+                hotkey=hotkey,
+                amount_to_consume=amount,
+                timestamp=timestamp
+            )
+            
+            if not success:
+                logger.warning(f"Failed to find enough tranches to consume {amount:.4f} TAO for {hotkey[:10]}...")
                 
-                if tranche_id:
-                    logger.info(
-                        f"Created new {'emission' if is_emission else 'manual'} stake tranche {tranche_id} "
-                        f"for {hotkey}: {abs(amount):.6f} TAO"
-                    )
-                    
-                    # Update metrics based on flow type
-                    if is_emission:
-                        # Emission is always added to earned_stake
-                        metrics['earned_stake'] += abs(amount)
-                        metrics['total_stake'] += abs(amount)
-                    else:
-                        # Manual inflows go to manual_stake
-                        if change_type in ['add_stake', 'transfer', 'move_stake', 'swap_stake']:
-                            metrics['manual_stake'] += abs(amount)
-                            metrics['total_stake'] += abs(amount)
-                        else:
-                            # Other inflows (like rewards that aren't emissions) go to earned_stake
-                            metrics['earned_stake'] += abs(amount)
-                            metrics['total_stake'] += abs(amount)
-                else:
-                    logger.error(f"Failed to create tranche for {hotkey}, stake change not recorded")
-                    return False
-                    
-            # 2. For outflows, consume existing tranches using FILO accounting
-            elif flow_type == OUTFLOW and amount < 0:
-                # For outflows (remove_stake etc.), consume tranches using FILO
-                amount_consumed, consumed_details = await self._consume_tranches_filo(
-                    hotkey=hotkey,
-                    amount_to_consume=abs(amount),
-                    timestamp=timestamp
-                )
+            # First consume earned stake, then manual stake if needed
+            if metrics['earned_stake'] > 0:
+                earned_consumed = min(metrics['earned_stake'], remaining)
+                metrics['earned_stake'] -= earned_consumed
+                remaining -= earned_consumed
+                logger.debug(f"Consumed {earned_consumed:.4f} TAO of earned stake from {hotkey[:10]}...")
                 
-                if amount_consumed > 0:
-                    # Log consumption details
-                    emission_consumed = sum(detail['amount_consumed'] for detail in consumed_details if detail['is_emission'])
-                    manual_consumed = amount_consumed - emission_consumed
-                    
-                    logger.info(
-                        f"Consumed {amount_consumed:.6f} TAO from {len(consumed_details)} tranches for {hotkey} "
-                        f"({emission_consumed:.6f} emission, {manual_consumed:.6f} manual)"
-                    )
-                    
-                    # Update metrics
-                    metrics['total_stake'] -= amount_consumed
-                    
-                    # Update earned_stake and manual_stake based on what was consumed
-                    metrics['earned_stake'] -= emission_consumed
-                    metrics['manual_stake'] -= manual_consumed
-                    
-                    # If we couldn't consume the full requested amount (not enough stake)
-                    if amount_consumed < abs(amount):
-                        logger.warning(
-                            f"Could only consume {amount_consumed:.6f} of {abs(amount):.6f} TAO "
-                            f"requested for {hotkey} (insufficient stake)"
-                        )
-                else:
-                    logger.warning(f"No stake was consumed for {hotkey}, requested {abs(amount):.6f} TAO")
+            if remaining > 0 and metrics['manual_stake'] > 0:
+                manual_consumed = min(metrics['manual_stake'], remaining)
+                metrics['manual_stake'] -= manual_consumed
+                remaining -= manual_consumed
+                logger.debug(f"Consumed {manual_consumed:.4f} TAO of manual stake from {hotkey[:10]}...")
+                
+            # Update total stake
+            metrics['total_stake'] = max(0, metrics['total_stake'] - amount)
             
-            # Ensure no negative values
-            metrics['total_stake'] = max(0, metrics['total_stake'])
-            metrics['manual_stake'] = max(0, metrics['manual_stake'])
-            metrics['earned_stake'] = max(0, metrics['earned_stake'])
-            
-            # Verify that manual_stake + earned_stake = total_stake
-            if abs((metrics['manual_stake'] + metrics['earned_stake']) - metrics['total_stake']) > 0.000001:
-                # Adjust earned_stake to ensure balance
-                metrics['earned_stake'] = metrics['total_stake'] - metrics['manual_stake']
-                metrics['earned_stake'] = max(0, metrics['earned_stake'])
-            
-            # Update last_update timestamp
-            metrics['last_update'] = timestamp
-            
-            # Update or insert stake metrics
-            await self.db_manager.execute_query("""
-                INSERT INTO stake_metrics 
-                (hotkey, coldkey, total_stake, manual_stake, earned_stake, last_update)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(hotkey) DO UPDATE SET
-                coldkey = excluded.coldkey,
-                total_stake = excluded.total_stake,
-                manual_stake = excluded.manual_stake,
-                earned_stake = excluded.earned_stake,
-                last_update = excluded.last_update
-            """, (
-                hotkey,
-                coldkey,
-                metrics['total_stake'],
-                metrics['manual_stake'],
-                metrics['earned_stake'],
-                timestamp
-            ))
-            
-            # Record the change in history
-            await self.db_manager.execute_query("""
-                INSERT INTO stake_change_history 
-                (timestamp, hotkey, coldkey, amount, change_type, flow_type, 
-                prev_total_stake, new_total_stake,
-                prev_manual_stake, new_manual_stake,
-                prev_earned_stake, new_earned_stake)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                timestamp,
-                hotkey,
-                coldkey,
-                amount,
-                change_type,
-                flow_type,
-                prev_total_stake,
-                metrics['total_stake'],
-                prev_manual_stake,
-                metrics['manual_stake'],
-                prev_earned_stake,
-                metrics['earned_stake']
-            ))
-            
-            # Update coldkey metrics
-            await self._update_coldkey_metrics(coldkey)
-            
-            # Update aggregated tranche metrics for this hotkey
-            await self._update_aggregated_tranche_metrics(hotkey)
-            
-            logger.debug(f"Recorded stake change for {hotkey}: {amount} ({change_type}, {flow_type})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error recording stake change: {e}")
-            return False
+        # Update last update timestamp
+        metrics['last_update'] = int(timestamp.timestamp())
+        
+        # Update the database record
+        await self.db_manager.execute_query("""
+            INSERT OR REPLACE INTO stake_metrics
+            (hotkey, coldkey, total_stake, manual_stake, earned_stake, first_stake_timestamp, last_update)
+            VALUES (:hotkey, :coldkey, :total_stake, :manual_stake, :earned_stake, :first_stake_timestamp, :last_update)
+        """, metrics)
+        
+        logger.info(f"Updated stake metrics for {hotkey[:10]}...: total={metrics['total_stake']:.4f}, manual={metrics['manual_stake']:.4f}, earned={metrics['earned_stake']:.4f}")
+        
+        # Update coldkey metrics
+        await self._update_coldkey_metrics(coldkey)
+        
+        # Update aggregated tranche metrics
+        await self._update_aggregated_tranche_metrics(hotkey)
+        
+        return metrics
     
     async def _update_coldkey_metrics(self, coldkey: str):
         """
@@ -304,13 +217,13 @@ class StakeTracker:
             # Update or insert coldkey metrics
             await self.db_manager.execute_query("""
                 INSERT INTO coldkey_metrics 
-                (coldkey, total_stake, manual_stake, earned_stake, num_hotkeys, last_update)
+                (coldkey, total_stake, manual_stake, earned_stake, hotkey_count, last_update)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(coldkey) DO UPDATE SET
                 total_stake = excluded.total_stake,
                 manual_stake = excluded.manual_stake,
                 earned_stake = excluded.earned_stake,
-                num_hotkeys = excluded.num_hotkeys,
+                hotkey_count = excluded.hotkey_count,
                 last_update = excluded.last_update
             """, (
                 coldkey,
@@ -378,8 +291,8 @@ class StakeTracker:
         """
         try:
             results = await self.db_manager.fetch_all("""
-                SELECT hotkey FROM stake_metrics WHERE coldkey = ?
-            """, (coldkey,))
+                SELECT hotkey FROM stake_metrics WHERE coldkey = :coldkey
+            """, {"coldkey": coldkey})
             
             return [row['hotkey'] for row in results]
             
@@ -621,73 +534,98 @@ class StakeTracker:
     
     async def _create_new_tranche(self, hotkey: str, coldkey: str, amount: float, is_emission: bool, timestamp: datetime):
         """
-        Create a new stake tranche.
+        Create a new stake tranche entry.
         
         Args:
-            hotkey: The hotkey owning this tranche
-            coldkey: The associated coldkey
-            amount: Amount of stake in this tranche
-            is_emission: Whether this tranche is from emissions/rewards
-            timestamp: When this tranche was created
+            hotkey: Miner hotkey
+            coldkey: Associated coldkey
+            amount: Amount of stake in the tranche
+            is_emission: Whether this is from emissions (True) or manual stake (False)
+            timestamp: When the tranche was created
             
         Returns:
-            int: ID of the created tranche
+            int: Tranche ID if successful, None otherwise
         """
-        if amount <= 0:
-            logger.warning(f"Attempted to create tranche with non-positive amount {amount}")
+        try:
+            # Log tranche creation
+            tranche_type = "emission" if is_emission else "manual"
+            logger.info(f"Creating new {tranche_type} stake tranche: hotkey={hotkey[:10]}..., amount={amount:.4f} TAO")
+            
+            # Insert new tranche
+            result = await self.db_manager.execute_query("""
+                INSERT INTO stake_tranches 
+                (hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                hotkey, 
+                coldkey, 
+                amount, 
+                amount, 
+                int(timestamp.timestamp()), 
+                1 if is_emission else 0,
+                int(timestamp.timestamp())
+            ))
+            
+            # Get the tranche ID (last row ID)
+            tranche_id = result.lastrowid if hasattr(result, 'lastrowid') else None
+            
+            if tranche_id:
+                logger.debug(f"Created tranche ID {tranche_id}: {tranche_type}, {amount:.4f} TAO for {hotkey[:10]}...")
+                
+                # Count total tranches for this hotkey
+                count_result = await self.db_manager.fetch_one("""
+                    SELECT COUNT(*) as count, SUM(remaining_amount) as total
+                    FROM stake_tranches 
+                    WHERE hotkey = ? AND remaining_amount > 0
+                """, (hotkey,))
+                
+                if count_result:
+                    logger.debug(f"Hotkey {hotkey[:10]}... now has {count_result['count']} active tranches " +
+                                f"with {count_result['total']:.4f} total TAO")
+            else:
+                logger.warning(f"Failed to get tranche ID for new {tranche_type} stake: {amount:.4f} TAO for {hotkey[:10]}...")
+            
+            return tranche_id
+            
+        except Exception as e:
+            logger.error(f"Error creating new tranche: {e}")
             return None
-        
-        tranche_id = await self.db_manager.execute_query("""
-            INSERT INTO stake_tranches 
-            (hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
-        """, (
-            hotkey,
-            coldkey,
-            amount,
-            amount,  # Initially, remaining amount equals initial amount
-            timestamp,
-            is_emission,
-            timestamp
-        ))
-        
-        if tranche_id:
-            logger.debug(f"Created new {'emission' if is_emission else 'manual'} stake tranche {tranche_id} for {hotkey}: {amount} TAO")
-            return tranche_id[0] if isinstance(tranche_id, list) else tranche_id
-        return None
     
     async def _consume_tranches_filo(self, hotkey: str, amount_to_consume: float, timestamp: datetime):
         """
-        Consume stake tranches using FILO (First-In-Last-Out) accounting.
-        
-        This method will consume tranches starting from the newest,
-        handling both partial and complete tranche consumption.
-        This approach allows miners to maintain long-term holdings
-        while still having operational liquidity from newer rewards.
+        Consume stake tranches using FILO accounting (Last In, First Out).
         
         Args:
-            hotkey: The hotkey withdrawing stake
-            amount_to_consume: Total amount to consume across tranches
-            timestamp: When this consumption is occurring
+            hotkey: Miner hotkey
+            amount_to_consume: Amount of stake to consume
+            timestamp: When the consumption occurred
             
         Returns:
-            tuple: (amount_consumed, list of consumed tranches with their details)
+            Tuple[float, List[Dict]]: Amount consumed and details of consumed tranches
         """
-        if amount_to_consume <= 0:
-            return 0, []
+        logger.info(f"Consuming {amount_to_consume:.4f} TAO from tranches for hotkey={hotkey[:10]}...")
         
-        # Get all non-empty tranches ordered by timestamp (newest first)
+        # Get all active tranches for this hotkey, ordered by timestamp descending (newest first)
         tranches = await self.db_manager.fetch_all("""
-            SELECT id, initial_amount, remaining_amount, entry_timestamp, is_emission
+            SELECT id, hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update
             FROM stake_tranches
             WHERE hotkey = ? AND remaining_amount > 0
             ORDER BY entry_timestamp DESC
         """, (hotkey,))
         
         if not tranches:
-            logger.warning(f"No available tranches found for {hotkey} to consume {amount_to_consume} TAO")
+            logger.warning(f"No active tranches found for hotkey {hotkey[:10]}...")
             return 0, []
+            
+        logger.debug(f"Found {len(tranches)} active tranches for hotkey {hotkey[:10]}...")
+        
+        # Count emission vs manual tranches
+        emission_tranches = sum(1 for t in tranches if t['is_emission'])
+        manual_tranches = len(tranches) - emission_tranches
+        emission_amount = sum(t['remaining_amount'] for t in tranches if t['is_emission'])
+        manual_amount = sum(t['remaining_amount'] for t in tranches if not t['is_emission'])
+        logger.debug(f"Tranche breakdown: {emission_tranches} emission tranches ({emission_amount:.4f} TAO), " +
+                    f"{manual_tranches} manual tranches ({manual_amount:.4f} TAO)")
         
         total_consumed = 0
         consumed_details = []

@@ -17,7 +17,7 @@ from os import path, rename
 from copy import deepcopy
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 from bettensor.base.neuron import BaseNeuron
 from bettensor.protocol import TeamGamePrediction
@@ -31,8 +31,12 @@ from bettensor.validator.io.miner_data import MinerDataMixin
 from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
 from bettensor.validator.io.base_api_client import BaseAPIClient
 from bettensor.validator.scoring.watchdog import Watchdog
+from bettensor.validator.vesting.system import VestingSystem
+from bettensor.validator.vesting.integration import VestingIntegration, get_vesting_system, handle_deregistered_miner, batch_handle_deregistrations
 from bettensor import __spec_version__
 from types import SimpleNamespace
+import configparser
+from bettensor.validator.vesting.database_schema import create_vesting_tables_async
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -71,6 +75,69 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             type=float,
             default=0.9,
             help="The alpha value for the validator."
+        )
+        
+        # Vesting system parameters
+        parser.add_argument(
+            "--vesting.enabled",
+            type=str,
+            default="False",
+            help="Enable vesting impact on weights (True/False)"
+        )
+        parser.add_argument(
+            "--vesting.minimum_stake",
+            type=float,
+            default=0.3,
+            help="Minimum stake required for multiplier"
+        )
+        parser.add_argument(
+            "--vesting.retention_window",
+            type=int,
+            default=30,
+            help="Retention window in days"
+        )
+        parser.add_argument(
+            "--vesting.retention_target",
+            type=float,
+            default=0.9,
+            help="Target retention percentage"
+        )
+        parser.add_argument(
+            "--vesting.max_multiplier",
+            type=float,
+            default=1.5,
+            help="Maximum vesting multiplier"
+        )
+        parser.add_argument(
+            "--vesting.use_background_thread",
+            type=str,
+            default="True",
+            help="Whether to use background threads for vesting system (True/False)"
+        )
+        parser.add_argument(
+            "--vesting.thread_priority",
+            type=str,
+            default="low",
+            choices=["low", "normal", "high"],
+            help="Priority for vesting system background threads"
+        )
+        parser.add_argument(
+            "--vesting.query_interval_seconds",
+            type=int,
+            default=300,
+            help="How often to check for blockchain updates (seconds)"
+        )
+        parser.add_argument(
+            "--vesting.transaction_query_interval_seconds",
+            type=int,
+            default=60,
+            help="How often to check for new transactions (seconds)"
+        )
+        parser.add_argument(
+            "--vesting.detailed_transaction_tracking",
+            type=str,
+            default="True",
+            help="Whether to use detailed transaction tracking (True/False)"
         )
 
     @classmethod
@@ -114,6 +181,10 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.is_primary = None
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.determine_max_workers())
         self.subnet_version = str(__spec_version__)  # Convert to string
+        
+        # Vesting system attributes
+        self.vesting_system = None
+        self.vesting_integration = None
 
         self.last_queried_block = 0
         self.last_sent_data_to_website = 0
@@ -226,84 +297,427 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
 
     async def initialize_neuron(self):
-        bt.logging(config=self.config, logging_dir=self.config.full_path)
-        bt.logging.info(
-            f"Initializing validator for subnet: {self.config.netuid} on network: {self.config.subtensor.chain_endpoint} with config: {self.config}"
-        )
+        """Initializes the neuron by setting up the axon and synapse network components
+        Sets up the database, loads state, sets up the axon and synapse, and sets up the API client
+        Returns:
+            bool: True if initialization was successful, False otherwise
+        """
+        try:
+            bt.logging.info("Initializing validator neuron")
+            
+            # Check mandatory config parameters
+            for param in ['netuid', 'subtensor.network', 'wallet.name', 'wallet.hotkey']:
+                if not hasattr(self.config, param):
+                    bt.logging.error(f"Missing required config parameter: {param}")
+                    return False
+            
+            # Set up bittensor objects (wallet, subtensor, dendrite, metagraph)
+            try:
+                # Setup bittensor objects (wallet, subtensor, dendrite, metagraph)
+                self.wallet, self.subtensor, self.dendrite, self.metagraph = self.setup_bittensor_objects(self.config)
+                if not self.wallet or not self.subtensor or not self.dendrite or not self.metagraph:
+                    raise ValueError("Failed to set up bittensor objects")
+            except Exception as e:
+                bt.logging.error(f"Error in bittensor setup: {e}")
+                bt.logging.error(traceback.format_exc())
+                return False
+                
+            # Set up database connection and validators manager
+            try:
+                # Get DB path and ensure directory exists
+                os.makedirs(os.path.dirname(self.config.db), exist_ok=True)
+                
+                # Create main database manager
+                self.db_manager = DatabaseManager(self.config.db)
+                
+                # Create separate vesting database manager with a different file
+                vesting_db_dir = os.path.dirname(self.config.db)
+                self.vesting_db_path = os.path.join(vesting_db_dir, "vesting.db")
+                bt.logging.info(f"Creating separate vesting database at {self.vesting_db_path}")
+                self.vesting_db_manager = DatabaseManager(self.vesting_db_path)
+                
+                # Log database paths for debugging
+                bt.logging.info(f"Main database path: {self.db_manager.database_path}")
+                bt.logging.info(f"Vesting database path: {self.vesting_db_manager.database_path}")
+                
+                # Check if vesting.db file exists
+                if os.path.exists(self.vesting_db_path):
+                    bt.logging.info(f"Vesting database file found at {self.vesting_db_path}")
+                else:
+                    bt.logging.warning(f"Vesting database file not found at {self.vesting_db_path}")
+                
+            except Exception as e:
+                bt.logging.error(f"Error in database setup: {e}")
+                bt.logging.error(traceback.format_exc())
+                return False
 
-        # Setup the bittensor objects
-        self.wallet, self.subtensor, self.dendrite, self.metagraph = self.setup_bittensor_objects(
-            self.config
-        )
+            # Setup api client
+            if self.config.get("bettensor.api_client.type", "default") == "default":
+                self.api_client = BettensorAPIClient(db_manager=self.db_manager)
+            else:
+                # Base API client for testing
+                self.api_client = BaseAPIClient()
+            
+            # Set up entropy system first
+            self.entropy_system = EntropySystem(
+                num_miners=256,
+                max_days=45,
+                db_manager=self.db_manager
+            )
 
-        bt.logging.info(
-            f"Bittensor objects initialized:\nmetagraph: {self.metagraph}\nsubtensor: {self.subtensor}\nwallet: {self.wallet}"
-        )
+            # Initialize sports data handler with correct parameters
+            self.sports_data = SportsData(
+                db_manager=self.db_manager,
+                entropy_system=self.entropy_system,
+                api_client=self.api_client
+            )
 
-        # Validate that the validator has registered to the metagraph correctly
-        if not self.validator_validation(self.metagraph, self.wallet, self.subtensor):
-            raise IndexError("Unable to find validator key from metagraph")
+            # Set up website handler
+            self.website_handler = WebsiteHandler(validator=self)
 
-        # Get the unique identity (uid) from the network
-        validator_uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+            # Get step from loaded state or set to 0 if not found
+            state_path = self.base_path + "state/state.pt"
+            if os.path.exists(state_path):
+                try:
+                    state_dict = torch.load(state_path)
+                    self.step = state_dict.get("step", 0)
+                    bt.logging.info(f"Loaded step {self.step} from saved state")
+                except:
+                    bt.logging.info("Failed to load state, defaulting to step 0")
+                    self.step = 0
+                    
+            else:
+                bt.logging.info("No saved state found, defaulting to step 0")
+                self.step = 0
 
-        self.uid = validator_uid
-        bt.logging.info(f"Validator is running with uid: {validator_uid}")
+            # Validate the subtensor connection
+            if self.subtensor is None:
+                bt.logging.error("Failed to connect to subtensor")
+                return False
+                
+            # Print chain endpoint for debugging
+            self.print_chain_endpoint()
 
-        if self.metagraph is not None:
-            self.scores = torch.zeros(len(self.metagraph.uids), dtype=torch.float32)
+            # Check validator registration and set up axon/dendrite
+            try:
+                # Check validator registration
+                if not self.check_vali_reg(self.metagraph, self.wallet, self.subtensor):
+                    bt.logging.error("Validator is not registered or improperly set up")
+                    return False
 
-        # Handle load_state configuration
-        load_state_str = getattr(self.config, 'load_state', 'True')
-        self.load_validator_state = load_state_str.lower() != "false" if isinstance(load_state_str, str) else True
+                # Load state AFTER checking registration
+                await self.load_state()
 
-        if self.load_validator_state:
-            await self.load_state()
-        else:
-            self.init_default_scores()
+                # Setup axon
+                self.serve_axon()
 
-        self.max_targets = getattr(self.config, 'max_targets', 256)
-        self.target_group = 0
+            except Exception as e:
+                bt.logging.error(f"Error in subtensor setup: {e}")
+                bt.logging.error(traceback.format_exc())
+                return False
 
-        # Initialize the database manager
-        self.db_manager = DatabaseManager(self.db_path)
-        await self.db_manager.initialize()
+            # Initialize MinerDataMixin with metagraph
+            try:
+                if hasattr(self.metagraph, 'uids'):
+                    bt.logging.info(f"Initializing MinerDataMixin with {len(self.metagraph.uids)} miners")
+                    MinerDataMixin.__init__(self, self.db_manager, self.metagraph, set(self.metagraph.uids))
+                else:
+                    bt.logging.warning("Metagraph uids not available for MinerDataMixin initialization")
+            except Exception as e:
+                bt.logging.error(f"Error initializing MinerDataMixin: {e}")
+                bt.logging.error(traceback.format_exc())
 
-        # Initialize MinerDataMixin with required parameters
-        MinerDataMixin.__init__(self, self.db_manager, self.metagraph, set(self.metagraph.uids))
+            # Set up scoring system with correct parameters
+            self.scoring_system = ScoringSystem(
+                db_manager=self.db_manager,
+                num_miners=256,
+                max_days=45,
+                reference_date=datetime.now(timezone.utc),
+                validator=self
+            )
+            
+            # Set up the weight setting functions
+            self.weight_setter = WeightSetter(
+                metagraph=self.metagraph,
+                wallet=self.wallet,
+                subtensor=self.subtensor,
+                neuron_config=self.config,
+                db_path=self.config.db,
+            )
 
-        # Initialize the scoring system
-        self.scoring_system = ScoringSystem(
-            self.db_manager,
-            num_miners=256,
-            max_days=45,
-            reference_date=datetime.now(timezone.utc).date(),
-            validator=self,
-        )
-        await self.scoring_system.initialize()
+            # Initialize vesting system and integration
+            try:
+                bt.logging.info("Initializing vesting system...")
+                
+                # Try to read vesting config from setup.cfg
+                config_parser = configparser.ConfigParser()
+                try:
+                    config_parser.read('setup.cfg')
+                    vesting_cfg = config_parser['vesting'] if 'vesting' in config_parser else {}
+                except Exception as e:
+                    bt.logging.debug(f"Could not read vesting config from setup.cfg: {e}")
+                    vesting_cfg = {}
+                
+                # Check DB state to see if it was recently redownloaded
+                # Initialize need_metagraph_init with a default value
+                need_metagraph_init = True
+                
+                try:
+                    # First, check if the db_version table exists at all
+                    table_exists = await self.db_manager.fetch_one(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='db_version'"
+                    )
+                    
+                    if table_exists:
+                        # Check the columns in the db_version table
+                        columns = await self.db_manager.fetch_all(
+                            "PRAGMA table_info(db_version)"
+                        )
+                        
+                        # Find the column that represents time (might be 'timestamp', 'created_at', etc.)
+                        time_column = None
+                        for column in columns:
+                            col_name = column.get('name', '').lower()
+                            if 'time' in col_name or 'date' in col_name:
+                                time_column = column.get('name')
+                                break
+                        
+                        if time_column:
+                            bt.logging.info(f"Found time column in db_version: {time_column}")
+                            
+                            # Get the last update using the found column
+                            last_update = await self.db_manager.fetch_one(
+                                f"SELECT {time_column} FROM db_version ORDER BY {time_column} DESC LIMIT 1"
+                            )
+                            
+                            if last_update and time_column in last_update:
+                                now = datetime.now(timezone.utc)
+                                try:
+                                    # Try to parse the date in different formats
+                                    time_value = last_update[time_column]
+                                    if isinstance(time_value, str):
+                                        if 'Z' in time_value:
+                                            last_update_time = datetime.fromisoformat(time_value.replace("Z", "+00:00"))
+                                        else:
+                                            last_update_time = datetime.fromisoformat(time_value)
+                                    else:
+                                        # Might be a datetime object already
+                                        last_update_time = time_value
+                                    
+                                    time_since_update = (now - last_update_time).total_seconds() / 60
+                                    bt.logging.info(f"Database was last updated {time_since_update:.1f} minutes ago")
+                                    
+                                    if time_since_update < 10:  # If it was updated in the last 10 minutes
+                                        bt.logging.info("Database was recently redownloaded, need to reinitialize vesting integration")
+                                        need_metagraph_init = True
+                                    else:
+                                        bt.logging.info("Database has not been recently redownloaded")
+                                        need_metagraph_init = False
+                                except Exception as e:
+                                    bt.logging.warning(f"Error parsing date from db_version: {e}")
+                                    # Fall back to default
+                                    need_metagraph_init = True
+                            else:
+                                bt.logging.warning(f"No values found in db_version.{time_column}")
+                        else:
+                            bt.logging.warning("No time/date column found in db_version table")
+                    else:
+                        bt.logging.warning("db_version table not found")
+                except Exception as e:
+                    bt.logging.warning(f"Error checking db_version table: {e}")
+                    bt.logging.debug(traceback.format_exc())
+                    
+                bt.logging.info(f"Setting need_metagraph_init = {need_metagraph_init}")
+                
+                # Get vesting configuration parameters (command line takes precedence over setup.cfg)
+                # Core parameters
+                vesting_enabled_str = getattr(self.config, 'vesting.enabled', vesting_cfg.get('enabled', 'False'))
+                vesting_enabled = vesting_enabled_str.lower() == 'true' if isinstance(vesting_enabled_str, str) else bool(vesting_enabled_str)
+                
+                min_stake = getattr(self.config, 'vesting.minimum_stake', 
+                                   float(vesting_cfg.get('minimum_stake', 0.3)))
+                
+                retention_window = getattr(self.config, 'vesting.retention_window', 
+                                          int(vesting_cfg.get('retention_window', 30)))
+                
+                retention_target = getattr(self.config, 'vesting.retention_target', 
+                                          float(vesting_cfg.get('retention_target', 0.9)))
+                
+                max_multiplier = getattr(self.config, 'vesting.max_multiplier', 
+                                        float(vesting_cfg.get('max_multiplier', 1.5)))
+                
+                # Threading parameters
+                use_bg_thread_str = getattr(self.config, 'vesting.use_background_thread', 
+                                           vesting_cfg.get('use_background_thread', 'True'))
+                use_bg_thread = use_bg_thread_str.lower() == 'true' if isinstance(use_bg_thread_str, str) else bool(use_bg_thread_str)
+                
+                thread_priority = getattr(self.config, 'vesting.thread_priority', 
+                                         vesting_cfg.get('thread_priority', 'low'))
+                
+                query_interval = getattr(self.config, 'vesting.query_interval_seconds', 
+                                        int(vesting_cfg.get('query_interval_seconds', 300)))
+                
+                tx_query_interval = getattr(self.config, 'vesting.transaction_query_interval_seconds', 
+                                           int(vesting_cfg.get('transaction_query_interval_seconds', 60)))
+                
+                detailed_tx_str = getattr(self.config, 'vesting.detailed_transaction_tracking', 
+                                         vesting_cfg.get('detailed_transaction_tracking', 'True'))
+                detailed_tx = detailed_tx_str.lower() == 'true' if isinstance(detailed_tx_str, str) else bool(detailed_tx_str)
+                
+                # Create and initialize the vesting system
+                try:
+                    self.vesting_system = get_vesting_system(
+                        subtensor=self.subtensor,
+                        subnet_id=self.config.netuid,
+                        db_manager=self.vesting_db_manager  # Use dedicated vesting database manager
+                    )
+                    
+                    # Initialize the vesting system with better error handling
+                    try:
+                        bt.logging.info("Starting vesting system initialization...")
+                        success = await self.vesting_system.initialize(
+                            auto_init_metagraph=False,  # We'll handle metagraph init separately
+                            minimum_stake=min_stake,
+                            retention_window_days=retention_window,
+                            retention_target=retention_target,
+                            max_multiplier=max_multiplier,
+                            use_background_thread=use_bg_thread,
+                            thread_priority=thread_priority,
+                            query_interval_seconds=query_interval,
+                            transaction_query_interval_seconds=tx_query_interval,
+                            detailed_transaction_tracking=detailed_tx
+                        )
+                        
+                        if not success:
+                            bt.logging.error("Vesting system initialization returned False")
+                            raise Exception("Vesting system initialization returned False")
+                        
+                        bt.logging.info("Vesting system initialized successfully")
+                        
+                        # ADDED: Force detailed transaction tracking on for debugging
+                        self.vesting_system.detailed_transaction_tracking = True
+                        bt.logging.info("Forcing detailed transaction tracking ON for debugging")
+                        
+                        # ADDED: Check if transaction monitoring is active and running
+                        if hasattr(self.vesting_system, 'transaction_monitor') and self.vesting_system.transaction_monitor:
+                            if hasattr(self.vesting_system.transaction_monitor, 'is_running'):
+                                is_running = self.vesting_system.transaction_monitor.is_running
+                                bt.logging.info(f"Transaction monitoring status: {'RUNNING' if is_running else 'STOPPED'}")
+                                if not is_running:
+                                    bt.logging.warning("Transaction monitoring is not running! Attempting to start manually...")
+                                    success = self.vesting_system.start_background_thread('normal')
+                                    if success:
+                                        bt.logging.info("Successfully started background thread manually")
+                                        # Check again after 2 seconds
+                                        await asyncio.sleep(2)
+                                        is_running = self.vesting_system.transaction_monitor.is_running
+                                        bt.logging.info(f"Transaction monitoring status after manual start: {'RUNNING' if is_running else 'STILL STOPPED'}")
+                                    else:
+                                        bt.logging.error("Failed to start background thread manually")
+                            else:
+                                bt.logging.warning("Transaction monitor doesn't have is_running attribute - implementation has changed")
+                        else:
+                            bt.logging.error("Transaction monitor not initialized despite detailed_transaction_tracking=True")
+                            # Try to create and initialize it manually
+                            bt.logging.info("Attempting to create transaction monitor manually...")
+                            try:
+                                from bettensor.validator.vesting.transaction_monitor import TransactionMonitor
+                                self.vesting_system.transaction_monitor = TransactionMonitor(
+                                    subtensor=self.subtensor,
+                                    subnet_id=self.config.netuid,
+                                    db_manager=self.vesting_db_manager,
+                                    verbose=True
+                                )
+                                await self.vesting_system.transaction_monitor.initialize()
+                                self.vesting_system.start_background_thread('normal')
+                                bt.logging.info("Manually created and started transaction monitor")
+                            except Exception as e:
+                                bt.logging.error(f"Failed to manually create transaction monitor: {e}")
+                        
+                        # If we need metagraph initialization (e.g., after db redownload), do it now
+                        if need_metagraph_init:
+                            bt.logging.info("Initializing vesting data from metagraph (with force refresh)...")
+                            metagraph_init_success = await self.vesting_system.initialize_from_metagraph(force_refresh=True)
+                            if metagraph_init_success:
+                                bt.logging.info("Successfully initialized vesting data from metagraph with force refresh")
+                            else:
+                                bt.logging.warning("Failed to initialize from metagraph, vesting system may not have stake data")
+                        
+                        # Check vesting status after initialization 
+                        await self.check_vesting_status()
+                        
+                        # Explicitly update coldkey-hotkey relationships to ensure coldkey_metrics is populated
+                        bt.logging.info("Explicitly updating coldkey-hotkey relationships...")
+                        success = await self.vesting_system.update_coldkey_hotkey_relationships()
+                        if success:
+                            bt.logging.info("Successfully updated coldkey-hotkey relationships")
+                        else:
+                            bt.logging.warning("Failed to update coldkey-hotkey relationships")
+                            
+                        # Check the transaction monitoring status
+                        try:
+                            await self.check_transaction_monitoring_status()
+                        except Exception as e:
+                            bt.logging.error(f"Error checking transaction monitoring status: {e}")
+                            bt.logging.debug(traceback.format_exc())
+                        
+                        # Set up a periodic check to ensure transaction monitoring stays running
+                        async def periodic_tx_monitoring_check():
+                            try:
+                                while True:
+                                    await asyncio.sleep(300)  # Check every 5 minutes
+                                    bt.logging.info("Running periodic transaction monitoring status check")
+                                    try:
+                                        await self.check_transaction_monitoring_status()
+                                    except Exception as e:
+                                        bt.logging.error(f"Error in periodic transaction monitoring check: {e}")
+                            except asyncio.CancelledError:
+                                bt.logging.info("Periodic transaction monitoring check task cancelled")
+                            except Exception as e:
+                                bt.logging.error(f"Unexpected error in periodic monitoring task: {e}")
+                                bt.logging.debug(traceback.format_exc())
+                        
+                        # Start the periodic check in a background task
+                        try:
+                            self.tx_monitoring_check_task = asyncio.create_task(periodic_tx_monitoring_check())
+                            bt.logging.info("Started periodic transaction monitoring status check task")
+                        except Exception as e:
+                            bt.logging.error(f"Failed to start periodic transaction monitoring check: {e}")
+                    except Exception as e:
+                        bt.logging.error(f"Error during vesting system initialization: {e}")
+                        bt.logging.debug(traceback.format_exc())
+                        raise
+                    
+                    # Create and install the integration with the scoring system
+                    self.vesting_integration = VestingIntegration(
+                        scoring_system=self.scoring_system,
+                        vesting_system=self.vesting_system
+                    )
+                    
+                    # Install the integration
+                    enabled_status = "enabled" if vesting_enabled else "shadow mode (tracking but not impacting weights)"
+                    bt.logging.info(f"Installing vesting integration in {enabled_status}")
+                    self.vesting_integration.install(impact_weights=vesting_enabled)
+                    
+                    bt.logging.info("Vesting system initialized and integrated successfully")
+                except Exception as e:
+                    bt.logging.error(f"Failed to initialize vesting system: {e}")
+                    bt.logging.debug(traceback.format_exc())
+                    self.vesting_system = None
+                    self.vesting_integration = None
+            except Exception as e:
+                bt.logging.error(f"Failed to initialize vesting system: {e}")
+                bt.logging.debug(traceback.format_exc())
+                self.vesting_system = None
+                self.vesting_integration = None
 
-        # Setup Validator Components
-        self.api_client = BettensorAPIClient(self.db_manager)
-
-        self.sports_data = SportsData(
-            db_manager=self.db_manager,
-            api_client=self.api_client,
-            entropy_system=self.scoring_system.entropy_system,
-        )
-
-        self.weight_setter = WeightSetter(
-            metagraph=self.metagraph,
-            wallet=self.wallet,
-            subtensor=self.subtensor,
-            neuron_config=self.config,
-            db_path=self.db_path,
-        )
-
-        self.website_handler = WebsiteHandler(self)
-
-        self.is_initialized = True
-        return True
-
+            self.is_initialized = True
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Exception during initialization: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
 
     def _parse_args(self, parser):
         """Parses the command line arguments"""
@@ -334,14 +748,31 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 # Check if known state len matches with current metagraph hotkey length
                 if len(self.hotkeys) == len(self.metagraph.hotkeys):
                     current_hotkeys = self.metagraph.hotkeys
+                    deregistered_hotkeys = []
+                    
                     for i, hotkey in enumerate(current_hotkeys):
                         if self.hotkeys[i] != hotkey:
                             bt.logging.debug(
                                 f"Index '{i}' has mismatching hotkey. Old hotkey: '{self.hotkeys[i]}', New hotkey: '{hotkey}'. Resetting score to 0.0"
                             )
+                            # Track deregistered hotkey
+                            if self.hotkeys[i] not in current_hotkeys:
+                                deregistered_hotkeys.append(self.hotkeys[i])
+                                
                             self.scores[i] = 0.0
                             await self.scoring_system.reset_miner(i)
                             await self.save_state()
+                    
+                    # Handle deregistered hotkeys in vesting system
+                    if deregistered_hotkeys and self.vesting_system:
+                        bt.logging.info(f"Handling {len(deregistered_hotkeys)} deregistered hotkeys in vesting system")
+                        try:
+                            await batch_handle_deregistrations(
+                                vesting_system=self.vesting_system, 
+                                deregistered_hotkeys=deregistered_hotkeys
+                            )
+                        except Exception as e:
+                            bt.logging.error(f"Error handling deregistered hotkeys in vesting system: {e}")
                 else:
                     bt.logging.info(
                         f"Init default scores because of state and metagraph hotkey length mismatch. Expected: {len(self.metagraph.hotkeys)} Had: {len(self.hotkeys)}"
@@ -593,7 +1024,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         #bt.logging.debug(f"Filtered uids: {uids_not_to_query}")
 
         # Reduce the number of simultaneous uids to query
-        if self.max_targets < 256:
+        if hasattr(self, 'max_targets') and self.max_targets is not None and self.max_targets < 256:
             start_idx = self.max_targets * self.target_group
             end_idx = min(
                 len(uids_to_query), self.max_targets * (self.target_group + 1)
@@ -615,6 +1046,11 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 f"List indices for uids to query starting from: '{start_idx}' ending with: '{end_idx}'"
             )
             uids_to_query = uids_to_query[start_idx:end_idx]
+        else:
+            # If max_targets is None, use all available uids
+            bt.logging.debug(f"Using all {len(uids_to_query)} available uids to query (max_targets not set)")
+            # Ensure target_group is reset for next time
+            self.target_group = 0
 
         list_of_uids = [
             self.metagraph.hotkeys.index(axon.hotkey) for axon in uids_to_query
@@ -648,10 +1084,14 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         try:
             bt.logging.info("Resetting scoring system(deleting state files)...")
                         
-            # Delete state files (./bettensor/validator/state/state.pt, ./bettensor/validator/state/validator.db, ./bettensor/validator/state/entropy_system_state.json)
-            for file in ["./bettensor/validator/state/state.pt", "./bettensor/validator/state/validator.db", "./bettensor/validator/state/entropy_system_state.json"]:
+            # Delete state files (./bettensor/validator/state/state.pt, ./bettensor/validator/state/validator.db, ./bettensor/validator/state/vesting.db, ./bettensor/validator/state/entropy_system_state.json)
+            for file in ["./bettensor/validator/state/state.pt", 
+                         "./bettensor/validator/state/validator.db", 
+                         "./bettensor/validator/state/vesting.db",  # Add vesting.db to the list
+                         "./bettensor/validator/state/entropy_system_state.json"]:
                 if os.path.exists(file):
                     os.remove(file)
+                    bt.logging.info(f"Deleted {file}")
             
         except Exception as e:
             bt.logging.error(f"Error resetting scoring system: {e}")
@@ -688,11 +1128,19 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             
             # Cleanup database connections
             if hasattr(self, 'db_manager'):
-                bt.logging.info("Cleaning up database connections...")
+                bt.logging.info("Cleaning up main database connections...")
                 try:
                     await self.db_manager.cleanup()
                 except Exception as e:
-                    bt.logging.error(f"Error cleaning up database: {e}")
+                    bt.logging.error(f"Error cleaning up main database: {e}")
+                    
+            # Cleanup vesting database connections
+            if hasattr(self, 'vesting_db_manager'):
+                bt.logging.info("Cleaning up vesting database connections...")
+                try:
+                    await self.vesting_db_manager.cleanup()
+                except Exception as e:
+                    bt.logging.error(f"Error cleaning up vesting database: {e}")
                 
             bt.logging.info("Shutdown completed successfully")
             sys.exit(0)
@@ -714,104 +1162,212 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         Regular (non-async) destructor that ensures resources are cleaned up.
         Note: We should avoid complex cleanup logic in __del__
         """
-        if hasattr(self, 'db_manager'):
+        if hasattr(self, 'db_manager') or hasattr(self, 'vesting_db_manager'):
             bt.logging.info("Object being destroyed, cleanup should have been called explicitly")
 
     async def cleanup(self):
-        """Cleanup validator resources"""
-        bt.logging.info("Cleaning up validator resources...")
+        """
+        Cleanup resources used by the validator.
+        """
+        bt.logging.info("Running cleanup...")
         
-        # Check if we already cleaned up
-        if getattr(self, '_cleaned_up', False):
-            bt.logging.info("Validator already cleaned up, skipping")
-            return
-        
-        # Track any errors to return at the end
-        cleanup_errors = []
-        
-        # Set shutdown flag
-        self.is_shutting_down = True
-        
-        # 1. Handle watchdog cleanup
-        if hasattr(self, 'watchdog'):
+        # Cancel the transaction monitoring check task if it exists
+        if hasattr(self, 'tx_monitoring_check_task') and self.tx_monitoring_check_task:
+            bt.logging.info("Cancelling transaction monitoring check task")
+            self.tx_monitoring_check_task.cancel()
             try:
-                bt.logging.debug("Cleaning up watchdog...")
-                self.watchdog.cleanup()
-                bt.logging.debug("Watchdog cleanup completed")
-            except Exception as e:
-                error_msg = f"Error during watchdog cleanup: {str(e)}"
-                bt.logging.error(error_msg)
-                cleanup_errors.append(error_msg)
-        
-        # 2. Save state before database cleanup if possible
-        if hasattr(self, 'db_manager') and hasattr(self, 'save_state'):
+                await self.tx_monitoring_check_task
+            except asyncio.CancelledError:
+                pass
+            
+        # Cleanup vesting system
+        if hasattr(self, 'vesting_system') and self.vesting_system:
+            bt.logging.info("Shutting down vesting system...")
             try:
-                bt.logging.debug("Saving state before shutdown...")
-                try:
-                    await asyncio.wait_for(self.save_state(), timeout=10)
-                    bt.logging.debug("State saved successfully")
-                except asyncio.TimeoutError:
-                    bt.logging.warning("State saving timed out after 10 seconds")
-                    cleanup_errors.append("State saving timed out")
+                await self.vesting_system.shutdown()
+                bt.logging.info("Vesting system shut down successfully")
             except Exception as e:
-                error_msg = f"Error saving state during shutdown: {str(e)}"
-                bt.logging.error(error_msg)
-                cleanup_errors.append(error_msg)
+                bt.logging.error(f"Error shutting down vesting system: {e}")
         
-        # 3. Cancel any pending tasks
-        # Check for background tasks and cancel them
-        if hasattr(self, 'tasks') and self.tasks:
-            bt.logging.debug(f"Cancelling {len(self.tasks)} background tasks...")
-            for task_name, task in list(self.tasks.items()):
-                if not task.done():
-                    bt.logging.debug(f"Cancelling task: {task_name}")
-                    task.cancel()
-                    try:
-                        # Give task a short time to respond to cancellation
-                        await asyncio.wait_for(task, timeout=2)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
-                        # This is expected
-                        pass
-                    except Exception as e:
-                        bt.logging.warning(f"Error while cancelling {task_name}: {str(e)}")
-            bt.logging.debug("All tasks cancelled")
-        
-        # 4. Close database connection
-        if hasattr(self, 'db_manager'):
+        # Close database connections
+        if hasattr(self, 'db_manager') and self.db_manager:
+            bt.logging.info("Closing database connections...")
             try:
-                bt.logging.debug("Closing database connection...")
-                # Use a timeout for database operations
-                try:
-                    await asyncio.wait_for(self.db_manager.close(), timeout=5)
-                    bt.logging.debug("Database connection closed successfully")
-                except asyncio.TimeoutError:
-                    bt.logging.warning("Database closing timed out after 5 seconds")
-                    cleanup_errors.append("Database closing timed out")
+                await self.db_manager.close()
+                bt.logging.info("Database connections closed")
             except Exception as e:
-                error_msg = f"Error closing database: {str(e)}"
-                bt.logging.error(error_msg)
-                cleanup_errors.append(error_msg)
-        
-        # 5. Close axon if it exists
-        if hasattr(self, 'axon') and hasattr(self.axon, 'close'):
+                bt.logging.error(f"Error closing database connections: {e}")
+                
+        # Close vesting database connections
+        if hasattr(self, 'vesting_db_manager') and self.vesting_db_manager:
+            bt.logging.info("Closing vesting database connections...")
             try:
-                bt.logging.debug("Closing axon...")
-                self.axon.close()
-                bt.logging.debug("Axon closed successfully")
+                await self.vesting_db_manager.close()
+                bt.logging.info("Vesting database connections closed")
             except Exception as e:
-                error_msg = f"Error closing axon: {str(e)}"
-                bt.logging.error(error_msg)
-                cleanup_errors.append(error_msg)
+                bt.logging.error(f"Error closing vesting database connections: {e}")
+                
+        bt.logging.info("Cleanup complete")
+
+    async def check_vesting_status(self):
+        """
+        Check and print the status of the vesting system.
         
-        # 6. Mark as cleaned up
-        self._cleaned_up = True
-        
-        bt.logging.info("Validator cleanup completed")
-        if cleanup_errors:
-            bt.logging.warning(f"The following cleanup errors occurred: {', '.join(cleanup_errors)}")
-        
-        # Give a moment for logs to be written
+        This method is useful for diagnostics and debugging to verify
+        that the vesting system is properly initialized and functioning.
+        """
+        if not self.vesting_system:
+            bt.logging.error("Vesting system is not initialized")
+            return False
+            
         try:
-            await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            pass
+            # Get diagnostic information
+            bt.logging.info("Checking vesting system status...")
+            info = await self.vesting_system.get_diagnostic_info()
+            
+            # Print system status
+            status = info['system_status']
+            status_emoji = "✅" if status == 'operational' else "❌"
+            
+            bt.logging.info(f"Vesting System Status: {status_emoji} {status.upper()}")
+            bt.logging.info(f"Metagraph initialization: {'✅ COMPLETE' if info['metagraph_initialized'] else '❌ NOT INITIALIZED'}")
+            
+            # Print table information
+            bt.logging.info("\nTable Statistics:")
+            for table, stats in info['tables'].items():
+                if 'total_stake' in stats:
+                    bt.logging.info(f"  {table}: {stats['count']} records, {stats['total_stake']} total stake")
+                else:
+                    bt.logging.info(f"  {table}: {stats['count']} records")
+            
+            # Print errors if any
+            if info['errors']:
+                bt.logging.error("\nErrors detected:")
+                for i, error in enumerate(info['errors']):
+                    bt.logging.error(f"  {i+1}. {error}")
+                    
+            # Provide further diagnosis for common issues
+            if status != 'operational':
+                if status == 'no_data':
+                    bt.logging.warning("\nDiagnosis: Vesting system tables exist but contain no data")
+                    bt.logging.warning("Possible solutions:")
+                    bt.logging.warning("  1. Force reinitialization from metagraph")
+                    bt.logging.warning("  2. Check for errors during initialization")
+                    
+                    # Check specifically for coldkey_metrics
+                    if 'coldkey_metrics' in info['tables'] and info['tables']['coldkey_metrics']['count'] == 0:
+                        bt.logging.warning("\nDetected missing coldkey-hotkey relationships")
+                        bt.logging.warning("Attempting to update coldkey-hotkey relationships...")
+                        
+                        try:
+                            success = await self.vesting_system.update_coldkey_hotkey_relationships()
+                            if success:
+                                bt.logging.info("✅ Successfully updated coldkey-hotkey relationships")
+                            else:
+                                bt.logging.warning("❌ Failed to update coldkey-hotkey relationships")
+                        except Exception as e:
+                            bt.logging.error(f"Error updating coldkey-hotkey relationships: {e}")
+                elif status == 'not_initialized':
+                    bt.logging.warning("\nDiagnosis: Vesting system needs initialization from metagraph")
+                    bt.logging.warning("Possible solutions:")
+                    bt.logging.warning("  1. Force reinitialization from metagraph")
+                    bt.logging.warning("  2. Ensure blockchain_state table exists")
+                
+                # Offer to reinitialize from metagraph
+                bt.logging.info("\nAttempting to reinitialize from metagraph with force refresh...")
+                success = await self.vesting_system.initialize_from_metagraph(force_refresh=True)
+                if success:
+                    bt.logging.info("✅ Successfully reinitialized from metagraph with force refresh")
+                    
+                    # Check status again
+                    info = await self.vesting_system.get_diagnostic_info()
+                    for table, stats in info['tables'].items():
+                        if 'total_stake' in stats and stats['total_stake'] > 0:
+                            bt.logging.info(f"  {table}: {stats['count']} records, {stats['total_stake']} total stake")
+                else:
+                    bt.logging.error("❌ Failed to reinitialize from metagraph")
+            
+            return status == 'operational'
+            
+        except Exception as e:
+            bt.logging.error(f"Error checking vesting status: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
+
+    async def check_transaction_monitoring_status(self):
+        """
+        Check and log the status of transaction monitoring, attempting to restart if not running.
+        
+        Returns:
+            bool: True if transaction monitoring is running, False otherwise
+        """
+        if not hasattr(self, 'vesting_system') or not self.vesting_system:
+            bt.logging.error("Vesting system not initialized, cannot check transaction monitoring status")
+            return False
+            
+        bt.logging.info("Checking transaction monitoring status...")
+        
+        if not hasattr(self.vesting_system, 'detailed_transaction_tracking'):
+            bt.logging.error("Vesting system doesn't have detailed_transaction_tracking attribute")
+            return False
+            
+        bt.logging.info(f"Detailed transaction tracking setting: {self.vesting_system.detailed_transaction_tracking}")
+        
+        if not self.vesting_system.detailed_transaction_tracking:
+            bt.logging.warning("Detailed transaction tracking is disabled, enabling it now for debugging")
+            self.vesting_system.detailed_transaction_tracking = True
+            
+        if not hasattr(self.vesting_system, 'transaction_monitor') or not self.vesting_system.transaction_monitor:
+            bt.logging.error("Transaction monitor not initialized despite detailed_transaction_tracking=True")
+            
+            # Try to create and initialize it manually
+            bt.logging.info("Attempting to create transaction monitor manually...")
+            try:
+                from bettensor.validator.vesting.transaction_monitor import TransactionMonitor
+                self.vesting_system.transaction_monitor = TransactionMonitor(
+                    subtensor=self.subtensor,
+                    subnet_id=self.config.netuid,
+                    db_manager=self.vesting_db_manager,
+                    verbose=True
+                )
+                await self.vesting_system.transaction_monitor.initialize()
+                self.vesting_system.start_background_thread('normal')
+                bt.logging.info("Manually created and started transaction monitor")
+            except Exception as e:
+                bt.logging.error(f"Failed to manually create transaction monitor: {e}")
+                return False
+        
+        # Check if transaction monitoring is running
+        if not hasattr(self.vesting_system.transaction_monitor, 'is_running'):
+            bt.logging.warning("Transaction monitor doesn't have is_running property")
+            
+            # Try accessing 'is_monitoring' attribute instead
+            if hasattr(self.vesting_system.transaction_monitor, 'is_monitoring'):
+                is_running = self.vesting_system.transaction_monitor.is_monitoring
+            else:
+                bt.logging.error("Cannot determine transaction monitoring status")
+                return False
+        else:
+            is_running = self.vesting_system.transaction_monitor.is_running
+        
+        bt.logging.info(f"Transaction monitoring status: {'RUNNING' if is_running else 'STOPPED'}")
+        
+        if not is_running:
+            bt.logging.warning("Transaction monitoring is not running! Attempting to start manually...")
+            success = self.vesting_system.start_background_thread('normal')
+            
+            if success:
+                bt.logging.info("Successfully started background thread manually")
+                # Check again after 2 seconds
+                await asyncio.sleep(2)
+                
+                if hasattr(self.vesting_system.transaction_monitor, 'is_running'):
+                    is_running = self.vesting_system.transaction_monitor.is_running
+                elif hasattr(self.vesting_system.transaction_monitor, 'is_monitoring'):
+                    is_running = self.vesting_system.transaction_monitor.is_monitoring
+                    
+                bt.logging.info(f"Transaction monitoring status after manual start: {'RUNNING' if is_running else 'STILL STOPPED'}")
+            else:
+                bt.logging.error("Failed to start background thread manually")
+        
+        return is_running

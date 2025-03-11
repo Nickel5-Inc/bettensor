@@ -15,9 +15,10 @@ import logging
 import functools
 import numpy as np
 from typing import Dict, List, Optional, Callable, Any, Union
+import asyncio
 
 from bettensor.validator.vesting.system import VestingSystem
-from bettensor.validator.vesting.database_schema import create_vesting_tables
+from bettensor.validator.vesting.database_schema import create_vesting_tables_async
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ async def initialize_vesting_tables(db_manager) -> bool:
     """
     Initialize vesting system database tables.
     
-    This function should be called by the DatabaseManager during
+    This function is intended to be called by the DatabaseManager during
     initialization to create all vesting system tables.
     
     Args:
@@ -39,7 +40,49 @@ async def initialize_vesting_tables(db_manager) -> bool:
         bool: True if tables were created successfully
     """
     logger.info("Initializing vesting system database schema")
-    return await create_vesting_tables(db_manager)
+    from bettensor.validator.vesting.database_schema import create_vesting_tables_async
+    
+    # First attempt to create tables
+    success = await create_vesting_tables_async(db_manager)
+    if not success:
+        logger.warning("Failed to create vesting tables on first attempt, retrying...")
+        await asyncio.sleep(0.5)  # Small delay before retry
+        success = await create_vesting_tables_async(db_manager)
+    
+    # Verify tables were actually created
+    if success:
+        # Check that a critical table exists as verification
+        try:
+            result = await db_manager.fetch_one("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='stake_tranches'
+            """)
+            if not result:
+                logger.error("stake_tranches table was not created despite successful creation call")
+                # Try one more time with explicit creation
+                await db_manager.execute_query("""
+                    CREATE TABLE IF NOT EXISTS stake_tranches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        hotkey TEXT NOT NULL,
+                        coldkey TEXT,
+                        initial_amount REAL NOT NULL,
+                        remaining_amount REAL NOT NULL,
+                        entry_timestamp INTEGER NOT NULL,
+                        is_emission INTEGER NOT NULL,
+                        last_update INTEGER NOT NULL
+                    )
+                """)
+                # Add index
+                await db_manager.execute_query("""
+                    CREATE INDEX IF NOT EXISTS idx_stake_tranches_hotkey ON stake_tranches(hotkey)
+                """)
+                logger.info("stake_tranches table created explicitly")
+                return True
+        except Exception as e:
+            logger.error(f"Error verifying table creation: {e}")
+            return False
+    
+    return success
 
 # ----------------------
 # Validator Integration
@@ -186,10 +229,18 @@ class VestingIntegration:
         
         # Flag to track if integration is installed
         self.is_installed = False
+        
+        # Flag to control whether vesting impacts weights
+        self.impact_weights = True
     
-    def install(self):
+    def install(self, impact_weights: bool = True):
         """
         Install the vesting integration by patching the calculate_weights method.
+        
+        Args:
+            impact_weights: If True, vesting multipliers will be applied to weights.
+                           If False, the system will run in shadow mode, tracking everything
+                           but not modifying the weights.
         
         Returns:
             bool: True if installation was successful
@@ -198,6 +249,9 @@ class VestingIntegration:
             logger.warning("Vesting integration is already installed")
             return False
         
+        # Store the impact_weights setting
+        self.impact_weights = impact_weights
+        
         try:
             # Define the patched method using a closure to preserve self reference
             @functools.wraps(self.original_calculate_weights)
@@ -205,8 +259,13 @@ class VestingIntegration:
                 # Call the original method to get base weights
                 original_weights = self.original_calculate_weights(*args, **kwargs)
                 
-                # Apply vesting multipliers
-                return self._apply_vesting_multipliers(original_weights)
+                # Apply vesting multipliers if impact_weights is True, otherwise return original
+                if self.impact_weights:
+                    return self._apply_vesting_multipliers(original_weights)
+                else:
+                    # Still calculate multipliers for tracking/stats but don't apply them
+                    asyncio.create_task(self._calculate_without_applying(original_weights))
+                    return original_weights
             
             # Install the patched method
             self.scoring_system.calculate_weights = patched_calculate_weights
@@ -215,12 +274,48 @@ class VestingIntegration:
             self.scoring_system._original_calculate_weights = self.original_calculate_weights
             
             self.is_installed = True
-            logger.info("Vesting integration installed successfully")
+            mode_str = "enabled" if self.impact_weights else "shadow mode (tracking only)"
+            logger.info(f"Vesting integration installed successfully in {mode_str}")
             return True
             
         except Exception as e:
             logger.error(f"Failed to install vesting integration: {e}")
             return False
+    
+    async def _calculate_without_applying(self, original_weights: np.ndarray) -> None:
+        """
+        Calculate vesting multipliers without applying them (for shadow mode).
+        This allows tracking multiplier calculations even when not applying them to weights.
+        
+        Args:
+            original_weights: Original weights from scoring system
+        """
+        try:
+            # Skip if weights are empty or all zero
+            if original_weights is None or np.sum(original_weights) <= 0:
+                return
+            
+            # Get UIDs with non-zero weights
+            uids = np.where(original_weights > 0)[0].tolist()
+            
+            # Get hotkeys for UIDs
+            hotkeys = self._get_hotkeys_for_uids(uids)
+            
+            # If no hotkeys could be mapped, return
+            if not hotkeys:
+                return
+            
+            # Calculate multipliers but don't use the result
+            await apply_vesting_multipliers(
+                vesting_system=self.vesting_system,
+                weights=original_weights,
+                uids=uids,
+                hotkeys=hotkeys
+            )
+            
+            logger.debug(f"Calculated vesting multipliers for {len(uids)} miners in shadow mode")
+        except Exception as e:
+            logger.error(f"Error calculating vesting multipliers in shadow mode: {e}")
     
     def uninstall(self):
         """
