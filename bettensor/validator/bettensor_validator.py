@@ -37,6 +37,7 @@ from bettensor import __spec_version__
 from types import SimpleNamespace
 import configparser
 from bettensor.validator.vesting.database_schema import create_vesting_tables_async
+import pandas as pd
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -463,70 +464,59 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 need_metagraph_init = True
                 
                 try:
-                    # First, check if the db_version table exists at all
-                    table_exists = await self.db_manager.fetch_one(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name='db_version'"
-                    )
+                    # Ensure state directory exists
+                    state_dir = Path(os.path.dirname(self.config.db)) / "state"
+                    state_dir.mkdir(parents=True, exist_ok=True)
                     
-                    if table_exists:
-                        # Check the columns in the db_version table
-                        columns = await self.db_manager.fetch_all(
-                            "PRAGMA table_info(db_version)"
-                        )
-                        
-                        # Find the column that represents time (might be 'timestamp', 'created_at', etc.)
-                        time_column = None
-                        for column in columns:
-                            col_name = column.get('name', '').lower()
-                            if 'time' in col_name or 'date' in col_name:
-                                time_column = column.get('name')
-                                break
-                        
-                        if time_column:
-                            bt.logging.info(f"Found time column in db_version: {time_column}")
+                    # Instead of querying a non-existent database table, read from state_metadata.json
+                    metadata_file = state_dir / "state_metadata.json"
+                    
+                    if metadata_file.exists():
+                        try:
+                            with open(metadata_file, 'r') as f:
+                                metadata = json.load(f)
                             
-                            # Get the last update using the found column
-                            last_update = await self.db_manager.fetch_one(
-                                f"SELECT {time_column} FROM db_version ORDER BY {time_column} DESC LIMIT 1"
-                            )
-                            
-                            if last_update and time_column in last_update:
-                                now = datetime.now(timezone.utc)
-                                try:
-                                    # Try to parse the date in different formats
-                                    time_value = last_update[time_column]
-                                    if isinstance(time_value, str):
-                                        if 'Z' in time_value:
-                                            last_update_time = datetime.fromisoformat(time_value.replace("Z", "+00:00"))
-                                        else:
-                                            last_update_time = datetime.fromisoformat(time_value)
-                                    else:
-                                        # Might be a datetime object already
-                                        last_update_time = time_value
-                                    
-                                    time_since_update = (now - last_update_time).total_seconds() / 60
-                                    bt.logging.info(f"Database was last updated {time_since_update:.1f} minutes ago")
-                                    
-                                    if time_since_update < 10:  # If it was updated in the last 10 minutes
-                                        bt.logging.info("Database was recently redownloaded, need to reinitialize vesting integration")
-                                        need_metagraph_init = True
-                                    else:
-                                        bt.logging.info("Database has not been recently redownloaded")
-                                        need_metagraph_init = False
-                                except Exception as e:
-                                    bt.logging.warning(f"Error parsing date from db_version: {e}")
-                                    # Fall back to default
+                            if 'last_update' in metadata:
+                                # Parse ISO format datetime string
+                                last_update_str = metadata['last_update']
+                                last_update_dt = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
+                                last_updated = int(last_update_dt.timestamp())
+                                
+                                current_time = int(datetime.now(timezone.utc).timestamp())
+                                time_diff_hours = (current_time - last_updated) / 3600
+                                
+                                if time_diff_hours > 24:  # If the state is more than 24 hours old
+                                    bt.logging.info(f"State data is {time_diff_hours:.1f} hours old. Need to refresh from metagraph.")
                                     need_metagraph_init = True
+                                else:
+                                    bt.logging.info(f"State data is recent ({time_diff_hours:.1f} hours old). No need to refresh.")
+                                    need_metagraph_init = False
                             else:
-                                bt.logging.warning(f"No values found in db_version.{time_column}")
-                        else:
-                            bt.logging.warning("No time/date column found in db_version table")
+                                bt.logging.warning("No last_update field found in state_metadata.json")
+                                need_metagraph_init = True
+                        except Exception as e:
+                            bt.logging.warning(f"Error reading state_metadata.json: {e}")
+                            need_metagraph_init = True
                     else:
-                        bt.logging.warning("db_version table not found")
+                        bt.logging.warning(f"State metadata file not found at {metadata_file}")
+                        # Create a default metadata file
+                        current_time = datetime.now(timezone.utc)
+                        default_metadata = {
+                            "last_update": current_time.isoformat(),
+                            "files": {}
+                        }
+                        try:
+                            with open(metadata_file, 'w') as f:
+                                json.dump(default_metadata, f, indent=2)
+                            bt.logging.info(f"Created default state metadata file at {metadata_file}")
+                        except Exception as e:
+                            bt.logging.warning(f"Failed to create default metadata file: {e}")
+                        need_metagraph_init = True
                 except Exception as e:
-                    bt.logging.warning(f"Error checking db_version table: {e}")
+                    bt.logging.warning(f"Error checking database state: {e}")
                     bt.logging.debug(traceback.format_exc())
-                    
+                    need_metagraph_init = True
+                
                 bt.logging.info(f"Setting need_metagraph_init = {need_metagraph_init}")
                 
                 # Get vesting configuration parameters (command line takes precedence over setup.cfg)
@@ -566,145 +556,108 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 
                 # Create and initialize the vesting system
                 try:
+                    bt.logging.info("Creating vesting system with explicit chain endpoint if available")
+                    explicit_endpoint = None
+                    
+                    # Check if we have a chain_endpoint from the subtensor
+                    if hasattr(self.subtensor, 'chain_endpoint') and self.subtensor.chain_endpoint:
+                        explicit_endpoint = self.subtensor.chain_endpoint
+                        bt.logging.info(f"Using explicit endpoint from subtensor: {explicit_endpoint}")
+                    else:
+                        bt.logging.warning("No chain_endpoint available from subtensor")
+                        # Try to get the URL from substrate if available
+                        if hasattr(self.subtensor, 'substrate') and self.subtensor.substrate:
+                            if hasattr(self.subtensor.substrate, 'url'):
+                                explicit_endpoint = self.subtensor.substrate.url
+                                bt.logging.info(f"Extracted URL from subtensor.substrate: {explicit_endpoint}")
+                            else:
+                                bt.logging.warning("subtensor.substrate has no url attribute")
+                        else:
+                            bt.logging.warning("Subtensor has no substrate attribute or it's None")
+                    
                     self.vesting_system = get_vesting_system(
                         subtensor=self.subtensor,
                         subnet_id=self.config.netuid,
-                        db_manager=self.vesting_db_manager  # Use dedicated vesting database manager
+                        db_manager=self.vesting_db_manager,  # Use dedicated vesting database manager
+                        explicit_endpoint=explicit_endpoint  # Pass explicit endpoint if available
                     )
                     
                     # Initialize the vesting system with better error handling
                     try:
                         bt.logging.info("Starting vesting system initialization...")
-                        success = await self.vesting_system.initialize(
-                            auto_init_metagraph=False,  # We'll handle metagraph init separately
-                            minimum_stake=min_stake,
-                            retention_window_days=retention_window,
-                            retention_target=retention_target,
-                            max_multiplier=max_multiplier,
-                            use_background_thread=use_bg_thread,
-                            thread_priority=thread_priority,
-                            query_interval_seconds=query_interval,
-                            transaction_query_interval_seconds=tx_query_interval,
-                            detailed_transaction_tracking=detailed_tx
-                        )
                         
-                        if not success:
-                            bt.logging.error("Vesting system initialization returned False")
-                            raise Exception("Vesting system initialization returned False")
+                        # Log detailed connection info before initializing
+                        if hasattr(self.subtensor, 'chain_endpoint'):
+                            bt.logging.info(f"Subtensor chain_endpoint: {self.subtensor.chain_endpoint}")
                         
-                        bt.logging.info("Vesting system initialized successfully")
-                        
-                        # ADDED: Force detailed transaction tracking on for debugging
-                        self.vesting_system.detailed_transaction_tracking = True
-                        bt.logging.info("Forcing detailed transaction tracking ON for debugging")
-                        
-                        # ADDED: Check if transaction monitoring is active and running
-                        if hasattr(self.vesting_system, 'transaction_monitor') and self.vesting_system.transaction_monitor:
-                            if hasattr(self.vesting_system.transaction_monitor, 'is_running'):
-                                is_running = self.vesting_system.transaction_monitor.is_running
-                                bt.logging.info(f"Transaction monitoring status: {'RUNNING' if is_running else 'STOPPED'}")
-                                if not is_running:
-                                    bt.logging.warning("Transaction monitoring is not running! Attempting to start manually...")
-                                    success = self.vesting_system.start_background_thread('normal')
-                                    if success:
-                                        bt.logging.info("Successfully started background thread manually")
-                                        # Check again after 2 seconds
-                                        await asyncio.sleep(2)
-                                        is_running = self.vesting_system.transaction_monitor.is_running
-                                        bt.logging.info(f"Transaction monitoring status after manual start: {'RUNNING' if is_running else 'STILL STOPPED'}")
-                                    else:
-                                        bt.logging.error("Failed to start background thread manually")
+                        # Log substrate instance details
+                        if hasattr(self.subtensor, 'substrate'):
+                            if self.subtensor.substrate:
+                                substrate_id = id(self.subtensor.substrate)
+                                bt.logging.info(f"Subtensor has substrate instance (id: {substrate_id})")
+                                if hasattr(self.subtensor.substrate, 'url'):
+                                    bt.logging.info(f"Substrate URL: {self.subtensor.substrate.url}")
                             else:
-                                bt.logging.warning("Transaction monitor doesn't have is_running attribute - implementation has changed")
+                                bt.logging.warning("Subtensor substrate is None")
                         else:
-                            bt.logging.error("Transaction monitor not initialized despite detailed_transaction_tracking=True")
-                            # Try to create and initialize it manually
-                            bt.logging.info("Attempting to create transaction monitor manually...")
-                            try:
-                                from bettensor.validator.vesting.transaction_monitor import TransactionMonitor
-                                self.vesting_system.transaction_monitor = TransactionMonitor(
-                                    subtensor=self.subtensor,
-                                    subnet_id=self.config.netuid,
-                                    db_manager=self.vesting_db_manager,
-                                    verbose=True
-                                )
-                                await self.vesting_system.transaction_monitor.initialize()
-                                self.vesting_system.start_background_thread('normal')
-                                bt.logging.info("Manually created and started transaction monitor")
-                            except Exception as e:
-                                bt.logging.error(f"Failed to manually create transaction monitor: {e}")
+                            bt.logging.warning("Subtensor has no substrate attribute")
                         
-                        # If we need metagraph initialization (e.g., after db redownload), do it now
-                        if need_metagraph_init:
-                            bt.logging.info("Initializing vesting data from metagraph (with force refresh)...")
-                            metagraph_init_success = await self.vesting_system.initialize_from_metagraph(force_refresh=True)
-                            if metagraph_init_success:
-                                bt.logging.info("Successfully initialized vesting data from metagraph with force refresh")
-                            else:
-                                bt.logging.warning("Failed to initialize from metagraph, vesting system may not have stake data")
+                        # Update VestingSystem parameters before initialization
+                        self.vesting_system.minimum_stake = min_stake
+                        self.vesting_system.retention_window_days = retention_window
+                        self.vesting_system.retention_target = retention_target
+                        self.vesting_system.max_multiplier = max_multiplier
+                        self.vesting_system.use_background_thread = use_bg_thread
+                        self.vesting_system.thread_priority = thread_priority
+                        self.vesting_system.query_interval_seconds = query_interval
+                        self.vesting_system.transaction_query_interval_seconds = tx_query_interval
+                        self.vesting_system.detailed_transaction_tracking = detailed_tx
                         
-                        # Check vesting status after initialization 
-                        await self.check_vesting_status()
+                        # Call initialize with no parameters
+                        success = await self.vesting_system.initialize()
                         
-                        # Explicitly update coldkey-hotkey relationships to ensure coldkey_metrics is populated
-                        bt.logging.info("Explicitly updating coldkey-hotkey relationships...")
-                        success = await self.vesting_system.update_coldkey_hotkey_relationships()
                         if success:
-                            bt.logging.info("Successfully updated coldkey-hotkey relationships")
-                        else:
-                            bt.logging.warning("Failed to update coldkey-hotkey relationships")
+                            bt.logging.info("Vesting system initialized successfully")
                             
-                        # Check the transaction monitoring status
-                        try:
-                            await self.check_transaction_monitoring_status()
-                        except Exception as e:
-                            bt.logging.error(f"Error checking transaction monitoring status: {e}")
-                            bt.logging.debug(traceback.format_exc())
-                        
-                        # Set up a periodic check to ensure transaction monitoring stays running
-                        async def periodic_tx_monitoring_check():
-                            try:
-                                while True:
-                                    await asyncio.sleep(300)  # Check every 5 minutes
-                                    bt.logging.info("Running periodic transaction monitoring status check")
-                                    try:
-                                        await self.check_transaction_monitoring_status()
-                                    except Exception as e:
-                                        bt.logging.error(f"Error in periodic transaction monitoring check: {e}")
-                            except asyncio.CancelledError:
-                                bt.logging.info("Periodic transaction monitoring check task cancelled")
-                            except Exception as e:
-                                bt.logging.error(f"Unexpected error in periodic monitoring task: {e}")
-                                bt.logging.debug(traceback.format_exc())
-                        
-                        # Start the periodic check in a background task
-                        try:
-                            self.tx_monitoring_check_task = asyncio.create_task(periodic_tx_monitoring_check())
-                            bt.logging.info("Started periodic transaction monitoring status check task")
-                        except Exception as e:
-                            bt.logging.error(f"Failed to start periodic transaction monitoring check: {e}")
+                            # After initialization, explicitly initialize hotkeys from the metagraph
+                            bt.logging.info("Initializing vesting hotkeys from metagraph...")
+                            metagraph_init_success = await self.vesting_system.initialize_from_metagraph(force_refresh=need_metagraph_init)
+                            if metagraph_init_success:
+                                bt.logging.info("✅ Successfully initialized hotkeys from metagraph")
+                                # Get counts of miners with stake
+                                info = await self.vesting_system.get_diagnostic_info()
+                                if 'tables' in info and 'miner_metrics' in info['tables']:
+                                    bt.logging.info(f"Initialized {info['tables']['miner_metrics']['count']} miner records with {info['tables']['miner_metrics'].get('total_stake', 0)} total stake")
+                            else:
+                                bt.logging.warning("❌ Failed to initialize hotkeys from metagraph")
+                        else:
+                            bt.logging.warning("Vesting system initialization returned False")
+                    
                     except Exception as e:
-                        bt.logging.error(f"Error during vesting system initialization: {e}")
-                        bt.logging.debug(traceback.format_exc())
-                        raise
+                        bt.logging.error(f"Error initializing vesting system: {e}")
+                        bt.logging.error(traceback.format_exc())
+                        success = False
                     
-                    # Create and install the integration with the scoring system
-                    self.vesting_integration = VestingIntegration(
-                        scoring_system=self.scoring_system,
-                        vesting_system=self.vesting_system
-                    )
-                    
-                    # Install the integration
-                    enabled_status = "enabled" if vesting_enabled else "shadow mode (tracking but not impacting weights)"
-                    bt.logging.info(f"Installing vesting integration in {enabled_status}")
-                    self.vesting_integration.install(impact_weights=vesting_enabled)
-                    
-                    bt.logging.info("Vesting system initialized and integrated successfully")
+                    if not success:
+                        bt.logging.error("Failed to initialize vesting system, some functionality may be limited")
+                
                 except Exception as e:
-                    bt.logging.error(f"Failed to initialize vesting system: {e}")
-                    bt.logging.debug(traceback.format_exc())
-                    self.vesting_system = None
-                    self.vesting_integration = None
+                    bt.logging.error(f"Failed to create vesting system: {e}")
+                    bt.logging.error(traceback.format_exc())
+                    success = False
+
+                # Create and install the integration with the scoring system
+                self.vesting_integration = VestingIntegration(
+                    scoring_system=self.scoring_system,
+                    vesting_system=self.vesting_system
+                )
+                
+                # Install the integration
+                enabled_status = "enabled" if vesting_enabled else "shadow mode (tracking but not impacting weights)"
+                bt.logging.info(f"Installing vesting integration in {enabled_status}")
+                self.vesting_integration.install(impact_weights=vesting_enabled)
+                
+                bt.logging.info("Vesting system initialized and integrated successfully")
             except Exception as e:
                 bt.logging.error(f"Failed to initialize vesting system: {e}")
                 bt.logging.debug(traceback.format_exc())
@@ -1295,79 +1248,79 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             return False
 
     async def check_transaction_monitoring_status(self):
-        """
-        Check and log the status of transaction monitoring, attempting to restart if not running.
-        
-        Returns:
-            bool: True if transaction monitoring is running, False otherwise
-        """
-        if not hasattr(self, 'vesting_system') or not self.vesting_system:
-            bt.logging.error("Vesting system not initialized, cannot check transaction monitoring status")
-            return False
+        """Check the status of the transaction monitoring system and restart if needed"""
+        try:
+            bt.logging.info("Checking transaction monitoring status...")
             
-        bt.logging.info("Checking transaction monitoring status...")
-        
-        if not hasattr(self.vesting_system, 'detailed_transaction_tracking'):
-            bt.logging.error("Vesting system doesn't have detailed_transaction_tracking attribute")
-            return False
+            # Log current settings
+            bt.logging.info(f"Detailed transaction tracking setting: {self.vesting_system.detailed_transaction_tracking}")
             
-        bt.logging.info(f"Detailed transaction tracking setting: {self.vesting_system.detailed_transaction_tracking}")
-        
-        if not self.vesting_system.detailed_transaction_tracking:
-            bt.logging.warning("Detailed transaction tracking is disabled, enabling it now for debugging")
-            self.vesting_system.detailed_transaction_tracking = True
-            
-        if not hasattr(self.vesting_system, 'transaction_monitor') or not self.vesting_system.transaction_monitor:
-            bt.logging.error("Transaction monitor not initialized despite detailed_transaction_tracking=True")
-            
-            # Try to create and initialize it manually
-            bt.logging.info("Attempting to create transaction monitor manually...")
-            try:
-                from bettensor.validator.vesting.transaction_monitor import TransactionMonitor
-                self.vesting_system.transaction_monitor = TransactionMonitor(
-                    subtensor=self.subtensor,
-                    subnet_id=self.config.netuid,
-                    db_manager=self.vesting_db_manager,
-                    verbose=True
-                )
-                await self.vesting_system.transaction_monitor.initialize()
-                self.vesting_system.start_background_thread('normal')
-                bt.logging.info("Manually created and started transaction monitor")
-            except Exception as e:
-                bt.logging.error(f"Failed to manually create transaction monitor: {e}")
-                return False
-        
-        # Check if transaction monitoring is running
-        if not hasattr(self.vesting_system.transaction_monitor, 'is_running'):
-            bt.logging.warning("Transaction monitor doesn't have is_running property")
-            
-            # Try accessing 'is_monitoring' attribute instead
-            if hasattr(self.vesting_system.transaction_monitor, 'is_monitoring'):
-                is_running = self.vesting_system.transaction_monitor.is_monitoring
-            else:
-                bt.logging.error("Cannot determine transaction monitoring status")
-                return False
-        else:
-            is_running = self.vesting_system.transaction_monitor.is_running
-        
-        bt.logging.info(f"Transaction monitoring status: {'RUNNING' if is_running else 'STOPPED'}")
-        
-        if not is_running:
-            bt.logging.warning("Transaction monitoring is not running! Attempting to start manually...")
-            success = self.vesting_system.start_background_thread('normal')
-            
-            if success:
-                bt.logging.info("Successfully started background thread manually")
-                # Check again after 2 seconds
-                await asyncio.sleep(2)
-                
-                if hasattr(self.vesting_system.transaction_monitor, 'is_running'):
-                    is_running = self.vesting_system.transaction_monitor.is_running
-                elif hasattr(self.vesting_system.transaction_monitor, 'is_monitoring'):
-                    is_running = self.vesting_system.transaction_monitor.is_monitoring
+            if hasattr(self, 'vesting_system') and self.vesting_system:
+                # Check if transaction monitor exists
+                if hasattr(self.vesting_system, 'transaction_monitor') and self.vesting_system.transaction_monitor:
+                    # Get transaction monitor
+                    tx_monitor = self.vesting_system.transaction_monitor
                     
-                bt.logging.info(f"Transaction monitoring status after manual start: {'RUNNING' if is_running else 'STILL STOPPED'}")
+                    # Log detailed status using the new summary method
+                    if hasattr(tx_monitor, 'log_status_summary'):
+                        tx_monitor.log_status_summary()
+                    
+                    # Check substrate instance
+                    if hasattr(tx_monitor, 'substrate') and tx_monitor.substrate:
+                        substrate_id = id(tx_monitor.substrate)
+                        bt.logging.info(f"Transaction monitor has substrate instance (id: {substrate_id})")
+                        
+                        if hasattr(tx_monitor.substrate, 'url'):
+                            bt.logging.info(f"Transaction monitor substrate URL: {tx_monitor.substrate.url}")
+                    else:
+                        bt.logging.warning("Transaction monitor has no substrate instance")
+                    
+                    # Check if monitoring is running
+                    if hasattr(tx_monitor, 'is_running'):
+                        monitoring_status = tx_monitor.is_running
+                        bt.logging.info(f"Transaction monitoring status: {'RUNNING' if monitoring_status else 'STOPPED'}")
+                        
+                        # If monitoring is stopped, attempt to restart it
+                        if not monitoring_status:
+                            bt.logging.warning("Transaction monitoring is not running! Attempting to start manually...")
+                            
+                            if hasattr(tx_monitor, 'start_monitoring'):
+                                # Try to get a fresh endpoint from subtensor if available
+                                explicit_endpoint = None
+                                if hasattr(self.subtensor, 'chain_endpoint') and self.subtensor.chain_endpoint:
+                                    explicit_endpoint = self.subtensor.chain_endpoint
+                                    bt.logging.info(f"Using fresh endpoint from subtensor: {explicit_endpoint}")
+                                    if hasattr(tx_monitor, 'explicit_endpoint'):
+                                        tx_monitor.explicit_endpoint = explicit_endpoint
+                                
+                                # Try to initialize transaction monitor if needed
+                                if hasattr(tx_monitor, 'initialize') and callable(tx_monitor.initialize):
+                                    try:
+                                        await tx_monitor.initialize()
+                                        bt.logging.info("Re-initialized transaction monitor")
+                                    except Exception as e:
+                                        bt.logging.error(f"Failed to re-initialize transaction monitor: {e}")
+                                
+                                # Start monitoring
+                                tx_monitor.start_monitoring()
+                                
+                                # Check status again
+                                if hasattr(tx_monitor, 'is_running'):
+                                    if tx_monitor.is_running:
+                                        bt.logging.info("Successfully started background thread manually")
+                                    else:
+                                        bt.logging.error("Failed to start background thread manually")
+                            else:
+                                bt.logging.error("Transaction monitor has no start_monitoring method")
+                    else:
+                        bt.logging.warning("Transaction monitor has no is_running property")
+                else:
+                    bt.logging.warning("Vesting system has no transaction monitor")
             else:
-                bt.logging.error("Failed to start background thread manually")
-        
-        return is_running
+                bt.logging.warning("No vesting system available")
+            
+            return True
+        except Exception as e:
+            bt.logging.error(f"Error checking transaction monitoring status: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False

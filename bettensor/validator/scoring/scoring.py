@@ -2275,7 +2275,36 @@ class ScoringSystem:
             
             if missing_tables:
                 bt.logging.error(f"Missing required tables: {missing_tables}")
-                await self.db_manager.initialize(force=True)
+                # Temporarily monkey patch the initialize_database function to avoid adding vesting tables
+                from bettensor.validator.database.database_init import initialize_database
+                
+                # Store original function
+                original_initialize_database = initialize_database
+                
+                # Define a wrapper that excludes vesting tables
+                def custom_initialize_database():
+                    statements = original_initialize_database()
+                    # Filter out any statements related to vesting tables
+                    filtered_statements = [stmt for stmt in statements if not any(
+                        vesting_table in stmt for vesting_table in [
+                            'blockchain_state', 'stake_transactions', 'stake_balance_changes',
+                            'stake_metrics', 'coldkey_metrics', 'stake_change_history',
+                            'vesting_module_state', 'stake_tranches'
+                        ]
+                    )]
+                    bt.logging.info(f"Filtered out vesting-related statements. Original: {len(statements)}, Filtered: {len(filtered_statements)}")
+                    return filtered_statements
+                
+                # Replace the function temporarily
+                import bettensor.validator.database.database_init
+                bettensor.validator.database.database_init.initialize_database = custom_initialize_database
+                
+                try:
+                    # Initialize with the patched function
+                    await self.db_manager.initialize(force=True)
+                finally:
+                    # Restore original function
+                    bettensor.validator.database.database_init.initialize_database = original_initialize_database
             
             # 2. Verify ROI columns in miner_stats
             # Enhanced approach - first check if miner_stats exists

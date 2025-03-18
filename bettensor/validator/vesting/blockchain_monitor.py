@@ -131,52 +131,47 @@ class BlockchainMonitor:
     
     def start_background_thread(self, thread_nice_value: int = 0):
         """
-        Start the blockchain monitor in a background thread.
-        
-        This method starts a background thread that periodically:
-        1. Tracks manual transactions
-        2. Tracks balance changes
-        3. Checks for epoch boundaries
+        Start a background thread to periodically check for changes.
         
         Args:
             thread_nice_value: Nice value for thread scheduling (-20 to 19, lower means higher priority)
                                Only works on UNIX systems.
-        
-        Returns:
-            bool: True if thread was started, False otherwise
         """
         if self._is_running:
             logger.warning("Blockchain monitor thread is already running")
             return False
         
-        # Reset stop event
+        logger.info(f"Starting blockchain monitor background thread with nice value: {thread_nice_value}")
         self._stop_event.clear()
         
-        # Create and start thread
-        self._thread = threading.Thread(
-            target=self._background_thread_loop,
-            daemon=True,
-            name="vesting_blockchain_monitor"
-        )
-        self._thread.start()
-        
-        # Try to set thread priority if on a compatible system
-        if thread_nice_value != 0:
-            try:
-                import os
-                if hasattr(os, 'nice'):
-                    # This is unix-specific - get thread ID and set nice value
-                    # Note: This requires appropriate permissions
-                    thread_id = self._thread.ident
-                    if thread_id:
-                        logger.debug(f"Setting blockchain monitor thread priority to {thread_nice_value}")
-                        os.nice(thread_nice_value)
-            except (ImportError, AttributeError, PermissionError) as e:
-                logger.debug(f"Could not set thread priority: {e}")
-        
-        self._is_running = True
-        logger.info("Started blockchain monitor background thread")
-        return True
+        try:
+            thread_name = f"blockchain_monitor_{int(time.time())}"
+            self._thread = threading.Thread(
+                target=self._background_thread_loop,
+                daemon=True,
+                name=thread_name
+            )
+            self._thread.start()
+            logger.info(f"Started blockchain monitor thread: {thread_name} (ID: {self._thread.ident})")
+            
+            # Set thread priority if on Linux
+            if thread_nice_value != 0:
+                try:
+                    logger.info(f"Setting blockchain monitor thread nice value to {thread_nice_value}")
+                    import os
+                    os.nice(thread_nice_value)
+                    logger.info(f"Set nice value {thread_nice_value} for thread {self._thread.ident}")
+                except Exception as e:
+                    logger.warning(f"Failed to set thread priority: {e}")
+            
+            self._is_running = True
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start blockchain monitor background thread: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self._is_running = False
+            return False
     
     def stop_background_thread(self, timeout=10):
         """
@@ -207,83 +202,162 @@ class BlockchainMonitor:
         return True
     
     def _background_thread_loop(self):
-        """
-        Background thread loop for the blockchain monitor.
-        
-        This method runs in a separate thread and periodically:
-        1. Tracks manual transactions
-        2. Tracks balance changes
-        3. Checks for epoch boundaries
-        """
+        """Background thread loop for monitoring blockchain changes."""
         logger.info("Blockchain monitor background thread started")
         
-        # Create event loop for the thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Track recent errors to avoid logging the same error repeatedly
+        recent_errors = []
+        max_recent_errors = 5
         
-        try:
-            # Initialize if not already initialized
-            if not self._is_connected:
+        # Try to initialize state if not already done
+        if not self._is_connected:
+            try:
+                logger.info("Initializing state in background thread")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 loop.run_until_complete(self.initialize())
-            
-            # Main loop
-            start_time = time.time()
-            last_check_time = 0
-            check_interval = 5  # Check more frequently for epoch boundaries
-            
-            # Ensure query_interval is a valid number
-            if not hasattr(self, 'query_interval') or self.query_interval is None:
-                logger.warning("query_interval is None, defaulting to 60 seconds")
-                self.query_interval = 60  # Default to 60 seconds
-
-            logger.info(f"Blockchain monitor starting with query_interval: {self.query_interval} seconds")
-            
-            while not self._stop_event.is_set():
-                try:
-                    current_time = time.time()
-                    
-                    # Check for epoch boundary more frequently
-                    if current_time - last_check_time >= check_interval:
-                        # Get current block
-                        if self._substrate:
-                            block_hash = self._substrate.get_chain_head()
-                            block_num = self._substrate.get_block_number(block_hash)
-                        else:
-                            block_num = self.subtensor.get_current_block()
-                        
-                        # Check for epoch boundary
-                        epoch_changed = loop.run_until_complete(self._check_for_epoch_boundary(block_num))
-                        if epoch_changed:
-                            self._current_epoch += 1
-                            logger.info(f"Epoch boundary detected, new epoch: {self._current_epoch}")
-                            
-                            # Track balance changes for the new epoch
-                            loop.run_until_complete(self.track_balance_changes(self._current_epoch))
-                        
-                        # Track manual transactions periodically
-                        if current_time - last_check_time >= self.query_interval:
-                            loop.run_until_complete(self.track_manual_transactions())
-                            
-                        last_check_time = current_time
-                    
-                    # Log status periodically
-                    elapsed = time.time() - start_time
-                    if elapsed % 300 < check_interval:
-                        hours = elapsed / 3600
-                        logger.info(f"Monitor running for {hours:.1f} hours, detected {self._current_epoch} epochs")
-                    
-                    # Sleep briefly
-                    time.sleep(1)
-                        
-                except Exception as e:
-                    logger.error(f"Error in blockchain monitor background thread: {e}")
-                    # Sleep for a shorter interval on error
-                    time.sleep(10)
+                loop.close()
+                logger.info("State initialization successful in background thread")
+            except Exception as e:
+                error_msg = f"Failed to initialize state in background thread: {e}"
+                if error_msg not in recent_errors:
+                    logger.error(error_msg)
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    recent_errors.append(error_msg)
+                    if len(recent_errors) > max_recent_errors:
+                        recent_errors.pop(0)
         
-        finally:
-            # Clean up
+        logger.info(f"Query interval is {self.query_interval}s")
+        next_check_time = time.time()
+        last_check_success = None
+        
+        # Ensure we have a local asyncio loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            logger.info("Created new asyncio loop for blockchain monitor thread")
+        except Exception as e:
+            logger.error(f"Failed to create asyncio loop: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return
+        
+        while not self._stop_event.is_set():
+            try:
+                current_time = time.time()
+                
+                # Check if it's time to run a check
+                if current_time >= next_check_time:
+                    # Log thread and connection info for debugging
+                    thread_id = threading.get_ident()
+                    current_thread = threading.current_thread()
+                    logger.debug(f"Running blockchain check in thread: {current_thread.name} (ID: {thread_id})")
+                    
+                    # Check if the subtensor connection is valid
+                    subtensor_ok = self._check_subtensor_connection()
+                    if not subtensor_ok:
+                        logger.warning("Subtensor connection issue detected, will retry later")
+                        next_check_time = current_time + min(60, self.query_interval)
+                        continue
+                    
+                    # Run the next check
+                    logger.debug("Running blockchain checks in background thread")
+                    
+                    # Run asynchronous checks in the event loop
+                    try:
+                        result = loop.run_until_complete(self._run_checks())
+                        if result:
+                            logger.debug("Blockchain checks completed successfully")
+                            last_check_success = time.time()
+                        else:
+                            logger.warning("Blockchain checks failed, will retry later")
+                    except Exception as e:
+                        error_msg = f"Error running blockchain checks: {e}"
+                        if error_msg not in recent_errors:
+                            logger.error(error_msg)
+                            import traceback
+                            logger.error(traceback.format_exc())
+                            recent_errors.append(error_msg)
+                            if len(recent_errors) > max_recent_errors:
+                                recent_errors.pop(0)
+                    
+                    # Set next check time
+                    next_check_time = time.time() + self.query_interval
+                    logger.debug(f"Next blockchain check scheduled in {self.query_interval}s")
+                
+                # Sleep for a bit to avoid busy-waiting
+                time.sleep(1)
+                
+            except Exception as e:
+                error_msg = f"Error in blockchain monitor background thread: {e}"
+                if error_msg not in recent_errors:
+                    logger.error(error_msg)
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    recent_errors.append(error_msg)
+                    if len(recent_errors) > max_recent_errors:
+                        recent_errors.pop(0)
+                
+                # Sleep before retrying
+                time.sleep(5)
+        
+        # Cleanup
+        try:
+            logger.info("Closing asyncio loop")
             loop.close()
-            logger.info("Blockchain monitor background thread stopped")
+        except Exception as e:
+            logger.error(f"Error closing asyncio loop: {e}")
+        
+        logger.info("Blockchain monitor background thread exiting")
+        self._is_running = False
+
+    def _check_subtensor_connection(self):
+        """Check if the subtensor connection is valid and working."""
+        try:
+            # Note: We don't want to create a new connection here, just check if the existing one is valid
+            if not self.subtensor:
+                logger.error("No subtensor instance available")
+                return False
+            
+            # Try to access an attribute that should always be available
+            if not hasattr(self.subtensor, 'network'):
+                logger.error("Invalid subtensor instance: missing 'network' attribute")
+                return False
+            
+            logger.debug(f"Subtensor connection check passed (network: {self.subtensor.network})")
+            return True
+        except Exception as e:
+            logger.error(f"Error checking subtensor connection: {e}")
+            return False
+
+    async def _run_checks(self):
+        """Run all blockchain monitoring checks."""
+        try:
+            # Check for epoch boundary first
+            current_block = self.subtensor.get_current_block()
+            if not current_block:
+                logger.warning("Failed to get current block")
+                return False
+            
+            logger.debug(f"Current block: {current_block}")
+            
+            # Check if this is a new epoch
+            is_epoch_boundary = await self._check_for_epoch_boundary(current_block)
+            if is_epoch_boundary:
+                logger.info(f"Epoch boundary detected at block {current_block}")
+            
+            # Update last checked block
+            if current_block > self._last_check_block:
+                self._last_check_block = current_block
+                await self._save_last_processed_blocks()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error running blockchain checks: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
     async def _check_for_epoch_boundary(self, block_num: int) -> bool:
         """

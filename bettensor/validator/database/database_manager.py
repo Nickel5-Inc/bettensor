@@ -114,7 +114,7 @@ class DatabaseManager:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    async with async_timeout.timeout(10):  # Increased from 2s to 10s
+                    async with async_timeout.timeout(10):
                         await session.execute(text("PRAGMA journal_mode = WAL"))
                         await session.execute(text("PRAGMA synchronous = NORMAL"))
                         await session.execute(text("PRAGMA busy_timeout = 30000"))
@@ -124,64 +124,42 @@ class DatabaseManager:
                 except (asyncio.TimeoutError, SQLAlchemyError) as e:
                     if attempt == max_retries - 1:
                         bt.logging.error(f"Failed to set PRAGMA statements after {max_retries} attempts")
+                        if session.in_transaction():
+                            await session.rollback()
                         raise
-                    await asyncio.sleep(1)  # Wait before retry
+                    await asyncio.sleep(1)
                     continue
 
             yield session
             
-            # Commit any pending changes if no error occurred
+            # Commit any pending changes if no error occurred and we're in a transaction
             if session and session.in_transaction():
                 try:
                     async with async_timeout.timeout(5):
                         await session.commit()
-                except asyncio.TimeoutError:
-                    session.sync_session.rollback()
-                    raise
-                except Exception:
-                    session.sync_session.rollback()
-                    raise
-                
-        except asyncio.CancelledError:
-            bt.logging.warning("Session operation cancelled, performing cleanup")
-            if session:
-                try:
-                    async with async_timeout.timeout(1):
-                        if session.in_transaction():
-                            session.sync_session.rollback()
-                        session.sync_session.close()
                 except Exception as e:
-                    bt.logging.error(f"Error during session cleanup after cancellation: {e}")
-            if connection:
-                await self._safe_close_connection(connection)
-            raise
+                    bt.logging.error(f"Error committing transaction: {e}")
+                    await session.rollback()
+                    raise
             
         except Exception as e:
             bt.logging.error(f"Database error: {e}")
-            if session:
+            if session and session.in_transaction():
                 try:
-                    async with async_timeout.timeout(1):
-                        if session.in_transaction():
-                            session.sync_session.rollback()
-                        session.sync_session.close()
-                except Exception as cleanup_error:
-                    bt.logging.error(f"Error during session cleanup: {cleanup_error}")
-            if connection:
-                await self._safe_close_connection(connection)
+                    await session.rollback()
+                except Exception as rollback_error:
+                    bt.logging.error(f"Error during rollback: {rollback_error}")
             raise
-            
+        
         finally:
             # Always clean up the session and connection
             if session:
                 try:
-                    async with async_timeout.timeout(1):
-                        if session in self._active_sessions:
-                            self._active_sessions.remove(session)
-                        if session.in_transaction():
-                            session.sync_session.rollback()
-                        session.sync_session.close()
+                    if session in self._active_sessions:
+                        self._active_sessions.remove(session)
+                    await session.close()
                 except Exception as e:
-                    bt.logging.error(f"Error during final session cleanup: {e}")
+                    bt.logging.error(f"Error during session cleanup: {e}")
             if connection:
                 await self._safe_close_connection(connection)
 

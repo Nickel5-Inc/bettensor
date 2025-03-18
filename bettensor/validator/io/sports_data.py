@@ -51,21 +51,31 @@ class SportsData:
                 inserted_ids = []
                 for i in range(0, len(all_games), self.CHUNK_SIZE):
                     chunk = all_games[i:i + self.CHUNK_SIZE]
-                    try:
-                        # Set timeout for each chunk processing
-                        async with async_timeout.timeout(self.TRANSACTION_TIMEOUT):
-                            # Process chunk with proper context management
-                            async with self.db_manager.get_session() as session:
-                                chunk_ids = await self._process_game_chunk(chunk, session)
-                                inserted_ids.extend(chunk_ids)
+                    retry_count = 0
+                    max_retries = 3
+                    
+                    while retry_count < max_retries:
+                        try:
+                            # Set timeout for each chunk processing
+                            async with async_timeout.timeout(self.TRANSACTION_TIMEOUT):
+                                # Process chunk with proper context management
+                                async with self.db_manager.get_session() as session:
+                                    chunk_ids = await self._process_game_chunk(chunk, session)
+                                    inserted_ids.extend(chunk_ids)
+                                    break  # Success - exit retry loop
                                     
-                    except asyncio.CancelledError:
-                        bt.logging.warning(f"Chunk {i//self.CHUNK_SIZE + 1} processing was cancelled")
-                        raise
-                    except Exception as e:
-                        bt.logging.error(f"Error in transaction: {str(e)}")
-                        bt.logging.error(traceback.format_exc())
-                        continue
+                        except asyncio.CancelledError:
+                            bt.logging.warning(f"Chunk {i//self.CHUNK_SIZE + 1} processing was cancelled")
+                            raise
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count < max_retries:
+                                bt.logging.warning(f"Error in chunk {i//self.CHUNK_SIZE + 1}, attempt {retry_count}: {str(e)}")
+                                await asyncio.sleep(1)  # Wait before retry
+                                continue
+                            bt.logging.error(f"Failed to process chunk {i//self.CHUNK_SIZE + 1} after {max_retries} attempts: {str(e)}")
+                            bt.logging.error(traceback.format_exc())
+                            break  # Move to next chunk after max retries
                     
                 self.all_games = all_games
                 return inserted_ids

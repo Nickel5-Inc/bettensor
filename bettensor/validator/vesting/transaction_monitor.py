@@ -10,7 +10,9 @@ import asyncio
 import logging
 import time
 import json
+import threading
 from datetime import datetime, timezone
+import traceback
 from typing import Dict, List, Optional, Any, Set, Union, Tuple
 
 import bittensor as bt
@@ -19,22 +21,20 @@ from substrateinterface.exceptions import SubstrateRequestException
 
 from bettensor.validator.database.database_manager import DatabaseManager
 
-logger = logging.getLogger(__name__)
-
 # Transaction flow categories
 INFLOW = "inflow"         # Stake added to the hotkey
 OUTFLOW = "outflow"       # Stake removed from the hotkey
-NEUTRAL = "neutral"       # No net change to the hotkey's stake
+NEUTRAL = "neutral"       # No net change to the hotkey's stake (e.g., transfer between hotkeys in same subnet)
 EMISSION = "emission"     # Stake added via network emissions/rewards
 
 # Transaction types
-ADD_STAKE = "add_stake"
-REMOVE_STAKE = "remove_stake"
-TRANSFER_OWNERSHIP = "transfer_ownership"
-BURN_STAKE = "burn_stake"
-MOVE_STAKE = "move_stake"
-SWAP_STAKE = "swap_stake"
-EMISSION_REWARD = "emission"
+ADD_STAKE = "add_stake"           # Direct stake addition
+REMOVE_STAKE = "remove_stake"     # Direct stake removal
+TRANSFER_STAKE = "transfer_stake" # Transfer between hotkeys (can be neutral/inflow/outflow)
+MOVE_STAKE = "move_stake"         # Move stake between subnets (inflow/outflow)
+SWAP_STAKE = "swap_stake"         # Swap stake between subnets (inflow/outflow, same coldkey/hotkey)
+BURN_STAKE = "burn_stake"         # Stake burning (outflow)
+EMISSION_REWARD = "emission"      # Emission rewards (inflow)
 UNKNOWN = "unknown"
 
 class TransactionMonitor:
@@ -68,101 +68,125 @@ class TransactionMonitor:
             explicit_endpoint: Optional explicit endpoint URL for the substrate interface.
                              If not provided, defaults to mainnet endpoint.
         """
+        # Initialize subtensor and other parameters
         self.subtensor = subtensor
         self.subnet_id = subnet_id
         self.db_manager = db_manager
         self.verbose = verbose
-        # Store for backward compatibility but not used - monitoring happens via real-time block subscription
-        self.query_interval_seconds = query_interval_seconds
+        self.explicit_endpoint = explicit_endpoint
         
-        # Initialize substrate interface for direct queries
-        if explicit_endpoint:
-            self.substrate_url = explicit_endpoint
-            logger.info(f"Using explicit endpoint for transaction monitoring: {self.substrate_url}")
+        # Log initialization with explicit configuration
+        bt.logging.info(f"TransactionMonitor init - subnet_id: {subnet_id}, verbose: {verbose}, explicit_endpoint: {explicit_endpoint}")
+        if hasattr(subtensor, 'chain_endpoint'):
+            bt.logging.info(f"Subtensor chain_endpoint: {subtensor.chain_endpoint}")
         else:
-            # Always use the mainnet endpoint for monitoring stake transactions
-            self.substrate_url = "wss://entrypoint-finney.opentensor.ai:443"
-            logger.info(f"Using mainnet endpoint for transaction monitoring: {self.substrate_url}")
+            bt.logging.warning("Subtensor has no chain_endpoint attribute")
         
-        self.substrate = None  # Will be initialized later
+        # Monitoring thread
+        self.monitoring_thread = None
+        self.stop_event = threading.Event()
+        self.substrate = None
+        self._last_processed_block = None
+        self._last_call_block = 0
+        self._pending_calls = {}  # Block -> list of calls
+        self._is_initialized = False
+        self._thread_lock = threading.RLock()
+        self._substrate_lock = threading.RLock()
         
-        # Monitoring state
-        self.subscription = None
-        self.is_monitoring = False
-        self.should_exit = False
-        
-        # Dictionary to store pending stake extrinsic calls
-        # Keys: unique call IDs; Values: dict with call details
-        self.pending_calls = {}
-        self.call_counter = 0
+        # Status tracking
+        self._status = "STOPPED"
+        self._last_error = None
+        self._last_successful_block = None
+        self._thread_startup_time = None
     
     async def initialize(self):
-        """
-        Initialize the transaction monitor.
-        
-        This method initializes the transaction monitor but no longer creates 
-        database tables as this is now handled centrally by the DatabaseManager
-        using schema definitions from database_schema.py.
-        
-        Returns:
-            bool: True if initialization was successful
-        """
+        """Initialize the transaction monitor."""
         try:
-            logger.info("Initializing TransactionMonitor")
+            bt.logging.info("Initializing TransactionMonitor")
             
-            # Log the configuration settings
-            logger.info(f"Monitoring subnet ID: {self.subnet_id}")
-            logger.info(f"Real-time block monitoring: Enabled (subscription-based)")
-            logger.info(f"Verbose mode: {'Enabled' if self.verbose else 'Disabled'}")
+            # Ensure tables exist
+            await self._ensure_tables_exist()
             
-            # Initialize substrate interface
-            try:
-                logger.debug(f"Connecting to substrate endpoint: {self.substrate_url}")
-                # Use a unique WebSocket connection name to avoid conflicts with other components
-                self.substrate = SubstrateInterface(
-                    url=self.substrate_url,
-                    ws_options={'name': f'tx_monitor_{self.subnet_id}_{int(time.time())}'}
-                )
-                logger.info(f"Connected to substrate endpoint: {self.substrate_url}")
-                
-                # Get chain info
-                try:
-                    chain_info = self.substrate.get_chain_head()
-                    if chain_info:
-                        if isinstance(chain_info, dict) and 'header' in chain_info:
-                            if 'number' in chain_info['header']:
-                                logger.info(f"Chain head: #{chain_info['header']['number']}, hash: {chain_info['hash']}")
-                            else:
-                                logger.info(f"Chain head: hash: {chain_info['hash']}")
-                        else:
-                            logger.info(f"Connected to chain (response format unknown): {type(chain_info).__name__}")
-                except Exception as e:
-                    logger.warning(f"Couldn't get chain head: {e}")
-            except Exception as e:
-                logger.error(f"Failed to connect to substrate endpoint: {e}")
-                return False
+            # Try to load last processed block
+            self._last_processed_block = await self._load_last_processed_block()
             
-            # Load last processed block from database
-            logger.debug("Loading last processed block from database")
-            await self._load_last_processed_block()
-            
-            # Check how many blocks we need to process
-            try:
-                current_block = self.substrate.get_block_number(None)
-                blocks_behind = current_block - self.last_block if self.last_block > 0 else 0
-                logger.info(f"Current blockchain block: {current_block}")
-                if blocks_behind > 0:
-                    logger.info(f"Transaction monitor is {blocks_behind} blocks behind the chain head")
+            # Force Finney mainnet endpoint if monitoring subnet 30 and on test network
+            force_finney_endpoint = None
+            if self.subnet_id == 30 and hasattr(self.subtensor, 'chain_endpoint'):
+                if 'test' in self.subtensor.chain_endpoint:
+                    force_finney_endpoint = "wss://entrypoint-finney.opentensor.ai:443"
+                    bt.logging.info(f"⚠️ Detected test network but monitoring subnet 30, forcing Finney mainnet endpoint: {force_finney_endpoint}")
+
+            # Create a dedicated substrate connection for transaction monitoring
+            if force_finney_endpoint:
+                # Override with Finney mainnet endpoint
+                bt.logging.info(f"🔄 Using forced Finney mainnet endpoint: {force_finney_endpoint}")
+                self.explicit_endpoint = force_finney_endpoint  # Override the explicit endpoint
+                self.substrate = SubstrateInterface(url=force_finney_endpoint)
+            elif self.explicit_endpoint:
+                bt.logging.info(f"Using explicit endpoint: {self.explicit_endpoint}")
+                self.substrate = SubstrateInterface(url=self.explicit_endpoint)
+            else:
+                # Try to get an endpoint from subtensor
+                if hasattr(self.subtensor, 'chain_endpoint') and self.subtensor.chain_endpoint:
+                    endpoint = self.subtensor.chain_endpoint
+                    bt.logging.info(f"Using subtensor chain_endpoint: {endpoint}")
+                    self.substrate = SubstrateInterface(url=endpoint)
                 else:
-                    logger.info("Transaction monitor is up to date with the chain")
-            except Exception as e:
-                logger.warning(f"Couldn't calculate blocks behind: {e}")
+                    try:
+                        if hasattr(self.subtensor, 'substrate') and self.subtensor.substrate:
+                            bt.logging.info("Using subtensor.substrate's endpoint")
+                            substrate_url = self.subtensor.substrate.url
+                            bt.logging.info(f"Extracted URL from subtensor.substrate: {substrate_url}")
+                            self.substrate = SubstrateInterface(url=substrate_url)
+                        else:
+                            raise ValueError("No substrate endpoint available from subtensor")
+                    except Exception as e:
+                        bt.logging.error(f"Error extracting URL from subtensor.substrate: {e}")
+                        raise ValueError(f"Failed to determine chain endpoint: {e}")
             
-            logger.info(f"TransactionMonitor initialized. Last processed block: {self.last_block}")
+            # Test the connection
+            try:
+                # Get chain properties instead of using get_chain_info()
+                chain_head = self.substrate.get_chain_head()
+                
+                # Try to get chain name - handle potential exceptions safely
+                try:
+                    # Different approach to get chain info
+                    chain_props = "Unknown"
+                    if hasattr(self.substrate, 'get_metadata'):
+                        metadata = self.substrate.get_metadata(block_hash=chain_head)
+                        if metadata and hasattr(metadata, 'metadata') and hasattr(metadata.metadata, 'name'):
+                            chain_props = metadata.metadata.name
+                        elif metadata and hasattr(metadata, 'metadata_version'):
+                            chain_props = f"Substrate (Metadata v{metadata.metadata_version})"
+                    bt.logging.info(f"Connected to blockchain: {chain_props}")
+                except Exception as e:
+                    bt.logging.warning(f"Could not get chain name: {e}, but connection established")
+                
+                # Log current block information
+                try:
+                    current_block = self.substrate.get_block_number(chain_head)
+                    bt.logging.info(f"Current chain head: Block #{current_block}")
+                except Exception as e:
+                    bt.logging.warning(f"Could not get block number: {e}, but connection established")
+                
+                # Connection successful if we get here
+                bt.logging.info("Blockchain connection established successfully")
+            except Exception as e:
+                bt.logging.error(f"Failed to connect to blockchain: {e}")
+                # Handle error but don't raise - we want initialization to succeed even if blockchain connection fails
+                bt.logging.warning("Will continue without blockchain connection and retry later")
+            
+            self._is_initialized = True
+            bt.logging.info("TransactionMonitor initialized successfully")
             return True
         except Exception as e:
-            logger.error(f"Failed to initialize TransactionMonitor: {e}")
-            logger.exception("Initialization error details:")
+            bt.logging.error(f"Failed to initialize TransactionMonitor: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            self._is_initialized = False
+            self._last_error = str(e)
             return False
     
     # DEPRECATED: Kept for backward compatibility
@@ -173,125 +197,77 @@ class TransactionMonitor:
         This method is maintained for backward compatibility only and does nothing.
         Table schemas are defined in database_schema.py and created by DatabaseManager.
         """
-        logger.debug("_ensure_tables_exist() is deprecated - tables are created centrally")
+        bt.logging.debug("_ensure_tables_exist() is deprecated - tables are created centrally")
         return
     
     def start_monitoring(self, thread_nice_value: int = 0):
-        """
-        Start monitoring blockchain for transactions.
-        
-        This method starts a subscription to the blockchain to monitor
-        for new blocks and process transactions.
-        
-        Args:
-            thread_nice_value: Nice value for thread scheduling (-20 to 19, lower means higher priority)
-                               Only works on UNIX systems.
-                               
-        Returns:
-            bool: True if monitoring started successfully
-        """
-        if self.is_monitoring:
-            logger.warning("Transaction monitoring is already running")
-            return True
-        
-        try:
-            logger.info(f"Starting transaction monitoring for subnet {self.subnet_id}")
+        """Start the transaction monitoring thread."""
+        with self._thread_lock:
+            if self.monitoring_thread and self.monitoring_thread.is_alive():
+                bt.logging.info("Transaction monitoring thread is already running")
+                return
             
-            if not self.substrate:
-                logger.error("Substrate interface not initialized")
-                
-                # Try to initialize a new substrate interface
-                try:
-                    logger.info(f"Attempting to initialize substrate interface to mainnet: {self.substrate_url}")
-                    # Use a unique connection name to avoid conflicts
-                    connection_name = f'tx_monitor_start_{self.subnet_id}_{int(time.time())}'
-                    logger.debug(f"Using unique connection name: {connection_name}")
-                    self.substrate = SubstrateInterface(
-                        url=self.substrate_url,
-                        ws_options={'name': connection_name}
-                    )
-                    logger.info("Successfully created substrate interface connection to mainnet")
-                    
-                    # Test connection
-                    try:
-                        chain_info = self.substrate.get_chain_head()
-                        # Properly check the type and structure of chain_info
-                        if isinstance(chain_info, dict) and 'header' in chain_info and isinstance(chain_info['header'], dict) and 'number' in chain_info['header']:
-                            logger.info(f"Connected to mainnet: #{chain_info['header']['number']} (using {self.substrate_url})")
-                        else:
-                            # Handle unexpected response format
-                            logger.info(f"Connected to mainnet (format unknown): {type(chain_info).__name__} (using {self.substrate_url})")
-                            if isinstance(chain_info, dict):
-                                logger.debug(f"Chain info keys: {list(chain_info.keys())}")
-                            elif isinstance(chain_info, str):
-                                logger.debug(f"Chain info (string): {chain_info[:100]}...")
-                            else:
-                                logger.debug(f"Chain info type: {type(chain_info)}")
-                    except Exception as e:
-                        logger.warning(f"Connected to mainnet but couldn't get block details: {e} (using {self.substrate_url})")
-                except Exception as e:
-                    logger.error(f"Failed to initialize substrate interface to mainnet: {e}")
-                    logger.exception("Substrate initialization error details:")
-                    return False
-            
-            # Double-check that we have a valid substrate connection
-            if not self.substrate:
-                logger.error("Still no valid substrate interface after initialization attempt")
-                return False
-                
-            try:
-                # Test the substrate connection before proceeding
-                chain_info = self.substrate.get_chain_head()
-                # Properly check the type and structure of chain_info
-                if isinstance(chain_info, dict) and 'header' in chain_info and isinstance(chain_info['header'], dict) and 'number' in chain_info['header']:
-                    logger.info(f"Confirmed connection to chain: #{chain_info['header']['number']}")
-                else:
-                    # Handle unexpected response format
-                    logger.info(f"Connected to chain (format unknown): {type(chain_info).__name__}")
-                    if isinstance(chain_info, dict):
-                        logger.debug(f"Chain info keys: {list(chain_info.keys())}")
-                    elif isinstance(chain_info, str):
-                        logger.debug(f"Chain info (string): {chain_info[:100]}...")
-                    else:
-                        logger.debug(f"Chain info type: {type(chain_info)}")
-            except Exception as e:
-                logger.error(f"Substrate connection test failed: {e}")
-                logger.exception("Substrate connection test error details:")
-                return False
-            
-            # Start monitoring in a background thread
-            import threading
+            bt.logging.info(f"Starting transaction monitoring thread with nice value: {thread_nice_value}")
+            self.stop_event.clear()
             self.should_exit = False
-            logger.debug("Creating monitoring thread")
-            self.monitoring_thread = threading.Thread(
-                target=self._monitoring_thread_loop,
-                daemon=True,
-                name="vesting_transaction_monitor"
-            )
-            logger.debug("Starting monitoring thread")
-            self.monitoring_thread.start()
+            self.is_monitoring = False
+            self.subscription = None
             
-            # Try to set thread priority if on a compatible system
-            if thread_nice_value != 0:
-                try:
-                    import os
-                    if hasattr(os, 'nice'):
-                        # This is unix-specific - get thread ID and set nice value
-                        # Note: This requires appropriate permissions
-                        thread_id = self.monitoring_thread.ident
-                        if thread_id:
-                            logger.debug(f"Setting transaction monitor thread priority to {thread_nice_value}")
-                            os.nice(thread_nice_value)
-                except (ImportError, AttributeError, PermissionError) as e:
-                    logger.debug(f"Could not set thread priority: {e}")
-                              
-            logger.info("Transaction monitoring started successfully")
-            self.is_monitoring = True
-            return True
-        except Exception as e:
-            logger.error(f"Failed to start transaction monitoring: {e}")
-            logger.exception("Start monitoring error details:")
-            return False
+            try:
+                # Create a new thread
+                self.monitoring_thread = threading.Thread(
+                    target=self._monitoring_thread_loop, 
+                    daemon=True,
+                    name="TransactionMonitor"
+                )
+                self._status = "STARTING"
+                self._thread_startup_time = time.time()
+                
+                # Start the thread
+                self.monitoring_thread.start()
+                bt.logging.info(f"Transaction monitoring thread started: {self.monitoring_thread.name} (ID: {self.monitoring_thread.ident})")
+                
+                # Try to set thread priority if running on Linux
+                if thread_nice_value != 0:
+                    try:
+                        # Wait a moment for the thread to fully start
+                        time.sleep(0.5)
+                        
+                        # Check if thread ID is available
+                        if self.monitoring_thread.ident:
+                            import os
+                            import subprocess
+                            
+                            # Use subprocess instead of os.system for better error handling
+                            try:
+                                # First check if the process exists
+                                subprocess.run(['ps', '-p', str(self.monitoring_thread.ident)], check=True, capture_output=True)
+                                
+                                # Then try to renice it
+                                result = subprocess.run(
+                                    ['renice', '-n', str(thread_nice_value), '-p', str(self.monitoring_thread.ident)],
+                                    capture_output=True,
+                                    text=True
+                                )
+                                
+                                if result.returncode == 0:
+                                    bt.logging.info(f"Set nice value {thread_nice_value} for thread {self.monitoring_thread.ident}")
+                                else:
+                                    bt.logging.warning(f"Failed to set thread priority: {result.stderr}")
+                            except subprocess.CalledProcessError as e:
+                                bt.logging.warning(f"Process ID {self.monitoring_thread.ident} not found for renice: {e}")
+                        else:
+                            bt.logging.warning("Thread ID not available, cannot set priority")
+                    except Exception as e:
+                        bt.logging.warning(f"Failed to set thread priority: {e}")
+                
+                # Set status to running
+                self._status = "RUNNING"
+                return True
+            except Exception as e:
+                bt.logging.error(f"Failed to start monitoring thread: {e}")
+                self._status = "ERROR"
+                return False
     
     def stop_monitoring(self):
         """
@@ -300,173 +276,263 @@ class TransactionMonitor:
         Returns:
             bool: True if monitoring stopped successfully
         """
-        if not self.is_monitoring:
-            return True
-        
         try:
-            logger.info("Stopping transaction monitoring")
+            bt.logging.info("Stopping transaction monitoring")
+            
+            # Signal the thread to stop
+            self.stop_event.set()
             self.should_exit = True
+            self._status = "STOPPING"
             
-            # Unsubscribe if subscription is active
-            if self.subscription:
+            # Wait for the monitoring thread to exit (with timeout)
+            if self.monitoring_thread and self.monitoring_thread.is_alive():
                 try:
-                    self.subscription.unsubscribe()
+                    bt.logging.info(f"Waiting for monitoring thread to exit (ID: {self.monitoring_thread.ident})")
+                    self.monitoring_thread.join(timeout=10)
+                    if self.monitoring_thread.is_alive():
+                        bt.logging.warning("Monitoring thread did not exit within timeout period")
                 except Exception as e:
-                    logger.warning(f"Error unsubscribing from blockchain: {e}")
-                self.subscription = None
+                    bt.logging.error(f"Error waiting for monitoring thread: {e}")
             
-            # Wait for monitoring thread to exit
-            if hasattr(self, 'monitoring_thread') and self.monitoring_thread.is_alive():
-                self.monitoring_thread.join(timeout=5)
+            # Save the last processed block
+            if self._last_processed_block:
+                asyncio.run(self._save_last_processed_block())
             
+            # Update status
             self.is_monitoring = False
-            logger.info("Transaction monitoring stopped")
+            self._status = "STOPPED"
+            bt.logging.info("Transaction monitoring stopped")
             return True
         except Exception as e:
-            logger.error(f"Error stopping transaction monitoring: {e}")
+            bt.logging.error(f"Error stopping transaction monitoring: {e}")
+            self._status = "ERROR"
+            self._last_error = str(e)
+            import traceback
+            bt.logging.error(traceback.format_exc())
             return False
     
-    def _monitoring_thread_loop(self):
-        """
-        Main monitoring thread loop.
-        
-        This method runs in a separate thread and sets up a subscription
-        to the blockchain to receive notifications for new blocks.
-        """
-        self.is_monitoring = True
+    def _subscribe_to_blocks(self):
+        """Subscribe to new block headers with proper error handling for API differences."""
         try:
-            logger.info("Starting blockchain monitoring thread")
+            bt.logging.info("Attempting to subscribe to new block headers")
             
-            # Subscribe to block headers
-            logger.debug("Setting up block header subscription")
-            self.subscription = self.substrate.subscribe_block_headers(
-                self._block_header_handler
-            )
-            logger.info("Successfully subscribed to block headers")
-            
-            # Keep thread alive until should_exit is set
-            while not self.should_exit:
-                time.sleep(1)
-                
-            logger.info("Blockchain monitoring thread exiting")
-        except Exception as e:
-            logger.error(f"Error in blockchain monitoring thread: {e}")
-            logger.exception("Monitoring thread error details:")
-        finally:
-            # Ensure subscription is unsubscribed
-            if self.subscription:
-                try:
-                    logger.debug("Unsubscribing from block headers")
-                    self.subscription.unsubscribe()
-                    logger.debug("Successfully unsubscribed from block headers")
-                except Exception as e:
-                    logger.error(f"Error unsubscribing from block headers: {e}")
-                self.subscription = None
-            
-            self.is_monitoring = False
-    
-    def _block_header_handler(self, block_header, update_nr, subscription_id):
-        """
-        Handler for new block headers from subscription.
-        
-        Args:
-            block_header: The block header
-            update_nr: Update number
-            subscription_id: Subscription ID
-        """
-        try:
-            # Extract block number
-            block_num_val = block_header.get("header", {}).get("number")
-            block_num = int(block_num_val, 16) if isinstance(block_num_val, str) else block_num_val
-            
-            if self.verbose:
-                logger.info(f"Block header received: {block_num}")
+            if hasattr(self.substrate, 'subscribe_block_headers'):
+                # Newer API version
+                self.substrate.subscribe_block_headers(
+                    callback=self._block_header_handler
+                )
+                bt.logging.info("Successfully subscribed to block headers using subscribe_block_headers")
             else:
-                logger.debug(f"Block header received: {block_num}")
+                # Try the older method if available
+                if hasattr(self.substrate, 'subscribe_new_heads'):
+                    self.substrate.subscribe_new_heads(
+                        callback=self._block_header_handler
+                    )
+                    bt.logging.info("Successfully subscribed to block headers using subscribe_new_heads")
+                else:
+                    # As a last resort, try to see if there's any similar method
+                    for method_name in dir(self.substrate):
+                        if 'subscribe' in method_name.lower() and ('block' in method_name.lower() or 'head' in method_name.lower()):
+                            bt.logging.info(f"Trying alternative subscription method: {method_name}")
+                            subscription_method = getattr(self.substrate, method_name)
+                            if callable(subscription_method):
+                                try:
+                                    subscription_method(callback=self._block_header_handler)
+                                    bt.logging.info(f"Successfully subscribed using alternative method: {method_name}")
+                                    return True
+                                except Exception as e:
+                                    bt.logging.warning(f"Failed to use alternative method {method_name}: {e}")
+                    
+                    bt.logging.error("No suitable block subscription method found in substrate interface")
+                    return False
             
-            # Get block hash
-            block_hash = self.substrate.get_block_hash(block_num)
-            if not block_hash:
-                logger.error(f"Could not compute block hash for block number {block_num}")
+            return True
+        except Exception as e:
+            bt.logging.error(f"Error subscribing to new blocks: {e}")
+            return False
+            
+    def _monitoring_thread_loop(self):
+        """Main loop for the monitoring thread."""
+        try:
+            if not self._is_initialized:
+                bt.logging.info("Initializing TransactionMonitor before starting monitoring")
+                asyncio.run(self.initialize())
+            
+            # Ensure substrate connection is established
+            if not self.substrate:
+                bt.logging.info("No substrate connection, initializing...")
+                self._initialize_substrate()
+            
+            if not self.substrate:
+                bt.logging.error("Failed to establish substrate connection")
+                self._status = "ERROR"
                 return
             
-            logger.debug(f"Processing block {block_num} (hash: {block_hash})")
+            bt.logging.info("Starting transaction monitoring loop")
+            self.is_monitoring = True
+            self._status = "RUNNING"
             
-            # Process block
-            self._process_block(block_num, block_hash)
+            while not self.should_exit:
+                try:
+                    self._process_next_block()
+                except Exception as e:
+                    bt.logging.error(f"Error in monitoring loop: {e}")
+                    bt.logging.error(traceback.format_exc())
+                    time.sleep(1)  # Avoid tight loop on repeated errors
             
-            logger.debug(f"Finished processing block {block_num}")
+            bt.logging.info("Transaction monitoring stopped")
+            self.is_monitoring = False
+            self._status = "STOPPED"
         except Exception as e:
-            logger.error(f"Error handling block header: {e}")
-            logger.exception(f"Block header handler error details for block {block_num if 'block_num' in locals() else 'unknown'}:")
+            error_msg = f"Error in transaction monitoring thread: {e}"
+            bt.logging.error(error_msg)
+            bt.logging.error(traceback.format_exc())
+            self._status = "ERROR"
+            self._last_error = error_msg
+            self.is_monitoring = False
+    
+    def _block_header_handler(self, obj, update_nr, subscription_id):
+        """Handle a new block header notification."""
+        try:
+            # Make block reception more visible in logs with clear border
+            bt.logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            bt.logging.info("🔔 NEW BLOCK RECEIVED 🔔")
+            
+            if self.verbose:
+                # Only log the full JSON in verbose mode
+                bt.logging.debug("Block header received: %s", json.dumps(obj, indent=2, default=str))
+            
+            # Extract block number from header
+            try:
+                block_num_val = obj.get("header", {}).get("number")
+                block_num = int(block_num_val, 16) if isinstance(block_num_val, str) else block_num_val
+                bt.logging.info(f"🔢 BLOCK NUMBER: {block_num}")
+                
+                # Get block hash
+                block_hash = self.substrate.get_block_hash(block_num)
+                if not block_hash:
+                    bt.logging.error("Could not compute block hash for block number %s", block_num)
+                    return
+                bt.logging.info(f"🧩 Block hash: {block_hash}")
+            except Exception as e:
+                bt.logging.error("Error computing block hash from header: %s", e)
+                return
+            
+            # Log timestamps
+            current_time = datetime.now(timezone.utc)
+            bt.logging.info(f"🕒 Current time: {current_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} UTC")
+            
+            # Process this block
+            start_time = time.time()
+            self._process_block(block_num, block_hash)
+            processing_time = time.time() - start_time
+            
+            # Log success and update status
+            self._last_successful_block = block_num
+            bt.logging.info(f"✅ Finished processing block #{block_num} in {processing_time:.2f} seconds")
+            bt.logging.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        except Exception as e:
+            bt.logging.error(f"Error processing block header content: {e}")
+            bt.logging.error(traceback.format_exc())
+    
+    def _extract_timestamp(self, extrinsics):
+        """Extract timestamp from block extrinsics if available."""
+        try:
+            for extrinsic in extrinsics:
+                if isinstance(extrinsic, dict) and 'call' in extrinsic and 'module' in extrinsic['call']:
+                    if extrinsic['call']['module'] == 'Timestamp' and 'call' in extrinsic['call'] and extrinsic['call']['call'] == 'set':
+                        if 'args' in extrinsic['call'] and 'now' in extrinsic['call']['args']:
+                            timestamp = int(extrinsic['call']['args']['now'])
+                            return datetime.fromtimestamp(timestamp // 1000, tz=timezone.utc)
+            return None
+        except Exception as e:
+            bt.logging.debug(f"Error extracting timestamp: {e}")
+            return None
     
     def _process_block(self, block_num: int, block_hash: str):
-        """
-        Process a block for transactions and events.
-        
-        Args:
-            block_num: Block number
-            block_hash: Block hash
-        """
+        """Process a block for stake-related events."""
         try:
-            # Get block timestamp
+            # Get block data
+            block = self.substrate.get_block(block_hash)
+            if not block:
+                bt.logging.error(f"Could not get block data for block {block_num}")
+                return
+            
+            # Get timestamp from extrinsics
+            block_timestamp = self._extract_timestamp(block.get('extrinsics', []))
+            if block_timestamp:
+                bt.logging.debug(f"Block {block_num} timestamp: {block_timestamp}")
+            
+            # Process extrinsics first
+            self._process_extrinsics(block_num, block.get('extrinsics', []))
+            
+            # Get and process events
             try:
-                logger.debug(f"Getting timestamp for block {block_num}")
-                timestamp = self.substrate.query(
-                    module='Timestamp',
-                    storage_function='Now',
-                    block_hash=block_hash
-                ).value
-                block_time = datetime.fromtimestamp(timestamp / 1000, timezone.utc)
-                logger.debug(f"Block {block_num} timestamp: {block_time.isoformat()}")
-            except Exception as e:
-                logger.warning(f"Error getting block timestamp: {e}")
-                block_time = datetime.now(timezone.utc)
-            
-            # Get extrinsics
-            logger.debug(f"Getting extrinsics for block {block_num}")
-            extrinsics = self._get_extrinsics(block_hash)
-            logger.debug(f"Found {len(extrinsics) if extrinsics else 0} extrinsics in block {block_num}")
-            
-            # Process extrinsics
-            if extrinsics:
-                logger.debug(f"Processing {len(extrinsics)} extrinsics for block {block_num}")
-                self._process_extrinsics(block_num, extrinsics)
-            
-            # Get events
-            try:
-                logger.debug(f"Getting events for block {block_num}")
-                events_decoded = self.substrate.query(
-                    module="System",
-                    storage_function="Events",
-                    block_hash=block_hash
-                )
+                events = self.substrate.query("System", "Events", block_hash=block_hash)
+                if not events:
+                    bt.logging.error(f"Could not get events for block {block_num}")
+                    return
                 
-                # Process events
-                if events_decoded:
-                    logger.debug(f"Processing events for block {block_num}")
-                    self._process_events(block_num, events_decoded)
-                else:
-                    logger.debug(f"No events found for block {block_num}")
+                # Process events and match with pending calls
+                self._process_events(block_num, events)
             except Exception as e:
-                logger.error(f"Error querying events for block {block_hash}: {e}")
+                bt.logging.error(f"Error querying events for block {block_hash}: {e}")
+                bt.logging.error(traceback.format_exc())
             
-            # Purge old calls
+            # Purge old pending calls
             self._purge_old_calls(block_num)
             
-            # Update last processed block
-            self.last_block = block_num
-            
-            if self.verbose or (block_num % 100 == 0):  # Log every 100 blocks if not verbose
-                logger.info(f"Processed block {block_num}")
-            else:
-                logger.debug(f"Processed block {block_num}")
-                
         except Exception as e:
-            logger.error(f"Error processing block {block_num}: {e}")
-            logger.exception(f"Block processing error details for block {block_num}:")
-            # Still update last processed block to avoid getting stuck
-            self.last_block = block_num
+            bt.logging.error(f"Error processing block {block_num}: {e}")
+            bt.logging.error(traceback.format_exc())
+    
+    def _process_events(self, block_num, events_decoded):
+        """Process events in a block and match them with pending extrinsic calls."""
+        try:
+            event_values = events_decoded.value if hasattr(events_decoded, 'value') else events_decoded
+            stake_events_found = 0
+            
+            for idx, event_record in enumerate(event_values):
+                try:
+                    if self.verbose:
+                        bt.logging.info(f"Raw event record {idx}: {str(event_record)}")
+                    
+                    # Extract event information - handle both dict and object-style access
+                    if hasattr(event_record, 'get'):  # Dictionary-like object
+                        event = event_record.get('event', {})
+                        if hasattr(event, 'get'):
+                            module_id = event.get('module_id')
+                            event_id = event.get('event_id')
+                            attributes = event.get('attributes')
+                        else:
+                            # Handle case where event is an object
+                            module_id = event.module_id if hasattr(event, 'module_id') else None
+                            event_id = event.event_id if hasattr(event, 'event_id') else None
+                            attributes = event.attributes if hasattr(event, 'attributes') else None
+                    else:  # Direct attribute access
+                        if hasattr(event_record, 'event'):
+                            event = event_record.event
+                            module_id = event.module_id if hasattr(event, 'module_id') else None
+                            event_id = event.event_id if hasattr(event, 'event_id') else None
+                            attributes = event.attributes if hasattr(event, 'attributes') else None
+                    
+                    # Process SubtensorModule stake events
+                    if module_id == 'SubtensorModule' and event_id in ['StakeAdded', 'StakeRemoved', 'StakeTransferred']:
+                        try:
+                            self._handle_stake_event(module_id, event_id, attributes, idx, block_num)
+                            stake_events_found += 1
+                        except Exception as e:
+                            bt.logging.error(f"Error handling stake event in block {block_num}: {e}")
+                            bt.logging.error(traceback.format_exc())
+                except Exception as e:
+                    bt.logging.error(f"Error processing event {idx} in block {block_num}: {e}")
+                    bt.logging.error(traceback.format_exc())
+                    continue
+            
+            bt.logging.info(f"Found {stake_events_found} stake-related events in block {block_num}")
+        except Exception as e:
+            bt.logging.error(f"Error processing events for block {block_num}: {e}")
+            bt.logging.error(traceback.format_exc())
     
     def _get_extrinsics(self, block_hash):
         """
@@ -482,380 +548,851 @@ class TransactionMonitor:
             block = self.substrate.get_block(block_hash=block_hash)
             return block.get('extrinsics', [])
         except Exception as e:
-            logger.error(f"Error getting extrinsics for block {block_hash}: {e}")
+            bt.logging.error(f"Error getting extrinsics for block {block_hash}: {e}")
             return []
     
     def _process_extrinsics(self, block_num, extrinsics):
-        """Process extrinsics to detect stake-related transactions."""
-        if not extrinsics:
-            return 0
-            
-        logger.debug(f"Processing {len(extrinsics)} extrinsics in block {block_num}")
-        count = 0
-        
-        # Process each extrinsic
-        for extrinsic in extrinsics:
-            try:
-                # Process extrinsic here
-                if not extrinsic or not hasattr(extrinsic, 'call'):
-                    continue
-                    
-                # Get call data
-                call = extrinsic.call
-                if not call:
-                    continue
-                    
-                # Check if it's a transaction we care about
-                call_module = str(call.get('call_module', ''))
-                call_function = str(call.get('call_function', ''))
-                
-                logger.debug(f"Checking extrinsic: module={call_module}, function={call_function}")
-                
-                # Handle different transaction types
-                if call_module == 'SubtensorModule':
-                    if call_function == 'add_stake':
-                        count += self._handle_add_stake(block_num, extrinsic)
-                    elif call_function == 'remove_stake':
-                        count += self._handle_remove_stake(block_num, extrinsic)
-                    elif call_function == 'transfer_stake':
-                        count += self._handle_transfer_stake(block_num, extrinsic)
-                    elif call_function in ['burn', 'burn_stake']:
-                        count += self._handle_burn_stake(block_num, extrinsic)
-                        
-            except Exception as e:
-                logger.error(f"Error processing extrinsic in block {block_num}: {e}")
-                
-        if count > 0:
-            logger.info(f"Processed {count} stake-related transactions in block {block_num}")
-        
-        return count
-                
-    def _store_transaction(self, transaction_data):
-        """Store a transaction in the database and memory."""
-        try:
-            # Log transaction details
-            tx_type = transaction_data.get('transaction_type', 'unknown')
-            hotkey = transaction_data.get('hotkey', 'unknown')
-            amount = transaction_data.get('amount', 0)
-            block_num = transaction_data.get('block_number', 0)
-            
-            logger.info(f"Captured transaction: type={tx_type}, hotkey={hotkey[:10]}..., amount={amount:.4f} TAO, block={block_num}")
-            
-            # Store in database (async)
-            asyncio.run_coroutine_threadsafe(
-                self._store_transaction_async(transaction_data),
-                self._async_loop
-            )
-            
-            # Store in memory cache if needed
-            tx_hash = transaction_data.get('tx_hash')
-            if tx_hash:
-                self._transaction_cache[tx_hash] = transaction_data
-                
-            return True
-        except Exception as e:
-            logger.error(f"Error storing transaction: {e}")
-            return False
-
-    async def _store_transaction_async(self, transaction_data):
-        """Asynchronously store a transaction in the database."""
-        try:
-            # Insert transaction into database
-            await self.db_manager.execute_query("""
-                INSERT INTO stake_transactions (
-                    block_number, timestamp, transaction_type, hotkey, coldkey, 
-                    amount, tx_hash, flow_type, transaction_success
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                transaction_data.get('block_number'),
-                transaction_data.get('timestamp'),
-                transaction_data.get('transaction_type'),
-                transaction_data.get('hotkey', 'unknown'),
-                transaction_data.get('coldkey', 'unknown'),
-                transaction_data.get('amount', 0),
-                transaction_data.get('tx_hash'),
-                transaction_data.get('flow_type', NEUTRAL),
-                transaction_data.get('transaction_success', True)
-            ))
-            
-            logger.debug(f"Successfully stored transaction {transaction_data.get('tx_hash', 'unknown')} in database")
-            
-            # Notify stake change handlers
-            if hasattr(self, 'stake_change_handlers') and self.stake_change_handlers:
-                for handler in self.stake_change_handlers:
-                    try:
-                        await handler(
-                            transaction_data.get('hotkey', 'unknown'),
-                            transaction_data.get('coldkey', 'unknown'),
-                            transaction_data.get('amount', 0),
-                            transaction_data.get('transaction_type'),
-                            transaction_data.get('flow_type', NEUTRAL),
-                            transaction_data.get('timestamp')
-                        )
-                        logger.debug(f"Notified stake change handler for {transaction_data.get('transaction_type')}")
-                    except Exception as e:
-                        logger.error(f"Error in stake change handler: {e}")
-                        
-        except Exception as e:
-            logger.error(f"Error storing transaction in database: {e}")
-    
-    def _process_events(self, block_num, events_decoded):
         """
-        Process events in a block and attempt to match them with pending extrinsic calls.
+        Process extrinsics in a block to record pending stake-related calls.
         
         Args:
             block_num: Block number
-            events_decoded: Decoded events
+            extrinsics: List of extrinsics
+            
+        Returns:
+            int: Number of filtered extrinsics for the target subnet
         """
-        matched_calls = []
-        for idx, event_record in enumerate(events_decoded.value):
-            try:
-                if self.verbose:
-                    logger.info(f"Raw event record {idx}: {json.dumps(event_record, indent=2, default=str)}")
-                
-                event = event_record.get('event', {})
-                module_id = event.get('module_id')
-                event_id = event.get('event_id')
-                attributes = event.get('attributes')
-                
-                if module_id != 'SubtensorModule':
-                    continue
-                
-                # Comprehensive subnet checking in all event attributes
-                subnet_involved = False
+        try:
+            stake_calls_found = 0
+            subnet_filtered_count = 0
+            bt.logging.info(f"Processing {len(extrinsics)} extrinsics in block {block_num}")
+            
+            for ext_idx, ext in enumerate(extrinsics):
+                try:
+                    # Use ext.value if available; otherwise assume ext is a dict.
+                    ext_dict = ext.value if hasattr(ext, 'value') else ext
                     
-                event_hotkey = None
-                event_destination_hotkey = None
-                event_origin_netuid = None
-                event_destination_netuid = None
-                event_amount = None
-                event_coldkey = None
-                event_destination_coldkey = None
-                
-                # Extract all attributes for subnet checking
-                if isinstance(attributes, (list, tuple)):
-                    # Parse standard attributes first
-                    if event_id in ['StakeAdded', 'StakeRemoved']:
-                        # Expected: [coldkey, hotkey, amount, new_total, netuid]
-                        if len(attributes) >= 5:
-                            event_coldkey = attributes[0]
-                            event_hotkey = attributes[1]
-                            try:
-                                event_amount = float(attributes[2]) / 1e9
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event amount: {conv_e}")
-                            try:
-                                event_origin_netuid = int(attributes[4])
-                                if event_origin_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event netuid: {conv_e}")
-                    elif event_id == 'StakeMoved':
-                        # Expected: [origin_coldkey, origin_hotkey, origin_netuid, destination_hotkey, destination_netuid, amount]
-                        if len(attributes) >= 6:
-                            event_coldkey = attributes[0]
-                            event_hotkey = attributes[1]  # origin_hotkey
-                            event_destination_hotkey = attributes[3]
-                            try:
-                                event_amount = float(attributes[5]) / 1e9
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event amount: {conv_e}")
-                            try:
-                                event_origin_netuid = int(attributes[2])
-                                if event_origin_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event netuid: {conv_e}")
-                            try:
-                                event_destination_netuid = int(attributes[4])
-                                if event_destination_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event destination netuid: {conv_e}")
-                    elif event_id == 'StakeTransferred':
-                        # Expected: [origin_coldkey, destination_coldkey, hotkey, origin_netuid, destination_netuid, amount]
-                        if len(attributes) >= 6:
-                            event_coldkey = attributes[0]
-                            event_destination_coldkey = attributes[1]
-                            event_hotkey = attributes[2]
-                            try:
-                                event_amount = float(attributes[5]) / 1e9
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event amount: {conv_e}")
-                            try:
-                                event_origin_netuid = int(attributes[3])
-                                if event_origin_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event netuid: {conv_e}")
-                            try:
-                                event_destination_netuid = int(attributes[4])
-                                if event_destination_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event destination netuid: {conv_e}")
-                    elif event_id == 'StakeSwapped':
-                        # Expected: [coldkey, hotkey, origin_netuid, destination_netuid, amount]
-                        if len(attributes) >= 5:
-                            event_coldkey = attributes[0]
-                            event_hotkey = attributes[1]
-                            try:
-                                event_amount = float(attributes[4]) / 1e9
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event amount: {conv_e}")
-                            try:
-                                event_origin_netuid = int(attributes[2])
-                                if event_origin_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event netuid: {conv_e}")
-                            try:
-                                event_destination_netuid = int(attributes[3])
-                                if event_destination_netuid == self.subnet_id:
-                                    subnet_involved = True
-                            except Exception as conv_e:
-                                logger.error(f"Error converting event destination netuid: {conv_e}")
-                    else:
-                        if self.verbose:
-                            logger.info(f"Event {idx} with ID {event_id} not processed with specific logic")
-                    
-                    # Deep check all attributes for our subnet ID
-                    for i, attr in enumerate(attributes):
-                        if isinstance(attr, (int, str)) and str(attr) == str(self.subnet_id):
-                            subnet_involved = True
-                            logger.info(f"Found subnet {self.subnet_id} in event attribute at position {i}")
-                            break
-                
-                # Skip if not related to our subnet
-                if not subnet_involved and self.subnet_id is not None:
-                    # Last resort: check raw event data
-                    raw_event_str = str(event)
-                    if f"netuid': {self.subnet_id}" in raw_event_str or f"netuid': '{self.subnet_id}'" in raw_event_str:
-                        subnet_involved = True
-                        logger.info(f"Found subnet {self.subnet_id} in raw event data")
-                
-                if not subnet_involved and self.subnet_id is not None:
                     if self.verbose:
-                        logger.debug(f"Skipping event not involving our subnet {self.subnet_id}")
+                        bt.logging.info(f"Raw extrinsic data from block {block_num}, idx {ext_idx}: {json.dumps(ext_dict, indent=2, default=str)}")
+                    
+                    # Extract the coldkey from the extrinsic's "address" field.
+                    coldkey = ext_dict.get('address')
+                    
+                    call_info = ext_dict.get('call', {})
+                    call_module = call_info.get('call_module')
+                    call_function = call_info.get('call_function')
+                    
+                    # Only process stake-related calls from SubtensorModule
+                    if call_module == 'SubtensorModule' and call_function in [
+                        'add_stake', 'remove_stake', 'add_stake_limit', 'remove_stake_limit', 'add_stake_batch', 'transfer_stake'
+                    ]:
+                        stake_calls_found += 1
+                        if self._process_stake_call(ext_idx, block_num, call_info, coldkey, call_function):
+                            subnet_filtered_count += 1
+                except Exception as e:
+                    bt.logging.error(f"Error processing extrinsic {ext_idx} in block {block_num}: {e}")
+                    import traceback
+                    bt.logging.error(traceback.format_exc())
                     continue
-                
-                # Log event details
-                logger.info(
-                    f"Event {idx} in block {block_num}: {event_id} - "
-                    f"Hotkey: {event_hotkey}, Amount: {event_amount}, "
-                    f"Origin Netuid: {event_origin_netuid}, Destination Netuid: {event_destination_netuid}"
-                )
-                
-                # Map event types to call functions
-                mapping = {
-                    'add_stake': 'StakeAdded',
-                    'add_stake_limit': 'StakeAdded',
-                    'remove_stake': 'StakeRemoved',
-                    'remove_stake_limit': 'StakeRemoved',
-                    'move_stake': 'StakeMoved',
-                    'transfer_stake': 'StakeTransferred',
-                    'swap_stake': 'StakeSwapped'
-                }
-                
-                # Try to match event with pending calls
-                for call_id, call_data in list(self.pending_calls.items()):
-                    # Check if expected event matches actual event
-                    expected_event_id = mapping.get(call_data['call_function'])
-                    if expected_event_id != event_id:
-                        continue
-                    
-                    # Match hotkey
-                    if call_data['hotkey'] != event_hotkey:
-                        continue
-                    
-                    # Match netuid
-                    if call_data['call_function'] in ['move_stake', 'transfer_stake', 'swap_stake']:
-                        if call_data.get('origin_netuid') is None or int(call_data.get('origin_netuid')) != event_origin_netuid:
-                            continue
-                    else:
-                        if call_data.get('netuid') is None or int(call_data.get('netuid')) != event_origin_netuid:
-                            continue
-                    
-                    # Calculate final amount and fee
-                    if call_data['call_function'] in ['add_stake', 'add_stake_limit', 'move_stake', 'transfer_stake', 'swap_stake']:
-                        final_amount = event_amount
-                    else:
-                        final_amount = call_data['call_amount']
-                    
-                    call_data['final_amount'] = final_amount
-                    fee = None
-                    if call_data['call_function'] in ['add_stake', 'add_stake_limit', 'move_stake', 'transfer_stake', 'swap_stake'] and call_data['call_amount'] is not None and event_amount is not None:
-                        fee = call_data['call_amount'] - event_amount
-                    call_data['fee'] = fee
-                    
-                    # Log match details
-                    logger.info(
-                        f"Validated pending call {call_id} (from block {call_data['block_number']}) with event {event_id} in block {block_num}: "
-                        f"Coldkey: {call_data['coldkey']}, Hotkey: {event_hotkey}, "
-                        f"Final Amount: {final_amount:.9f}"
-                        f"{', Fee: ' + str(fee) if fee is not None else ''}, "
-                        f"Origin Netuid: {event_origin_netuid}"
-                    )
-                    
-                    # Store the transaction
-                    self._store_transaction(call_data)
-                    
-                    # Remove from pending calls
-                    del self.pending_calls[call_id]
-                    matched_calls.append(call_id)
-            except Exception as e:
-                logger.error(f"Error processing event {idx} in block {block_num}: {e}")
+            
+            bt.logging.info(f"Found {stake_calls_found} stake-related extrinsics in block {block_num}, {subnet_filtered_count} for subnet {self.subnet_id}")
+            return subnet_filtered_count
+        except Exception as e:
+            bt.logging.error(f"Error processing extrinsics for block {block_num}: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
+            return 0
+    
+    def _process_stake_call(self, ext_idx, block_num, call_info, coldkey, call_function):
+        """Process a single stake-related call."""
+        try:
+            # Extract call arguments
+            args = call_info.get('args', {})
+            
+            # Map call functions to transaction types
+            call_type_map = {
+                'add_stake': ADD_STAKE,
+                'remove_stake': REMOVE_STAKE,
+                'transfer_stake': TRANSFER_STAKE,
+                'move_stake': MOVE_STAKE,
+                'swap_stake': SWAP_STAKE,
+                'add_stake_limit': ADD_STAKE,      # Maps to same type as non-limit version
+                'remove_stake_limit': REMOVE_STAKE, # Maps to same type as non-limit version
+                'swap_stake_limit': SWAP_STAKE      # Maps to same type as non-limit version
+            }
+            
+            transaction_type = call_type_map.get(call_function, UNKNOWN)
+            if transaction_type == UNKNOWN:
+                bt.logging.debug(f"Ignoring unknown call function: {call_function}")
+                return False
+            
+            # Extract common parameters
+            hotkey = args.get('hotkey')
+            netuid = args.get('netuid')
+            
+            # Extract amount based on call type
+            amount = None
+            if call_function in ['add_stake', 'add_stake_limit']:
+                amount = args.get('amount_staked')
+            elif call_function in ['remove_stake', 'remove_stake_limit']:
+                amount = args.get('amount_unstaked')
+            elif call_function in ['swap_stake', 'swap_stake_limit']:
+                amount = args.get('alpha_amount')
+            else:
+                amount = args.get('amount')
+            
+            # Convert amount to float if present
+            if amount is not None:
+                try:
+                    amount = float(amount) / 1e9
+                except (TypeError, ValueError) as e:
+                    bt.logging.error(f"Error converting amount {amount}: {e}")
+                    amount = None
+            
+            # Extract subnet information for stake movements
+            origin_netuid = None
+            destination_netuid = None
+            if call_function in ['transfer_stake', 'move_stake', 'swap_stake', 'swap_stake_limit']:
+                origin_netuid = args.get('origin_netuid', netuid)
+                destination_netuid = args.get('destination_netuid', netuid)
+            
+            # For limit orders, extract limit price and partial flag
+            if call_function in ['add_stake_limit', 'remove_stake_limit', 'swap_stake_limit']:
+                limit_price = args.get('limit_price')
+                allow_partial = args.get('allow_partial', False)
+                bt.logging.debug(f"Limit order details - price: {limit_price}, allow_partial: {allow_partial}")
+            
+            # Store pending call
+            call_data = {
+                'call_function': call_function,
+                'transaction_type': transaction_type,
+                'hotkey': hotkey,
+                'coldkey': coldkey,
+                'amount': amount,
+                'netuid': netuid,
+                'origin_netuid': origin_netuid,
+                'destination_netuid': destination_netuid,
+                'timestamp': int(time.time())
+            }
+            
+            # Add to pending calls
+            if block_num not in self._pending_calls:
+                self._pending_calls[block_num] = []
+            self._pending_calls[block_num].append(call_data)
+            
+            bt.logging.debug(
+                f"Recorded pending {call_function} call in block {block_num}: "
+                f"hotkey={hotkey}, amount={amount}, "
+                f"netuid={netuid}, origin_netuid={origin_netuid}, destination_netuid={destination_netuid}"
+            )
+            
+            return True
+        except Exception as e:
+            bt.logging.error(f"Error processing stake call {ext_idx} in block {block_num}: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
+    
+    def _determine_flow_type(self, event_id: str, origin_netuid: Optional[int] = None, destination_netuid: Optional[int] = None) -> str:
+        """
+        Determine the flow type based on event ID and subnet information.
         
-        # Log matches
-        if matched_calls:
-            logger.info(f"Matched {len(matched_calls)} calls with events in block {block_num}")
+        Args:
+            event_id: The event ID (e.g., StakeAdded, StakeRemoved, etc.)
+            origin_netuid: The source subnet ID for stake movements
+            destination_netuid: The destination subnet ID for stake movements
+            
+        Returns:
+            str: The flow type (INFLOW, OUTFLOW, NEUTRAL, or EMISSION)
+        """
+        # Simple cases first
+        if event_id == 'StakeAdded':
+            return INFLOW
+        elif event_id == 'StakeRemoved':
+            return OUTFLOW
+        elif event_id == 'EmissionReceived':
+            return EMISSION
+        
+        # For stake movements, we need to consider the subnet IDs
+        if event_id in ['StakeTransferred', 'StakeMoved', 'StakeSwapped']:
+            # If we don't have subnet info, default to NEUTRAL for transfers
+            if origin_netuid is None or destination_netuid is None:
+                return NEUTRAL if event_id == 'StakeTransferred' else UNKNOWN
+            
+            # If this is our monitored subnet
+            if origin_netuid == self.subnet_id:
+                return OUTFLOW
+            elif destination_netuid == self.subnet_id:
+                return INFLOW
+            else:
+                # If neither subnet is ours, treat transfers as neutral and others as unknown
+                return NEUTRAL if event_id == 'StakeTransferred' else UNKNOWN
+        
+        return UNKNOWN
+
+    def _handle_stake_event(self, module_id, event_id, attributes, idx, block_num):
+        """Handle a stake-related event."""
+        try:
+            # Extract event information
+            event_hotkey = None
+            event_netuid = None
+            event_amount = None
+            origin_netuid = None
+            destination_netuid = None
+            
+            # Handle different attribute formats
+            if isinstance(attributes, dict):
+                # Try dictionary access
+                event_hotkey = attributes.get('hotkey')
+                event_amount = attributes.get('amount')
+                try:
+                    if event_amount is not None:
+                        event_amount = float(event_amount) / 1e9
+                except:
+                    bt.logging.error(f"Error converting amount from dict: {event_amount}")
+                
+                # Get subnet information
+                event_netuid = attributes.get('netuid')
+                origin_netuid = attributes.get('origin_netuid', event_netuid)
+                destination_netuid = attributes.get('destination_netuid', event_netuid)
+                
+            elif isinstance(attributes, (list, tuple)):
+                try:
+                    # Extract basic info first
+                    if len(attributes) > 1:
+                        event_hotkey = str(attributes[1])
+                    if len(attributes) > 2:
+                        try:
+                            event_amount = float(attributes[2]) / 1e9
+                        except Exception as conv_e:
+                            bt.logging.error(f"Error converting event amount: {conv_e}")
+                    
+                    # Extract subnet information based on event type
+                    if event_id in ['StakeTransferred', 'StakeMoved', 'StakeSwapped']:
+                        # For transfer/move/swap events, subnet info is in different positions
+                        if len(attributes) > 5:  # Standard transfer
+                            origin_netuid = int(attributes[4]) if attributes[4] is not None else None
+                            destination_netuid = int(attributes[5]) if attributes[5] is not None else None
+                        elif len(attributes) > 4:  # Fallback to basic netuid
+                            event_netuid = int(attributes[4])
+                            origin_netuid = event_netuid
+                            destination_netuid = event_netuid
+                    else:
+                        # For regular stake events
+                        if len(attributes) > 4:
+                            event_netuid = int(attributes[4])
+                            origin_netuid = event_netuid
+                            destination_netuid = event_netuid
+                            
+                except Exception as e:
+                    bt.logging.error(f"Error accessing attributes list/tuple: {e}")
+            else:
+                # Handle custom attribute objects
+                try:
+                    attr_values = (hasattr(attributes, 'value') and attributes.value) or \
+                                (hasattr(attributes, '__iter__') and list(attributes)) or []
+                    
+                    # Process the values
+                    if len(attr_values) > 1:
+                        event_hotkey = str(attr_values[1])
+                    if len(attr_values) > 2:
+                        try:
+                            event_amount = float(attr_values[2]) / 1e9
+                        except:
+                            pass
+                    
+                    # Extract subnet information
+                    if event_id in ['StakeTransferred', 'StakeMoved', 'StakeSwapped'] and len(attr_values) > 5:
+                        try:
+                            origin_netuid = int(attr_values[4])
+                            destination_netuid = int(attr_values[5])
+                        except:
+                            pass
+                    elif len(attr_values) > 4:
+                        try:
+                            event_netuid = int(attr_values[4])
+                            origin_netuid = event_netuid
+                            destination_netuid = event_netuid
+                        except:
+                            pass
+                        
+                except Exception as e:
+                    bt.logging.error(f"Error handling custom attributes object: {e}")
+                    bt.logging.info(f"Event {idx} attributes not in expected format: {attributes}")
+            
+            # Determine transaction and flow types
+            transaction_type = self._get_transaction_type(event_id)
+            flow_type = self._determine_flow_type(event_id, origin_netuid, destination_netuid)
+            
+            # Log the decision process for debugging
+            bt.logging.debug(
+                f"Stake event analysis: event_id={event_id}, "
+                f"origin_netuid={origin_netuid}, destination_netuid={destination_netuid}, "
+                f"transaction_type={transaction_type}, flow_type={flow_type}"
+            )
+            
+            # Create transaction data
+            transaction_data = {
+                'transaction_id': f"{block_num}-{idx}",
+                'block_number': block_num,
+                'transaction_type': transaction_type,
+                'flow_type': flow_type,
+                'hotkey': event_hotkey,
+                'coldkey': None,  # Will be updated from pending calls if matched
+                'amount': event_amount,
+                'netuid': destination_netuid if flow_type == INFLOW else origin_netuid,
+                'origin_netuid': origin_netuid,
+                'destination_netuid': destination_netuid,
+                'timestamp': int(time.time()),
+                'validated': True
+            }
+            
+            # Only store transactions that are relevant to our subnet
+            if flow_type != UNKNOWN and (origin_netuid == self.subnet_id or destination_netuid == self.subnet_id):
+                asyncio.run(self._store_transaction(transaction_data))
+            else:
+                bt.logging.debug(f"Skipping irrelevant transaction for subnet {self.subnet_id}")
+            
+        except Exception as e:
+            bt.logging.error(f"Error handling stake event: {e}")
+            bt.logging.error(traceback.format_exc())
+
+    def _get_transaction_type(self, event_id):
+        """Get transaction type from event ID."""
+        event_type_map = {
+            'StakeAdded': ADD_STAKE,
+            'StakeRemoved': REMOVE_STAKE,
+            'StakeTransferred': TRANSFER_STAKE,
+            'StakeMoved': MOVE_STAKE,
+            'StakeSwapped': SWAP_STAKE,
+            'StakeBurned': BURN_STAKE,
+            'EmissionReceived': EMISSION_REWARD
+        }
+        return event_type_map.get(event_id, UNKNOWN)
+    
+    async def _store_transaction(self, transaction_data):
+        """Store a transaction in the database."""
+        try:
+            # Sanitize the data
+            sanitized_data = self._sanitize_transaction_data(transaction_data)
+            
+            # Check if transaction already exists
+            existing_tx = await self.db_manager.fetch_one(
+                """
+                SELECT id FROM transactions 
+                WHERE transaction_id = ? AND block_number = ? AND amount = ?
+                """,
+                (
+                    sanitized_data['transaction_id'],
+                    sanitized_data['block_number'],
+                    sanitized_data['amount']
+                )
+            )
+            
+            if existing_tx:
+                bt.logging.debug(f"Transaction {sanitized_data['transaction_id']} already exists in database")
+                return
+            
+            # Insert the transaction
+            await self.db_manager.execute_query(
+                """
+                INSERT INTO transactions (
+                    transaction_id, block_number, transaction_type, flow_type,
+                    hotkey, coldkey, amount, netuid, timestamp, validated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sanitized_data['transaction_id'],
+                    sanitized_data['block_number'],
+                    sanitized_data['transaction_type'],
+                    sanitized_data['flow_type'],
+                    sanitized_data['hotkey'],
+                    sanitized_data['coldkey'],
+                    sanitized_data['amount'],
+                    sanitized_data['netuid'],
+                    sanitized_data['timestamp'],
+                    sanitized_data['validated']
+                )
+            )
+            
+            bt.logging.debug(f"Stored transaction {sanitized_data['transaction_id']} in database")
+        except Exception as e:
+            bt.logging.error(f"Error storing transaction: {e}")
+            bt.logging.error(traceback.format_exc())
+    
+    async def _save_last_processed_block(self):
+        """Save the last processed block to the database."""
+        try:
+            if self._last_processed_block is None:
+                return
+            
+            current_time = int(time.time())
+            
+            # First ensure the table exists
+            try:
+                await self.db_manager.execute_query("""
+                    CREATE TABLE IF NOT EXISTS vesting_module_state (
+                        module_name TEXT PRIMARY KEY,
+                        last_block INTEGER,
+                        last_timestamp INTEGER,
+                        last_epoch INTEGER,
+                        module_data TEXT
+                    )
+                """)
+            except Exception as e:
+                bt.logging.error(f"Error ensuring vesting_module_state table exists: {e}")
+                return
+            
+            # Save to vesting_module_state table
+            try:
+                # Check if entry exists
+                result = await self.db_manager.fetch_one("""
+                    SELECT module_data FROM vesting_module_state
+                    WHERE module_name = 'transaction_monitor'
+                """)
+                
+                if result and result['module_data']:
+                    # Update existing entry
+                    try:
+                        data = json.loads(result['module_data'])
+                    except:
+                        data = {}
+                    
+                    data['last_processed_block'] = self._last_processed_block
+                    
+                    await self.db_manager.execute_query("""
+                        UPDATE vesting_module_state 
+                        SET last_block = ?, last_timestamp = ?, module_data = ?
+                        WHERE module_name = 'transaction_monitor'
+                    """, (self._last_processed_block, current_time, json.dumps(data)))
+                else:
+                    # Create new entry
+                    data = {'last_processed_block': self._last_processed_block}
+                    
+                    await self.db_manager.execute_query("""
+                        INSERT INTO vesting_module_state 
+                        (module_name, last_block, last_timestamp, last_epoch, module_data)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, ('transaction_monitor', self._last_processed_block, current_time, 0, json.dumps(data)))
+            
+                bt.logging.debug(f"Saved last processed block: {self._last_processed_block}")
+            except Exception as e:
+                bt.logging.error(f"Error saving last processed block to vesting_module_state: {e}")
+                    
+        except Exception as e:
+            bt.logging.error(f"Error in _save_last_processed_block: {e}")
+    
+    def _handle_concurrent_recv_error(self):
+        """Handle recovery from concurrent recv error by creating a new connection."""
+        bt.logging.info("Attempting to recover from concurrent recv error")
+        try:
+            time.sleep(5)  # Wait to allow other threads to clean up
+            
+            # Reset status
+            self._status = "RECONNECTING"
+            
+            # Close old substrate connection
+            if self.substrate:
+                try:
+                    bt.logging.info("Closing old substrate connection")
+                    self.substrate.close()
+                    self.substrate = None
+                except Exception as e:
+                    bt.logging.error(f"Error closing old substrate connection: {e}")
+            
+            # Create new substrate connection
+            try:
+                bt.logging.info("Creating new substrate connection")
+                if self.explicit_endpoint:
+                    bt.logging.info(f"Using explicit endpoint: {self.explicit_endpoint}")
+                    self.substrate = SubstrateInterface(url=self.explicit_endpoint)
+                else:
+                    # Try to get endpoint from subtensor
+                    if hasattr(self.subtensor, 'chain_endpoint') and self.subtensor.chain_endpoint:
+                        endpoint = self.subtensor.chain_endpoint
+                        bt.logging.info(f"Using subtensor chain_endpoint: {endpoint}")
+                        self.substrate = SubstrateInterface(url=endpoint)
+                    else:
+                        bt.logging.error("No endpoint available for reconnection")
+                        self._status = "ERROR"
+                        return
+            except Exception as e:
+                bt.logging.error(f"Failed to create new substrate connection: {e}")
+                self._status = "ERROR"
+                return
+            
+            # Restart monitoring with new connection
+            bt.logging.info("Starting monitoring with new connection")
+            self.stop_event.clear()
+            self.start_monitoring()
+        except Exception as e:
+            bt.logging.error(f"Error during recovery from concurrent recv error: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
     
     def _purge_old_calls(self, current_block):
         """
-        Purge pending calls older than a threshold.
+        Purge pending extrinsic calls older than a threshold.
+        
+        Standard stake calls are purged after 20 blocks.
+        Limit orders (add_stake_limit, remove_stake_limit) are retained for 216000 blocks (~1 month).
         
         Args:
             current_block: Current block number
         """
-        threshold = 20
-        to_delete = []
-        for call_id, call_data in self.pending_calls.items():
-            if current_block - call_data['block_number'] >= threshold:
-                logger.info(f"Discarding pending call {call_id} from block {call_data['block_number']} (older than {threshold} blocks)")
-                to_delete.append(call_id)
-        for call_id in to_delete:
-            del self.pending_calls[call_id]
+        try:
+            # Get counts before purging for logging
+            total_calls_before = sum(len(calls) for calls in self._pending_calls.values())
+            blocks_before = len(self._pending_calls)
+            
+            # Create a list of blocks and call indices to delete
+            to_delete = []  # (block_num, call_idx) tuples
+            
+            for block_num, calls in list(self._pending_calls.items()):
+                # Check block-level threshold (if all calls from this block should be purged)
+                block_age = current_block - block_num
+                
+                # List of calls to remove from this block
+                calls_to_remove = []
+                
+                for call_idx, call_data in enumerate(calls):
+                    # Determine threshold based on call function
+                    if call_data.get('call_function') in ['add_stake_limit', 'remove_stake_limit']:
+                        threshold = 216000  # ~1 month - same as BlockMonitor.py
+                    else:
+                        threshold = 20  # ~5 minutes - same as BlockMonitor.py
+                    
+                    # Check if this call should be purged
+                    if block_age >= threshold:
+                        bt.logging.info(f"Purging call from block {block_num} (age: {block_age} blocks): "
+                                       f"{call_data.get('call_function')} for "
+                                       f"hotkey: {call_data.get('hotkey', '')[:10] if call_data.get('hotkey') else 'None'}")
+                        calls_to_remove.append(call_idx)
+                
+                # Sort in reverse to avoid index shifting when we remove
+                for call_idx in sorted(calls_to_remove, reverse=True):
+                    calls.pop(call_idx)
+                
+                # If all calls were removed, remove the block entry
+                if not calls:
+                    to_delete.append(block_num)
+            
+            # Delete empty block entries
+            for block_num in to_delete:
+                if block_num in self._pending_calls:
+                    del self._pending_calls[block_num]
+            
+            # Get counts after purging for logging
+            total_calls_after = sum(len(calls) for calls in self._pending_calls.values())
+            blocks_after = len(self._pending_calls)
+            
+            purged_calls = total_calls_before - total_calls_after
+            purged_blocks = blocks_before - blocks_after
+            
+            if purged_calls > 0 or purged_blocks > 0:
+                bt.logging.info(f"Purged {purged_calls} calls from {purged_blocks} blocks. "
+                               f"Remaining: {total_calls_after} calls in {blocks_after} blocks.")
+            
+            # Final summary of remaining calls
+            if total_calls_after > 0:
+                # Log details about remaining calls
+                bt.logging.info(f"After purge: {total_calls_after} pending calls in {blocks_after} blocks")
+                
+                # Log details of oldest remaining calls for debugging
+                if blocks_after > 0:
+                    oldest_block = min(self._pending_calls.keys())
+                    oldest_age = current_block - oldest_block
+                    oldest_calls = self._pending_calls[oldest_block]
+                    bt.logging.info(f"Oldest pending calls: block {oldest_block} (age: {oldest_age} blocks), {len(oldest_calls)} calls")
+                    
+                    # Log some details about the oldest calls
+                    for idx, call in enumerate(oldest_calls[:3]):  # Show at most 3 examples
+                        bt.logging.info(f"  Oldest call {idx}: {call.get('call_function')} for "
+                                      f"hotkey: {call.get('hotkey', '')[:10] if call.get('hotkey') else 'None'}, "
+                                      f"netuid: {call.get('netuid')}")
+                    
+                    if len(oldest_calls) > 3:
+                        bt.logging.info(f"  ... and {len(oldest_calls) - 3} more calls in block {oldest_block}")
+        except Exception as e:
+            bt.logging.error(f"Error purging old calls: {e}")
+            import traceback
+            bt.logging.error(traceback.format_exc())
     
     async def _load_last_processed_block(self):
-        """
-        Load last processed block from database.
-        """
+        """Load the last processed block from the database."""
         try:
-            result = await self.db_manager.fetch_one("""
-                SELECT value FROM vesting_module_state
-                WHERE module_name = 'transaction_monitor_last_block'
-            """)
+            bt.logging.info("Loading last processed block from database")
             
-            if result:
-                self.last_block = result['value']
-            else:
-                # Default to current block
-                self.last_block = self.subtensor.get_current_block()
-                # Store in database
-                await self.db_manager.execute_query("""
-                    INSERT INTO vesting_module_state (module_name, last_block, last_timestamp)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(module_name) DO UPDATE SET
-                    last_block = excluded.last_block,
-                    last_timestamp = excluded.last_timestamp
-                """, ('transaction_monitor_last_block', self.last_block, int(time.time())))
+            # Try to load from vesting_module_state
+            try:
+                # First check if the table exists
+                table_exists = await self.db_manager.fetch_one("""
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' AND name='vesting_module_state'
+                """)
+                
+                if table_exists:
+                    result = await self.db_manager.fetch_one("""
+                        SELECT module_data, last_block FROM vesting_module_state
+                        WHERE module_name = 'transaction_monitor'
+                    """)
+                    
+                    if result and result['module_data']:
+                        try:
+                            data = json.loads(result['module_data'])
+                            block_num = data.get('last_processed_block', result['last_block'])
+                            self._last_processed_block = block_num
+                            bt.logging.info(f"Loaded last processed block from vesting_module_state: {block_num}")
+                            return block_num
+                        except Exception as e:
+                            bt.logging.error(f"Error parsing module_data: {e}, falling back to last_block")
+                            if result['last_block']:
+                                self._last_processed_block = result['last_block']
+                                bt.logging.info(f"Loaded last processed block from last_block field: {result['last_block']}")
+                                return result['last_block']
+                    
+                    # No entry found or data is empty
+                    bt.logging.info("No last processed block found in vesting_module_state")
+                else:
+                    bt.logging.info("vesting_module_state table doesn't exist yet, creating it")
+                    # Create the table if it doesn't exist
+                    await self.db_manager.execute_query("""
+                        CREATE TABLE IF NOT EXISTS vesting_module_state (
+                            module_name TEXT PRIMARY KEY,
+                            last_block INTEGER,
+                            last_timestamp INTEGER,
+                            last_epoch INTEGER,
+                            module_data TEXT
+                        )
+                    """)
+                    bt.logging.info("vesting_module_state table created successfully")
+            except Exception as e:
+                bt.logging.error(f"Error with vesting_module_state table: {e}")
+                bt.logging.info("Creating vesting_module_state table if it doesn't exist")
+                try:
+                    await self.db_manager.execute_query("""
+                        CREATE TABLE IF NOT EXISTS vesting_module_state (
+                            module_name TEXT PRIMARY KEY,
+                            last_block INTEGER,
+                            last_timestamp INTEGER,
+                            last_epoch INTEGER,
+                            module_data TEXT
+                        )
+                    """)
+                    bt.logging.info("Ensured vesting_module_state table exists")
+                except Exception as create_e:
+                    bt.logging.error(f"Error creating vesting_module_state table: {create_e}")
             
-            logger.info(f"Loaded last processed block: {self.last_block}")
+            # If we're here, we couldn't load from database
+            # Use current block if possible
+            if self.substrate:
+                try:
+                    current_block = self.get_current_block_number()
+                    self._last_processed_block = current_block
+                    bt.logging.info(f"Using current block as start point: {current_block}")
+                    
+                    # Save it immediately to establish a record
+                    await self._save_last_processed_block()
+                    return current_block
+                except Exception as e:
+                    bt.logging.error(f"Error getting current block: {e}")
+            
+            # If all else fails, start from 0
+            bt.logging.info("Starting transaction monitoring from block 0")
+            self._last_processed_block = 0
+            return 0
         except Exception as e:
-            logger.error(f"Error loading last processed block: {e}")
-            self.last_block = self.subtensor.get_current_block()
+            bt.logging.error(f"Error loading last processed block: {e}")
+            self._last_processed_block = 0
+            return 0
+    
+    def get_current_block_number(self):
+        """Get the current block number from the blockchain."""
+        try:
+            if not self.substrate:
+                bt.logging.warning("No substrate connection when getting current block")
+                return 0
+                
+            # Method 1: Using get_chain_head and get_block_number
+            try:
+                chain_head = self.substrate.get_chain_head()
+                if chain_head:
+                    block_num = self.substrate.get_block_number(chain_head)
+                    bt.logging.info(f"Current block number from chain head: {block_num}")
+                    return block_num
+            except Exception as e:
+                bt.logging.warning(f"Error getting block number from chain head: {e}")
+                
+            # Method 2: Use get_block
+            try:
+                latest_block = self.substrate.get_block()
+                if latest_block and 'header' in latest_block and 'number' in latest_block['header']:
+                    block_num = latest_block['header']['number']
+                    bt.logging.info(f"Current block number from latest block: {block_num}")
+                    return block_num
+            except Exception as e:
+                bt.logging.warning(f"Error getting latest block: {e}")
+                
+            # Method 3: Try subtensor's get_current_block if available
+            if hasattr(self.subtensor, 'get_current_block'):
+                try:
+                    block_num = self.subtensor.get_current_block()
+                    bt.logging.info(f"Current block number from subtensor: {block_num}")
+                    return block_num
+                except Exception as e:
+                    bt.logging.warning(f"Error getting block from subtensor: {e}")
+                    
+            bt.logging.error("Failed to get current block number through any method")
+            return 0
+        except Exception as e:
+            bt.logging.error(f"Error in get_current_block_number: {e}")
+            return 0
     
     @property
     def is_running(self):
-        """Check if monitoring is running."""
-        return self.is_monitoring 
+        """Check if transaction monitoring is running."""
+        return self._status == "RUNNING"
+    
+    def log_status_summary(self):
+        """Log a summary of the transaction monitor status."""
+        bt.logging.info("===== Transaction Monitor Status Summary =====")
+        bt.logging.info(f"Status: {self._status}")
+        bt.logging.info(f"Last successful block: {self._last_successful_block}")
+        bt.logging.info(f"Last processed block: {self._last_processed_block}")
+        bt.logging.info(f"Thread running: {self.monitoring_thread and self.monitoring_thread.is_alive()}")
+        bt.logging.info(f"Substrate connection: {'Active' if self.substrate else 'None'}")
+        bt.logging.info(f"Explicit endpoint: {self.explicit_endpoint}")
+        bt.logging.info(f"Pending calls: {len(self._pending_calls)}")
+        bt.logging.info(f"Last error: {self._last_error}")
+        bt.logging.info("==========================================")
+    
+    def _process_next_block(self):
+        """Process the next block in the chain."""
+        try:
+            # Get current block number
+            chain_head = self.substrate.get_chain_head()
+            current_block = self.substrate.get_block_number(chain_head)
+            
+            # If we haven't processed any blocks yet, start from current - 50
+            # This ensures we don't try to process too old blocks that might be discarded
+            if self._last_processed_block is None:
+                self._last_processed_block = max(0, current_block - 50)
+                bt.logging.info(f"Starting block processing from block {self._last_processed_block}")
+            
+            next_block = self._last_processed_block + 1
+            
+            # Don't process future blocks
+            if next_block > current_block:
+                time.sleep(1)  # Wait for next block
+                return
+            
+            # Check if we're too far behind current block
+            blocks_behind = current_block - next_block
+            if blocks_behind > 500:  # If we're more than 500 blocks behind
+                # Skip ahead to avoid processing discarded blocks
+                new_start = max(next_block, current_block - 400)  # Stay within safe range
+                bt.logging.warning(f"Too far behind ({blocks_behind} blocks), skipping to block {new_start}")
+                self._last_processed_block = new_start - 1
+                next_block = new_start
+            
+            try:
+                # Get block hash
+                block_hash = self.substrate.get_block_hash(next_block)
+                if not block_hash:
+                    bt.logging.error(f"Could not get hash for block {next_block}")
+                    return
+                
+                # Process the block
+                self._process_block(next_block, block_hash)
+                
+                # Update last processed block
+                self._last_processed_block = next_block
+                
+                # Save progress periodically (every 100 blocks)
+                if next_block % 100 == 0:
+                    asyncio.run(self._save_last_processed_block())
+                    bt.logging.info(f"Saved progress at block {next_block}")
+                
+                # Purge old pending calls
+                self._purge_old_calls(next_block)
+                
+            except SubstrateRequestException as e:
+                error_msg = str(e)
+                if "State already discarded" in error_msg:
+                    # Skip this block and move forward
+                    bt.logging.warning(f"State discarded for block {next_block}, skipping ahead")
+                    self._last_processed_block = next_block  # Skip this block
+                elif "concurrent.futures._base.TimeoutError" in error_msg:
+                    bt.logging.warning("Detected timeout error, attempting recovery...")
+                    self._handle_concurrent_recv_error()
+                else:
+                    bt.logging.error(f"Substrate request error for block {next_block}: {e}")
+                time.sleep(1)  # Wait before retry
+            
+        except Exception as e:
+            bt.logging.error(f"Error processing next block: {e}")
+            bt.logging.error(traceback.format_exc())
+            time.sleep(1)  # Wait before retry 
+
+    def _initialize_substrate(self):
+        """Initialize the substrate connection."""
+        try:
+            if self.explicit_endpoint:
+                bt.logging.info(f"Using explicit endpoint: {self.explicit_endpoint}")
+                self.substrate = SubstrateInterface(url=self.explicit_endpoint)
+            else:
+                # Try to get endpoint from subtensor
+                if hasattr(self.subtensor, 'chain_endpoint') and self.subtensor.chain_endpoint:
+                    endpoint = self.subtensor.chain_endpoint
+                    bt.logging.info(f"Using subtensor chain_endpoint: {endpoint}")
+                    self.substrate = SubstrateInterface(url=endpoint)
+                else:
+                    bt.logging.error("No endpoint available for reconnection")
+                    self._status = "ERROR"
+                    return
+            
+            # Test the connection
+            try:
+                # Get chain properties instead of using get_chain_info()
+                chain_head = self.substrate.get_chain_head()
+                
+                # Try to get chain name - handle potential exceptions safely
+                try:
+                    # Different approach to get chain info
+                    chain_props = "Unknown"
+                    if hasattr(self.substrate, 'get_metadata'):
+                        metadata = self.substrate.get_metadata(block_hash=chain_head)
+                        if metadata and hasattr(metadata, 'metadata') and hasattr(metadata.metadata, 'name'):
+                            chain_props = metadata.metadata.name
+                        elif metadata and hasattr(metadata, 'metadata_version'):
+                            chain_props = f"Substrate (Metadata v{metadata.metadata_version})"
+                    bt.logging.info(f"Connected to blockchain: {chain_props}")
+                except Exception as e:
+                    bt.logging.warning(f"Could not get chain name: {e}, but connection established")
+                
+                # Log current block information
+                try:
+                    current_block = self.substrate.get_block_number(chain_head)
+                    bt.logging.info(f"Current chain head: Block #{current_block}")
+                except Exception as e:
+                    bt.logging.warning(f"Could not get block number: {e}, but connection established")
+                
+                # Connection successful if we get here
+                bt.logging.info("Blockchain connection established successfully")
+            except Exception as e:
+                bt.logging.error(f"Failed to connect to blockchain: {e}")
+                # Handle error but don't raise - we want initialization to succeed even if blockchain connection fails
+                bt.logging.warning("Will continue without blockchain connection and retry later")
+            
+            self._is_initialized = True
+            bt.logging.info("Blockchain connection established successfully")
+        except Exception as e:
+            bt.logging.error(f"Error initializing substrate connection: {e}")
+            self._status = "ERROR"
+            self._last_error = str(e)
+            self._is_initialized = False
+            bt.logging.error(traceback.format_exc())
+    
+    def _sanitize_transaction_data(self, transaction_data):
+        """Sanitize transaction data before storing it in the database."""
+        # Implement the sanitization logic here
+        return transaction_data 

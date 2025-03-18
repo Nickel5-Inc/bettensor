@@ -14,12 +14,18 @@ import traceback
 
 import bittensor as bt
 import numpy as np
+import json
+import os
+import time
+from substrateinterface import SubstrateInterface
+import argparse
 
 from bettensor.validator.database.database_manager import DatabaseManager
 from bettensor.validator.vesting.blockchain_monitor import BlockchainMonitor
 from bettensor.validator.vesting.stake_tracker import StakeTracker
 from bettensor.validator.vesting.transaction_monitor import TransactionMonitor
 from bettensor.validator.vesting.stake_tracker import INFLOW, OUTFLOW, NEUTRAL, EMISSION
+from bettensor.validator.vesting.database_schema import create_vesting_tables_async
 
 logger = logging.getLogger(__name__)
 
@@ -51,73 +57,111 @@ class VestingSystem:
         query_interval_seconds: int = 300,
         transaction_query_interval_seconds: int = 60,
         detailed_transaction_tracking: bool = True,
-        thread_priority: str = "low"
+        thread_priority: str = "low",
+        explicit_endpoint: str = None
     ):
         """
         Initialize the vesting system.
         
         Args:
-            subtensor: Subtensor client for blockchain queries
-            subnet_id: Subnet ID to monitor
-            db_manager: Database manager
-            minimum_stake: Minimum stake required for eligibility (default: 0.3 τ)
-            retention_window_days: Window for calculating retention metrics (default: 30 days)
-            retention_target: Target retention percentage for max multiplier (default: 0.9)
-            max_multiplier: Maximum multiplier to apply (default: 1.5)
-            use_background_thread: Whether to use a background thread for monitoring
-            query_interval_seconds: How often to poll for updates (seconds)
-            transaction_query_interval_seconds: How often to check for transactions (seconds)
-            detailed_transaction_tracking: Whether to use detailed transaction tracking
-            thread_priority: Thread priority - "low", "normal", or "high"
+            subtensor: The subtensor client.
+            subnet_id: The subnet ID to monitor.
+            db_manager: The database manager to use for storage.
+            minimum_stake: The minimum stake required for multiplier.
+            retention_window_days: The number of days to consider for retention calculation.
+            retention_target: The target retention percentage (0-1) for full multiplier.
+            max_multiplier: The maximum multiplier to apply to miner weights.
+            use_background_thread: Whether to use a background thread for periodic updates.
+            query_interval_seconds: How often to query blockchain for updates (in seconds).
+            transaction_query_interval_seconds: How often to query for transactions (in seconds).
+            detailed_transaction_tracking: Whether to use detailed transaction tracking.
+            thread_priority: Thread priority ("low", "normal", "high").
+            explicit_endpoint: Optional explicit endpoint URL for blockchain queries.
         """
         self.subtensor = subtensor
         self.subnet_id = subnet_id
         self.db_manager = db_manager
-        
-        # Configuration parameters
         self.minimum_stake = minimum_stake
         self.retention_window_days = retention_window_days
         self.retention_target = retention_target
         self.max_multiplier = max_multiplier
         self.use_background_thread = use_background_thread
-        self.detailed_transaction_tracking = detailed_transaction_tracking
-        self.thread_priority = thread_priority
         self.query_interval_seconds = query_interval_seconds
         self.transaction_query_interval_seconds = transaction_query_interval_seconds
+        self.detailed_transaction_tracking = detailed_transaction_tracking
+        self.thread_priority = thread_priority
+        self.explicit_endpoint = explicit_endpoint
+        self.validator_take = 0.18  # Default validator take percentage
         
-        # Adjust thread scheduling based on priority
-        self.thread_nice_value = {
-            "low": 10,      # Lower CPU priority
-            "normal": 0,    # Normal priority
-            "high": -10     # Higher CPU priority (use with caution)
-        }.get(thread_priority, 0)
+        # Log initialization parameters
+        logger.info(f"Initializing VestingSystem for subnet {subnet_id}")
+        logger.info(f"Parameters: min_stake={minimum_stake}, window={retention_window_days}d, target={retention_target}, max_mult={max_multiplier}")
+        logger.info(f"Threading: use_bg_thread={use_background_thread}, thread_priority={thread_priority}")
+        logger.info(f"Intervals: query={query_interval_seconds}s, tx_query={transaction_query_interval_seconds}s")
+        logger.info(f"Explicit endpoint: {explicit_endpoint}")
         
-        # Create components
+        # Initialize blockchain monitor
         self.blockchain_monitor = BlockchainMonitor(
             subtensor=subtensor,
             subnet_id=subnet_id,
             db_manager=db_manager,
-            query_interval_seconds=query_interval_seconds,
-            auto_start_thread=False  # We'll start it manually after initialization
+            query_interval_seconds=query_interval_seconds
         )
         
-        self.stake_tracker = StakeTracker(
-            db_manager=db_manager
-        )
-        
-        # Transaction monitor for detailed transaction tracking
+        # Initialize transaction monitor (if detailed tracking is enabled)
         if detailed_transaction_tracking:
-            logger.debug(f"Initializing transaction monitor with query_interval_seconds={transaction_query_interval_seconds}")
-            # Use mainnet endpoint for transaction monitoring with a unique connection
-            self.transaction_monitor = TransactionMonitor(
-                subtensor=subtensor,
-                subnet_id=subnet_id,
-                db_manager=db_manager,
-                verbose=True,  # Enable verbose logging
-                query_interval_seconds=transaction_query_interval_seconds,
-                explicit_endpoint="wss://entrypoint-finney.opentensor.ai:443"  # Explicitly use mainnet endpoint
-            )
+            try:
+                # Override: Use subnet 30 for transaction monitoring regardless of validator subnet
+                transaction_monitor_subnet_id = 30
+                logger.info(f"Creating transaction monitor with subnet_id: {transaction_monitor_subnet_id} (overridden from validator subnet {subnet_id})")
+                
+                # Create a dedicated subtensor instance connected to Finney for transaction monitoring
+                try:
+                    import bittensor as bt
+                    import argparse
+                    
+                    # Create a proper config object for Finney network
+                    parser = argparse.ArgumentParser()
+                    bt.subtensor.add_args(parser)
+                    config = bt.config(parser)
+                    
+                    # Explicitly set the network to Finney mainnet
+                    config.subtensor.network = "finney"
+                    finney_mainnet_endpoint = "wss://entrypoint-finney.opentensor.ai:443"
+                    config.subtensor.chain_endpoint = finney_mainnet_endpoint  # Explicit Finney mainnet endpoint
+                    
+                    # Create a dedicated subtensor instance for transaction monitoring
+                    logger.info("Creating dedicated subtensor instance connected to Finney mainnet for transaction monitoring")
+                    logger.info(f"Using Finney mainnet endpoint: {config.subtensor.chain_endpoint}")
+                    tx_monitor_subtensor = bt.subtensor(config=config)
+                    logger.info(f"Successfully created dedicated subtensor instance for transaction monitoring: {tx_monitor_subtensor.network} at {tx_monitor_subtensor.chain_endpoint}")
+                except Exception as e:
+                    logger.error(f"Failed to create dedicated subtensor for transaction monitoring: {e}")
+                    logger.debug(traceback.format_exc())
+                    logger.info("Falling back to using validator's subtensor instance")
+                    tx_monitor_subtensor = subtensor
+                    finney_mainnet_endpoint = None
+                
+                self.transaction_monitor = TransactionMonitor(
+                    subtensor=tx_monitor_subtensor,  # Use the dedicated Finney-connected subtensor
+                    subnet_id=transaction_monitor_subnet_id,  # Use subnet 30 specifically for transaction monitoring
+                    db_manager=db_manager,
+                    verbose=True,  # Enable verbose logging to help debug
+                    explicit_endpoint=finney_mainnet_endpoint  # Override with the Finney mainnet endpoint
+                )
+                
+                # Start the transaction monitoring
+                logger.info("Starting transaction monitor")
+                self.transaction_monitor.start_monitoring(thread_nice_value=10 if thread_priority.lower() == 'low' else 0)
+                logger.info(f"Transaction monitor started - monitoring subnet {transaction_monitor_subnet_id} on {tx_monitor_subtensor.network} network")
+                    
+            except Exception as e:
+                logger.error(f"Failed to create transaction monitor: {e}")
+                logger.debug(traceback.format_exc())
+                self.transaction_monitor = None
+                
         else:
+            logger.info("Detailed transaction tracking disabled")
             self.transaction_monitor = None
         
         # Cache for minimum stake requirement
@@ -125,119 +169,129 @@ class VestingSystem:
         self._minimum_stake_last_updated = None
         self._minimum_stake_ttl = 3600  # 1 hour
         
+        # Initialize stake tracker
+        self.stake_tracker = StakeTracker(self.db_manager)
+        
         # Event handlers
         self._epoch_boundary_handlers = []
     
-    async def initialize(self, auto_init_metagraph: bool = True, **kwargs):
+    async def initialize(self) -> bool:
         """
-        Initialize the vesting system.
-        
-        This method initializes the blockchain monitor and stake tracker,
-        and ensures all required database tables exist. It also optionally
-        initializes miner data from the metagraph.
-        
-        Args:
-            auto_init_metagraph: Whether to automatically initialize miner data from metagraph
-            **kwargs: Additional parameters that override init parameters (e.g., minimum_stake)
+        Initialize the vesting system and verify the database state.
             
         Returns:
             bool: True if initialization was successful
         """
         try:
-            logger.info("Initializing vesting system")
+            logger.info("Initializing vesting system...")
             
-            # Update configuration with any provided kwargs
-            for key, value in kwargs.items():
-                if hasattr(self, key):
-                    logger.debug(f"Updating {key} from {getattr(self, key)} to {value}")
-                    setattr(self, key, value)
-            
-            logger.debug(f"Vesting system configuration: use_background_thread={self.use_background_thread}, detailed_transaction_tracking={self.detailed_transaction_tracking}")
-            
-            # Ensure all required tables exist
-            logger.debug("Ensuring all required tables exist")
-            tables_exist = await self._ensure_tables_exist()
-            if not tables_exist:
-                logger.error("Failed to ensure required tables exist")
+            # Create the tables if they don't exist
+            logger.debug("Creating or checking vesting tables using execute_query")
+            tables_created = await create_vesting_tables_async(self.db_manager)
+            if not tables_created:
+                logger.error("Failed to create vesting tables")
                 return False
                 
-            # Initialize stake tracker
-            logger.debug("Initializing stake tracker")
-            self.stake_tracker = StakeTracker(self.db_manager)
-            if not await self.stake_tracker.initialize():
-                logger.error("Failed to initialize stake tracker")
-                return False
-                
-            # Initialize blockchain monitor
-            logger.debug(f"Initializing blockchain monitor with query_interval_seconds={self.query_interval_seconds}")
-            self.blockchain_monitor = BlockchainMonitor(
-                subtensor=self.subtensor,
-                subnet_id=self.subnet_id,
-                db_manager=self.db_manager,
-                query_interval_seconds=self.query_interval_seconds,
-                auto_start_thread=False  # Don't auto-start
+            # Verify the database state
+            await self._verify_database_state()
+            
+            # Initialize the stake tracker
+            await self.stake_tracker.initialize()
+            
+            # Check if transaction monitor is properly initialized
+            if self.transaction_monitor:
+                if not hasattr(self.transaction_monitor, 'substrate') or not self.transaction_monitor.substrate:
+                    logger.warning("Transaction monitor is not fully initialized, attempting to initialize it")
+                    try:
+                        # Try to initialize the transaction monitor if it's not already initialized
+                        if hasattr(self.transaction_monitor, 'initialize'):
+                            await self.transaction_monitor.initialize()
+                    except Exception as e:
+                        logger.error(f"Failed to initialize transaction monitor: {e}")
+            
+            # Check if we have state info
+            state_records = await self.db_manager.fetch_all(
+                "SELECT * FROM vesting_module_state"
             )
-            if not await self.blockchain_monitor.initialize():
-                logger.error("Failed to initialize blockchain monitor")
-                return False
+            
+            if not state_records:
+                # Set default state
+                start_block = 0
+                if self.transaction_monitor:
+                    try:
+                        # Check if transaction monitor is initialized
+                        if not hasattr(self.transaction_monitor, 'substrate') or not self.transaction_monitor.substrate:
+                            logger.warning("Transaction monitor not fully initialized, attempting to initialize it")
+                            if hasattr(self.transaction_monitor, 'initialize'):
+                                await self.transaction_monitor.initialize()
+                        
+                        # Get current block number from the transaction monitor
+                        if hasattr(self.transaction_monitor, 'get_current_block_number'):
+                            start_block = self.transaction_monitor.get_current_block_number()
+                            logger.info(f"Setting start_block to current block: {start_block}")
+                        else:
+                            logger.warning("Transaction monitor does not have get_current_block_number method")
+                    except Exception as e:
+                        logger.warning(f"Failed to get current block number: {e}, using 0 as fallback")
+                        start_block = 0
                 
-            # Initialize transaction monitor if detailed tracking is enabled
-            if self.detailed_transaction_tracking and self.transaction_monitor is None:
-                logger.debug(f"Initializing transaction monitor with query_interval_seconds={self.transaction_query_interval_seconds}")
-                # Use mainnet endpoint for transaction monitoring with a unique connection
-                # Make sure this is a completely separate connection from the blockchain monitor
-                self.transaction_monitor = TransactionMonitor(
-                    subtensor=self.subtensor,
-                    subnet_id=self.subnet_id,
-                    db_manager=self.db_manager,
-                    verbose=True,  # Enable verbose logging
-                    query_interval_seconds=self.transaction_query_interval_seconds,
-                    explicit_endpoint="wss://entrypoint-finney.opentensor.ai:443"  # Explicitly use mainnet endpoint
+                # Create vesting system state record
+                system_state = {
+                    "netuid": self.subnet_id,
+                    "last_validated_block": start_block,
+                    "valid_validators": "",
+                    "validator_permit": "default",
+                    "validator_take": self.validator_take,
+                    "validator_logits": "",
+                    "validator_trust": "",
+                    "start_block": start_block,
+                    "min_stake_requirement": self.minimum_stake
+                }
+                
+                # Insert as JSON in module_data field
+                await self.db_manager.execute_query(
+                    """
+                    INSERT INTO vesting_module_state (
+                        module_name, last_block, last_timestamp, last_epoch, module_data
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "vesting_system", start_block, time.time(), 0, json.dumps(system_state)
+                    )
                 )
-                
-                # Force creation of a new substrate connection to avoid thread conflicts
-                try:
-                    from substrateinterface import SubstrateInterface
-                    # Initialize the transaction_monitor's substrate interface here to keep it separate
-                    self.transaction_monitor.substrate = None
-                except Exception as e:
-                    logger.warning(f"Could not pre-clear transaction monitor substrate: {e}")
-            
-            if self.detailed_transaction_tracking and self.transaction_monitor:
-                if not await self.transaction_monitor.initialize():
-                    logger.error("Failed to initialize transaction monitor")
-                    return False
-                    
-                # Register the stake change handler
-                logger.debug("Registering stake change handler")
-                self._register_stake_change_handler()
-            
-            # Initialize from metagraph if requested
-            if auto_init_metagraph:
-                logger.info("Auto-initializing from metagraph")
-                success = await self.initialize_from_metagraph()
-                if not success:
-                    logger.warning("Failed to initialize from metagraph")
-                    # Continue anyway
-                else:
-                    logger.debug("Successfully initialized from metagraph")
-            
-            # Start the background thread if requested
-            if self.use_background_thread:
-                logger.debug(f"Starting background threads with priority: {self.thread_priority}")
-                success = self.start_background_thread(self.thread_priority)
-                if success:
-                    logger.debug("Background threads started successfully")
-                else:
-                    logger.warning("Failed to start background threads")
             else:
-                logger.debug("Background threads disabled, not starting monitoring")
+                # Update with current settings if needed
+                state = state_records[0]
                 
-            logger.info("Vesting system initialization completed successfully")
+                # Check if there's a module_data field with our settings
+                if 'module_data' in state and state['module_data']:
+                    try:
+                        system_state = json.loads(state['module_data'])
+                        
+                        # Check if we need to update any settings
+                        update_needed = False
+                        
+                        if 'validator_take' in system_state and system_state['validator_take'] != self.validator_take:
+                            system_state['validator_take'] = self.validator_take
+                            update_needed = True
+                            
+                        if 'min_stake_requirement' in system_state and system_state['min_stake_requirement'] != self.minimum_stake:
+                            system_state['min_stake_requirement'] = self.minimum_stake
+                            update_needed = True
+                        
+                        if update_needed:
+                            await self.db_manager.execute_query(
+                                "UPDATE vesting_module_state SET module_data = ?, last_timestamp = ? WHERE module_name = ?",
+                                (json.dumps(system_state), time.time(), "vesting_system")
+                            )
+                    except Exception as e:
+                        logger.error(f"Error updating vesting system state: {e}")
+            
+            logger.info(f"✅ Vesting system initialized for netuid {self.subnet_id}")
             return True
+            
         except Exception as e:
-            logger.error(f"Failed to initialize vesting system: {e}")
-            logger.exception("Initialization error details:")
+            logger.error(f"Error initializing vesting system: {e}")
             return False
     
     async def _ensure_tables_exist(self):
@@ -248,7 +302,18 @@ class VestingSystem:
             bool: True if all tables exist
         """
         try:
-            # Get list of all required tables
+            # Import here to avoid circular imports
+            from bettensor.validator.vesting.database_schema import create_vesting_tables_async
+            
+            # Use the dedicated function to create all vesting tables
+            logger.info("Creating or checking vesting tables - with fix for minimum_stake parameter")
+            success = await create_vesting_tables_async(self.db_manager)
+            if success:
+                logger.info("Vesting tables created or verified successfully")
+            else:
+                logger.warning("Failed to create or verify vesting tables")
+            
+            # Double-check that tables exist
             required_tables = [
                 'blockchain_state',
                 'stake_transactions',
@@ -279,8 +344,6 @@ class VestingSystem:
                 logger.warning(f"Missing vesting tables: {', '.join(missing)}")
                 
                 # Try to create tables explicitly
-                from bettensor.validator.vesting.database_schema import create_vesting_tables_async
-                logger.info("Attempting to create missing vesting tables...")
                 await create_vesting_tables_async(self.db_manager)
                 
                 # Verify tables were created
@@ -902,15 +965,15 @@ class VestingSystem:
                 logger.error(f"Error checking for stake_tranches table: {e}")
                 return False
             
-            # Check if tables have substantial data before clearing
+            # Check current data state
             should_clear = False
             if force_refresh:
                 # Check current data state
                 try:
-                    # Check stake_metrics
+                    # Check miner_metrics
                     metrics_result = await self.db_manager.fetch_one("""
                         SELECT COUNT(*) as count, COALESCE(SUM(total_stake), 0) as total_stake
-                        FROM stake_metrics
+                        FROM miner_metrics
                     """)
                     metrics_count = metrics_result['count'] if metrics_result else 0
                     metrics_stake = metrics_result['total_stake'] if metrics_result else 0
@@ -923,7 +986,7 @@ class VestingSystem:
                     tranches_count = tranches_result['count'] if tranches_result else 0
                     tranches_stake = tranches_result['total_stake'] if tranches_result else 0
                     
-                    logger.info(f"Current stake_metrics: {metrics_count} rows, {metrics_stake:.2f} total stake")
+                    logger.info(f"Current miner_metrics: {metrics_count} rows, {metrics_stake:.2f} total stake")
                     logger.info(f"Current stake_tranches: {tranches_count} rows, {tranches_stake:.2f} total stake")
                     
                     # Only clear if tables are empty or have minimal data (less than 5% of miners in metagraph)
@@ -948,20 +1011,25 @@ class VestingSystem:
                 try:
                     # Only truncate data, don't drop tables
                     await self.db_manager.execute_query("DELETE FROM stake_tranches")
+                    await self.db_manager.execute_query("DELETE FROM miner_metrics")
+                    await self.db_manager.execute_query("DELETE FROM stake_transactions")
+                    await self.db_manager.execute_query("DELETE FROM stake_balance_changes")
                     await self.db_manager.execute_query("DELETE FROM stake_metrics")
-                    await self.db_manager.execute_query("DELETE FROM aggregated_tranche_metrics")
+                    await self.db_manager.execute_query("DELETE FROM coldkey_metrics")
+                    await self.db_manager.execute_query("DELETE FROM stake_change_history")
+                    await self.db_manager.execute_query("DELETE FROM vesting_module_state")
                     logger.info("Successfully cleared existing stake data")
                     existing_hotkeys = set()  # No existing hotkeys after clearing
                 except Exception as e:
                     logger.error(f"Error clearing stake data: {e}")
                     # Continue anyway, as we'll use upserts
             
-            # Get all existing hotkeys in stake_metrics
+            # Get all existing hotkeys in miner_metrics
             results = await self.db_manager.fetch_all("""
-                SELECT hotkey FROM stake_metrics
+                SELECT hotkey FROM miner_metrics
             """)
             existing_hotkeys = {row['hotkey'] for row in results} if results else set()
-            logger.info(f"Found {len(existing_hotkeys)} existing hotkeys in stake_metrics")
+            logger.info(f"Found {len(existing_hotkeys)} existing hotkeys in miner_metrics")
             
             # Prepare data for initial stake metrics
             now = datetime.now(timezone.utc)
@@ -1002,7 +1070,7 @@ class VestingSystem:
                         timestamp
                     ))
                     
-                    # Add stake metrics entry
+                    # Add miner_metrics entry
                     metrics.append({
                         'hotkey': hotkey,
                         'coldkey': coldkey,
@@ -1019,7 +1087,7 @@ class VestingSystem:
                 # Verify if we already have stakeholders with non-zero stake in the database
                 result = await self.db_manager.fetch_one("""
                     SELECT COUNT(*) AS count, SUM(total_stake) AS total
-                    FROM stake_metrics
+                    FROM miner_metrics
                     WHERE total_stake > 0
                 """)
                 
@@ -1046,14 +1114,14 @@ class VestingSystem:
                 logger.info(f"Added {len(stakes)} stake tranches")
             except Exception as e:
                 logger.error(f"Error initializing from metagraph (stake_tranches): {e}")
-                # Continue with stake metrics if possible
+                # Continue with miner_metrics if possible
             
-            # Add stake metrics
+            # Add miner_metrics
             try:
                 # We use a different approach to avoid issues with column ordering
                 for metric in metrics:
                     await self.db_manager.execute_query("""
-                        INSERT INTO stake_metrics
+                        INSERT INTO miner_metrics
                         (hotkey, coldkey, total_stake, manual_stake, earned_stake, first_stake_timestamp, last_update)
                         VALUES (:hotkey, :coldkey, :total_stake, :manual_stake, :earned_stake, :first_stake_timestamp, :last_update)
                         ON CONFLICT(hotkey) DO UPDATE SET
@@ -1063,29 +1131,9 @@ class VestingSystem:
                         earned_stake = :earned_stake,
                         last_update = :last_update
                     """, metric)
-                logger.info(f"Added {len(metrics)} stake metrics entries")
+                logger.info(f"Added {len(metrics)} miner_metrics entries")
             except Exception as e:
-                logger.error(f"Error updating stake metrics: {e}")
-            
-            # Update aggregated_tranche_metrics
-            try:
-                # Create initial aggregated tranche metrics
-                for metric in metrics:
-                    await self.db_manager.execute_query("""
-                        INSERT INTO aggregated_tranche_metrics
-                        (hotkey, coldkey, total_tranches, active_tranches, avg_tranche_age, 
-                         oldest_tranche_age, total_tranche_amount, manual_tranches, 
-                         emission_tranches, emission_amount, manual_amount, last_update)
-                        VALUES (:hotkey, :coldkey, 1, 1, 0, 0, :total_stake, 1, 0, 0, :manual_stake, :last_update)
-                        ON CONFLICT(hotkey) DO UPDATE SET
-                        coldkey = :coldkey,
-                        total_tranche_amount = :total_stake,
-                        manual_amount = :manual_stake,
-                        last_update = :last_update
-                    """, metric)
-                logger.info(f"Added {len(metrics)} aggregated tranche metrics")
-            except Exception as e:
-                logger.error(f"Error initializing aggregated tranche metrics: {e}")
+                logger.error(f"Error updating miner_metrics: {e}")
             
             # Update coldkey metrics
             try:
@@ -1095,32 +1143,35 @@ class VestingSystem:
                 
                 # Update metrics for each coldkey
                 for coldkey in unique_coldkeys:
-                    # Calculate aggregated metrics for this coldkey
-                    coldkey_metrics = [m for m in metrics if m['coldkey'] == coldkey]
-                    total_stake = sum(m['total_stake'] for m in coldkey_metrics)
-                    manual_stake = sum(m['manual_stake'] for m in coldkey_metrics)
-                    earned_stake = sum(m['earned_stake'] for m in coldkey_metrics)
-                    num_hotkeys = len(coldkey_metrics)
-                    
-                    # Insert or update coldkey metrics
-                    await self.db_manager.execute_query("""
-                        INSERT INTO coldkey_metrics 
-                        (coldkey, total_stake, manual_stake, earned_stake, hotkey_count, last_update)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(coldkey) DO UPDATE SET
-                        total_stake = excluded.total_stake,
-                        manual_stake = excluded.manual_stake,
-                        earned_stake = excluded.earned_stake,
-                        hotkey_count = excluded.hotkey_count,
-                        last_update = excluded.last_update
-                    """, (
-                        coldkey,
-                        total_stake,
-                        manual_stake,
-                        earned_stake,
-                        num_hotkeys,
-                        int(datetime.now(timezone.utc).timestamp())
-                    ))
+                    try:
+                        # Calculate aggregated metrics for this coldkey
+                        coldkey_metrics = [m for m in metrics if m['coldkey'] == coldkey]
+                        total_stake = sum(m['total_stake'] for m in coldkey_metrics)
+                        manual_stake = sum(m['manual_stake'] for m in coldkey_metrics)
+                        earned_stake = sum(m['earned_stake'] for m in coldkey_metrics)
+                        num_hotkeys = len(coldkey_metrics)
+                        
+                        # Insert or update coldkey metrics
+                        await self.db_manager.execute_query("""
+                            INSERT INTO coldkey_metrics 
+                            (coldkey, total_stake, manual_stake, earned_stake, hotkey_count, last_update)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(coldkey) DO UPDATE SET
+                            total_stake = excluded.total_stake,
+                            manual_stake = excluded.manual_stake,
+                            earned_stake = excluded.earned_stake,
+                            hotkey_count = excluded.hotkey_count,
+                            last_update = excluded.last_update
+                        """, (
+                            coldkey,
+                            total_stake,
+                            manual_stake,
+                            earned_stake,
+                            num_hotkeys,
+                            int(datetime.now(timezone.utc).timestamp())
+                        ))
+                    except Exception as e:
+                        logger.error(f"Error updating metrics for coldkey {coldkey}: {e}")
                 
                 logger.info(f"Updated metrics for {len(unique_coldkeys)} coldkeys")
             except Exception as e:
@@ -1133,15 +1184,48 @@ class VestingSystem:
                 logger.info(f"Successfully initialized {len(stakes)} miners from metagraph")
                 logger.info(f"Total stakers: {verification['total_stakers']}, Total stake: {verification['total_stake']:.2f}")
                 
-                # Set initialization flag in blockchain_state
+                # Set initialization flag in vesting_module_state
                 try:
-                    await self.db_manager.execute_query("""
-                        INSERT OR REPLACE INTO blockchain_state (key, value)
-                        VALUES ('vesting_metagraph_initialized', 'true')
+                    # Get current system state record
+                    result = await self.db_manager.fetch_one("""
+                        SELECT module_data FROM vesting_module_state
+                        WHERE module_name = 'vesting_system'
                     """)
-                    logger.info("Set vesting_metagraph_initialized flag to true")
+                    
+                    if result and result['module_data']:
+                        # Update existing record
+                        try:
+                            system_state = json.loads(result['module_data'])
+                            system_state['metagraph_initialized'] = True
+                            
+                            await self.db_manager.execute_query("""
+                                UPDATE vesting_module_state 
+                                SET module_data = ?, last_timestamp = ?
+                                WHERE module_name = 'vesting_system'
+                            """, (json.dumps(system_state), int(time.time())))
+                            
+                            logger.info("Updated metagraph_initialized flag to true in vesting_module_state")
+                        except Exception as e:
+                            logger.error(f"Error updating metagraph_initialized flag: {e}")
+                    else:
+                        # Create new record
+                        system_state = {
+                            "netuid": self.subnet_id,
+                            "last_validated_block": 0,
+                            "validator_take": self.validator_take,
+                            "min_stake_requirement": self.minimum_stake,
+                            "metagraph_initialized": True
+                        }
+                        
+                        await self.db_manager.execute_query("""
+                            INSERT INTO vesting_module_state
+                            (module_name, last_block, last_timestamp, last_epoch, module_data)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, ('vesting_system', 0, time.time(), 0, json.dumps(system_state)))
+                        
+                        logger.info("Created vesting_module_state record with metagraph_initialized flag")
                 except Exception as e:
-                    logger.error(f"Error setting initialization flag: {e}")
+                    logger.error(f"Error setting metagraph_initialized flag: {e}")
                 
                 # As a final safety measure, force an update of all coldkey metrics
                 await self.update_all_coldkey_metrics()
@@ -1157,16 +1241,16 @@ class VestingSystem:
             
     async def _verify_initialization(self):
         """
-        Verify that the initialization was successful by checking the stake metrics.
+        Verify that the initialization was successful by checking the miner_metrics.
         
         Returns:
             dict: Verification result with success, staker count, and total stake
         """
         try:
-            # Verify that stake_metrics has entries with non-zero stake
+            # Verify that miner_metrics has entries with non-zero stake
             result = await self.db_manager.fetch_one("""
                 SELECT COUNT(*) AS count, SUM(total_stake) AS total
-                FROM stake_metrics
+                FROM miner_metrics
                 WHERE total_stake > 0
             """)
             
@@ -1257,7 +1341,7 @@ class VestingSystem:
                 
                 # Get all hotkeys in our database
                 results = await self.db_manager.fetch_all("""
-                    SELECT DISTINCT hotkey FROM stake_metrics
+                    SELECT DISTINCT hotkey FROM miner_metrics
                 """)
                 db_hotkeys = set(row['hotkey'] for row in results) if results else set()
                 
@@ -1272,43 +1356,23 @@ class VestingSystem:
             for hotkey in deregistered_hotkeys:
                 # Get the coldkey first so we can update coldkey metrics later
                 coldkey_result = await self.db_manager.fetch_one("""
-                    SELECT coldkey FROM stake_metrics WHERE hotkey = ?
+                    SELECT coldkey FROM miner_metrics WHERE hotkey = ?
                 """, (hotkey,))
-                
                 coldkey = coldkey_result['coldkey'] if coldkey_result else None
                 
-                # Delete from stake_metrics
+                # Delete from miner_metrics
                 await self.db_manager.execute_query("""
-                    DELETE FROM stake_metrics WHERE hotkey = ?
+                    DELETE FROM miner_metrics WHERE hotkey = ?
                 """, (hotkey,))
-                
-                # Delete from aggregated_tranche_metrics
-                await self.db_manager.execute_query("""
-                    DELETE FROM aggregated_tranche_metrics WHERE hotkey = ?
-                """, (hotkey,))
-                
-                # Get all tranche IDs for this hotkey
-                tranche_results = await self.db_manager.fetch_all("""
-                    SELECT id FROM stake_tranches WHERE hotkey = ?
-                """, (hotkey,))
-                
-                if tranche_results:
-                    tranche_ids = [row['id'] for row in tranche_results]
-                    
-                    # Delete from stake_tranche_exits for all associated tranches
-                    for tranche_id in tranche_ids:
-                        await self.db_manager.execute_query("""
-                            DELETE FROM stake_tranche_exits WHERE tranche_id = ?
-                        """, (tranche_id,))
                 
                 # Delete from stake_tranches
                 await self.db_manager.execute_query("""
                     DELETE FROM stake_tranches WHERE hotkey = ?
                 """, (hotkey,))
                 
-                # Delete from stake_change_history
+                # Delete from stake_transactions
                 await self.db_manager.execute_query("""
-                    DELETE FROM stake_change_history WHERE hotkey = ?
+                    DELETE FROM stake_transactions WHERE hotkey = ?
                 """, (hotkey,))
                 
                 logger.info(f"Cleaned up data for deregistered miner: {hotkey}")
@@ -1379,20 +1443,18 @@ class VestingSystem:
                 'system_status': 'operational',
                 'metagraph_initialized': False,
                 'tables': {
-                    'stake_metrics': {'count': 0, 'total_stake': 0},
-                    'stake_tranches': {'count': 0, 'total_stake': 0},
-                    'aggregated_tranche_metrics': {'count': 0, 'total_stake': 0},
-                    'coldkey_metrics': {'count': 0},
-                    'stake_change_history': {'count': 0},
-                    'stake_transactions': {'count': 0}
+                    'miner_metrics': {'count': 0, 'total_stake': 0},
+                    'coldkey_metrics': {'count': 0, 'total_stake': 0},
+                    'stake_transactions': {'count': 0},
+                    'stake_tranches': {'count': 0, 'active_count': 0, 'total_remaining': 0},
+                    'vesting_module_state': {'count': 0}
                 },
                 'errors': []
             }
             
             # Check if tables exist
             for table in [
-                'stake_metrics', 'stake_tranches', 'aggregated_tranche_metrics',
-                'coldkey_metrics', 'stake_change_history', 'stake_transactions'
+                'miner_metrics', 'stake_tranches', 'vesting_module_state'
             ]:
                 try:
                     result = await self.db_manager.fetch_one(f"""
@@ -1404,37 +1466,42 @@ class VestingSystem:
                 except Exception as e:
                     info['errors'].append(f"Error checking {table} table: {str(e)}")
             
-            # Check if vesting_metagraph_initialized flag is set
+            # Check if metagraph initialization is marked in vesting_module_state
             try:
                 result = await self.db_manager.fetch_one("""
-                    SELECT value FROM blockchain_state 
-                    WHERE key = 'vesting_metagraph_initialized'
+                    SELECT module_data FROM vesting_module_state 
+                    WHERE module_name = 'vesting_system'
                 """)
-                info['metagraph_initialized'] = result and result['value'] == 'true'
+                if result and result['module_data']:
+                    try:
+                        module_data = json.loads(result['module_data'])
+                        info['metagraph_initialized'] = module_data.get('metagraph_initialized', False)
+                    except Exception as e:
+                        info['errors'].append(f"Error parsing module_data: {str(e)}")
+                else:
+                    info['metagraph_initialized'] = False
             except Exception as e:
                 info['errors'].append(f"Error checking initialization flag: {str(e)}")
             
-            # Get stake metrics stats
+            # Get miner_metrics stats
             try:
                 result = await self.db_manager.fetch_one("""
                     SELECT COUNT(*) as count, SUM(total_stake) as total 
-                    FROM stake_metrics
-                    WHERE total_stake > 0
+                    FROM miner_metrics
                 """)
                 if result:
-                    info['tables']['stake_metrics'] = {
+                    info['tables']['miner_metrics'] = {
                         'count': result['count'] or 0,
                         'total_stake': round(result['total'] or 0, 4)
                     }
             except Exception as e:
-                info['errors'].append(f"Error getting stake metrics: {str(e)}")
+                info['errors'].append(f"Error getting miner_metrics: {str(e)}")
             
             # Get stake tranches stats
             try:
                 result = await self.db_manager.fetch_one("""
                     SELECT COUNT(*) as count, SUM(remaining_amount) as total 
                     FROM stake_tranches
-                    WHERE remaining_amount > 0
                 """)
                 if result:
                     info['tables']['stake_tranches'] = {
@@ -1444,65 +1511,10 @@ class VestingSystem:
             except Exception as e:
                 info['errors'].append(f"Error getting stake tranches: {str(e)}")
             
-            # Get aggregated tranche metrics stats
-            try:
-                result = await self.db_manager.fetch_one("""
-                    SELECT COUNT(*) as count, SUM(total_tranche_amount) as total 
-                    FROM aggregated_tranche_metrics
-                    WHERE total_tranche_amount > 0
-                """)
-                if result:
-                    info['tables']['aggregated_tranche_metrics'] = {
-                        'count': result['count'] or 0,
-                        'total_stake': round(result['total'] or 0, 4)
-                    }
-            except Exception as e:
-                info['errors'].append(f"Error getting aggregated metrics: {str(e)}")
-            
-            # Get coldkey metrics stats
-            try:
-                result = await self.db_manager.fetch_one("""
-                    SELECT COUNT(*) as count, SUM(total_stake) as total_stake, SUM(hotkey_count) as total_hotkeys
-                    FROM coldkey_metrics
-                    WHERE total_stake > 0
-                """)
-                if result:
-                    info['tables']['coldkey_metrics'] = {
-                        'count': result['count'] or 0,
-                        'total_stake': round(result['total_stake'] or 0, 4),
-                        'total_hotkeys': result['total_hotkeys'] or 0
-                    }
-            except Exception as e:
-                info['errors'].append(f"Error getting coldkey metrics: {str(e)}")
-            
-            # Get stake change history stats
-            try:
-                result = await self.db_manager.fetch_one("""
-                    SELECT COUNT(*) as count FROM stake_change_history
-                """)
-                if result:
-                    info['tables']['stake_change_history'] = {
-                        'count': result['count'] or 0
-                    }
-            except Exception as e:
-                info['errors'].append(f"Error getting stake change history: {str(e)}")
-            
-            # Get stake transactions stats
-            try:
-                result = await self.db_manager.fetch_one("""
-                    SELECT COUNT(*) as count FROM stake_transactions
-                """)
-                if result:
-                    info['tables']['stake_transactions'] = {
-                        'count': result['count'] or 0
-                    }
-            except Exception as e:
-                info['errors'].append(f"Error getting stake transactions: {str(e)}")
-            
             # Set overall system status based on errors and data
             if info['errors']:
                 info['system_status'] = 'error'
-            elif (info['tables']['stake_metrics']['count'] == 0 or
+            elif (info['tables']['miner_metrics']['count'] == 0 or
                   info['tables']['stake_tranches']['count'] == 0):
                 info['system_status'] = 'no_data'
             elif not info['metagraph_initialized']:
@@ -1517,170 +1529,601 @@ class VestingSystem:
                 'errors': [f"Failed to get diagnostic info: {str(e)}"]
             }
     
-    async def update_all_coldkey_metrics(self):
+    async def update_all_coldkey_metrics(self) -> bool:
         """
-        Force an update of all coldkey metrics by scanning all stake_metrics entries.
-        This ensures coldkey_metrics table is fully populated and up-to-date.
+        Force an update of all coldkey metrics by scanning all miner_metrics entries.
+        
+        Returns:
+            bool: True if update was successful
         """
         try:
-            logger.info("Forcing update of all coldkey metrics")
-            
-            # Get unique coldkeys from stake_metrics
-            results = await self.db_manager.fetch_all("""
-                SELECT DISTINCT coldkey FROM stake_metrics WHERE coldkey IS NOT NULL
+            # Get unique coldkeys from miner_metrics
+            coldkeys_result = await self.db_manager.fetch_all("""
+                SELECT DISTINCT coldkey FROM miner_metrics WHERE coldkey IS NOT NULL
             """)
             
-            if not results:
-                logger.warning("No coldkeys found in stake_metrics table")
-                return
+            if not coldkeys_result:
+                logger.warning("No coldkeys found in miner_metrics table")
+                return False
                 
-            unique_coldkeys = [row['coldkey'] for row in results]
-            logger.info(f"Found {len(unique_coldkeys)} unique coldkeys to update")
+            coldkeys = [row['coldkey'] for row in coldkeys_result]
+            logger.info(f"Updating metrics for {len(coldkeys)} coldkeys")
             
-            # Update metrics for each coldkey using stake_tracker
-            for coldkey in unique_coldkeys:
+            updated_count = 0
+            
+            # Update metrics for each coldkey
+            for coldkey in coldkeys:
                 try:
-                    await self.stake_tracker._update_coldkey_metrics(coldkey)
+                    # Get all hotkeys for this coldkey
+                    hotkeys_result = await self.db_manager.fetch_all("""
+                        SELECT hotkey, total_stake, manual_stake, earned_stake
+                        FROM miner_metrics
+                        WHERE coldkey = ?
+                    """, (coldkey,))  # Use a tuple with a trailing comma for a single parameter
+                    
+                    if not hotkeys_result:
+                        logger.warning(f"No hotkeys found for coldkey {coldkey}")
+                        continue
+                        
+                    # Calculate aggregated metrics
+                    hotkeys = [row['hotkey'] for row in hotkeys_result]
+                    total_stake = sum(row['total_stake'] for row in hotkeys_result)
+                    manual_stake = sum(row['manual_stake'] for row in hotkeys_result)
+                    earned_stake = sum(row['earned_stake'] for row in hotkeys_result)
+                    timestamp = int(datetime.now(timezone.utc).timestamp())
+                    
+                    # Update coldkey metrics
+                    await self.db_manager.execute_query("""
+                        INSERT OR REPLACE INTO coldkey_metrics
+                        (coldkey, total_stake, manual_stake, earned_stake, hotkey_count, last_update)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (coldkey, total_stake, manual_stake, earned_stake, len(hotkeys), timestamp))
+                    
+                    updated_count += 1
+                    
                 except Exception as e:
                     logger.error(f"Error updating metrics for coldkey {coldkey}: {e}")
             
-            # Verify the results
-            result = await self.db_manager.fetch_one("""
-                SELECT COUNT(*) as count, SUM(total_stake) as total_stake, SUM(hotkey_count) as total_hotkeys
-                FROM coldkey_metrics
-            """)
-            
-            if result:
-                logger.info(f"Updated {result['count']} coldkeys with {result['total_stake']:.2f} total stake " +
-                          f"and {result['total_hotkeys']} hotkeys")
-            else:
-                logger.warning("No coldkey metrics found after update")
+            logger.info(f"Successfully updated metrics for {updated_count}/{len(coldkeys)} coldkeys")
+            return updated_count > 0
                 
         except Exception as e:
             logger.error(f"Error updating all coldkey metrics: {e}")
+            return False
     
-    async def update_coldkey_hotkey_relationships(self):
+    async def _verify_database_state(self, verbose: bool = False):
+        """Verify the current state of the vesting database."""
+        try:
+            # Check that all required tables exist
+            table_names = [
+                'miner_metrics',
+                'coldkey_metrics',
+                'stake_transactions',
+                'stake_tranches',
+                'vesting_module_state'
+            ]
+            
+            tables_checked = 0
+            for table_name in table_names:
+                try:
+                    await self.db_manager.fetch_one(f"SELECT COUNT(*) as count FROM {table_name}")
+                    tables_checked += 1
+                except Exception as e:
+                    logger.error(f"Table {table_name} check failed: {e}")
+                    return False
+            
+            if verbose:
+                logger.info(f"All {tables_checked} vesting tables exist and are accessible")
+            
+            # Check miner_metrics
+            try:
+                metrics_result = await self.db_manager.fetch_one("""
+                    SELECT COUNT(*) as count, SUM(total_stake) as total_stake 
+                    FROM miner_metrics
+                """)
+                
+                metrics_count = metrics_result['count']
+                metrics_stake = metrics_result['total_stake'] or 0
+                
+                if verbose:
+                    logger.info(f"Current miner_metrics: {metrics_count} rows, {metrics_stake:.2f} total stake")
+            except Exception as e:
+                logger.error(f"Error checking miner_metrics: {e}")
+                return False
+            
+            # Check tranche consistency if requested
+            if verbose:
+                try:
+                    tranches_result = await self.db_manager.fetch_one("""
+                        SELECT COUNT(*) as count, 
+                               SUM(remaining_amount) as total_remaining,
+                               SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_count
+                        FROM stake_tranches
+                    """)
+                    
+                    tranches_count = tranches_result['count']
+                    active_tranches = tranches_result['active_count']
+                    total_remaining = tranches_result['total_remaining'] or 0
+                    
+                    logger.info(f"Current tranches: {tranches_count} total, {active_tranches} active, {total_remaining:.2f} TAO remaining")
+                    
+                    # Verify total stake matches
+                    stake_diff = abs(metrics_stake - total_remaining)
+                    if stake_diff > 0.01:
+                        logger.warning(f"Stake mismatch: metrics={metrics_stake:.2f}, tranches={total_remaining:.2f}, diff={stake_diff:.2f}")
+                except Exception as e:
+                    logger.error(f"Error checking tranches: {e}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error verifying database state: {e}")
+            return False
+    
+    async def get_hotkeys_with_minimum_stake(self, minimum_stake: float = None) -> List[str]:
         """
-        Explicitly update coldkey-hotkey relationships based on metagraph data.
+        Get all hotkeys with at least the minimum stake.
         
-        This method ensures that coldkey_metrics is properly populated with
-        relationships between coldkeys and their associated hotkeys.
+        Args:
+            minimum_stake: Minimum stake amount required (defaults to self.minimum_stake)
+            
+        Returns:
+            List[str]: List of hotkeys with at least the minimum stake
+        """
+        min_stake = minimum_stake if minimum_stake is not None else self.minimum_stake
+        
+        try:
+            # Get hotkeys from miner_metrics table with minimum stake
+            results = await self.db_manager.fetch_all("""
+                SELECT hotkey
+                FROM miner_metrics
+                WHERE total_stake >= ?
+                ORDER BY total_stake DESC
+            """, (min_stake,))
+            
+            return [row['hotkey'] for row in results]
+            
+        except Exception as e:
+            logger.error(f"Error getting hotkeys with minimum stake: {e}")
+            return []
+
+    async def reset_vesting_database(self, keep_metagraph_data: bool = False) -> bool:
+        """
+        Reset (clear) all data in the vesting database tables.
+        
+        Args:
+            keep_metagraph_data: If True, keep netuid and metagraph data
+            
+        Returns:
+            bool: True if reset was successful
         """
         try:
-            logger.info("Updating coldkey-hotkey relationships from metagraph")
+            logger.warning("Resetting vesting database - ALL VESTING DATA WILL BE LOST")
             
-            # Get current metagraph
-            self._metagraph = self.subtensor.metagraph(netuid=self.subnet_id)
+            # Delete data from the main vesting tables
+            await self.db_manager.execute_query("DELETE FROM miner_metrics")
+            await self.db_manager.execute_query("DELETE FROM coldkey_metrics")
+            await self.db_manager.execute_query("DELETE FROM stake_transactions")
+            await self.db_manager.execute_query("DELETE FROM stake_tranches")
             
-            # Create a mapping of hotkeys to coldkeys
-            hotkey_to_coldkey = {}
-            coldkey_to_hotkeys = {}
+            if not keep_metagraph_data:
+                await self.db_manager.execute_query("DELETE FROM vesting_module_state")
             
-            # Log the size of the metagraph
-            logger.info(f"Metagraph contains {len(self._metagraph.hotkeys)} hotkeys")
+            logger.info("Successfully reset vesting database")
             
-            # Process each hotkey in the metagraph
-            for idx, hotkey in enumerate(self._metagraph.hotkeys):
-                # Get coldkey for this hotkey
-                if hasattr(self._metagraph, 'owner_by_hotkey'):
-                    coldkey = self._metagraph.owner_by_hotkey(hotkey)
-                elif hasattr(self._metagraph, 'coldkeys') and idx < len(self._metagraph.coldkeys):
-                    coldkey = self._metagraph.coldkeys[idx]
-                else:
-                    logger.warning(f"Cannot determine coldkey for hotkey {hotkey}")
+            # Reinitialize the system
+            await self.stake_tracker.initialize()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting vesting database: {e}")
+            return False
+
+    async def initialize_hotkeys_from_metagraph(self, metagraph, stake_info: Optional[dict] = None) -> bool:
+        """
+        Initialize stake metrics for all hotkeys from the metagraph.
+        
+        This method takes a snapshot of the current stake state in the metagraph
+        and stores it in the vesting system database.
+        
+        Args:
+            metagraph: Bittensor metagraph
+            stake_info: Optional dictionary of stake info to use instead of metagraph
+            
+        Returns:
+            bool: True if initialization was successful
+        """
+        try:
+            # Get all existing hotkeys in miner_metrics
+            existing_result = await self.db_manager.fetch_all("""
+                SELECT hotkey FROM miner_metrics
+            """)
+            existing_hotkeys = [row['hotkey'] for row in existing_result]
+            logger.info(f"Found {len(existing_hotkeys)} existing hotkeys in miner_metrics")
+            
+            # Get all hotkeys from metagraph
+            if stake_info is None:
+                logger.info("Getting hotkeys and stake from metagraph")
+                hotkeys = metagraph.hotkeys
+                stakes = metagraph.S.tolist()
+                try:
+                    coldkeys = metagraph.coldkeys
+                except:
+                    # Older metagraph might not have coldkeys
+                    coldkeys = ["unknown"] * len(hotkeys)
+                    
+                # Convert to a dictionary
+                stake_info = {
+                    hotkeys[i]: {
+                        'stake': float(stakes[i]),
+                        'coldkey': coldkeys[i] if i < len(coldkeys) else "unknown"
+                    } for i in range(len(hotkeys))
+                }
+            
+            # Count totals for logging
+            total_hotkeys = len(stake_info)
+            total_stake = sum(info['stake'] for info in stake_info.values())
+            new_count = 0
+            new_stake = 0
+            updated_count = 0
+            updated_stake = 0
+            
+            # Current timestamp
+            now = datetime.now(timezone.utc)
+            timestamp = int(now.timestamp())
+            
+            # Get existing data to avoid duplicate work
+            existing_stake = {}
+            if existing_hotkeys:
+                existing_data = await self.db_manager.fetch_all("""
+                    SELECT hotkey, total_stake, coldkey
+                    FROM miner_metrics
+                    WHERE hotkey IN ({})
+                """.format(','.join(['?'] * len(existing_hotkeys))), existing_hotkeys)
+                
+                for row in existing_data:
+                    existing_stake[row['hotkey']] = {
+                        'stake': row['total_stake'],
+                        'coldkey': row['coldkey']
+                    }
+            
+            # Process each hotkey
+            for hotkey, info in stake_info.items():
+                stake = info['stake']
+                coldkey = info['coldkey']
+                
+                # Skip if stake is zero or too small
+                if stake < 0.001:
                     continue
                     
-                if coldkey:
-                    hotkey_to_coldkey[hotkey] = coldkey
-                    
-                    if coldkey not in coldkey_to_hotkeys:
-                        coldkey_to_hotkeys[coldkey] = []
-                    coldkey_to_hotkeys[coldkey].append(hotkey)
-            
-            # Log the number of coldkeys found
-            logger.info(f"Found {len(coldkey_to_hotkeys)} unique coldkeys in metagraph")
-            
-            # Store hotkey to coldkey relationships in stake_metrics table if needed
-            for hotkey, coldkey in hotkey_to_coldkey.items():
-                # Check if entry exists
-                result = await self.db_manager.fetch_one("""
-                    SELECT coldkey FROM stake_metrics WHERE hotkey = ?
-                """, (hotkey,))
+                # Check if hotkey already exists with same stake and coldkey
+                if hotkey in existing_stake:
+                    existing_info = existing_stake[hotkey]
+                    if abs(existing_info['stake'] - stake) < 0.001 and existing_info['coldkey'] == coldkey:
+                        # Skip if stake and coldkey are unchanged
+                        continue
                 
-                if not result:
-                    # Need to create a new entry with default values
-                    await self.db_manager.execute_query("""
-                        INSERT INTO stake_metrics
-                        (hotkey, coldkey, total_stake, manual_stake, earned_stake, first_stake_timestamp, last_update)
-                        VALUES (?, ?, 0, 0, 0, ?, ?)
-                    """, (
-                        hotkey,
-                        coldkey,
-                        int(datetime.now(timezone.utc).timestamp()),
-                        int(datetime.now(timezone.utc).timestamp())
-                    ))
-                    logger.debug(f"Created new stake_metrics entry for hotkey {hotkey}, coldkey {coldkey}")
-                elif result['coldkey'] != coldkey:
-                    # Update coldkey if different
-                    await self.db_manager.execute_query("""
-                        UPDATE stake_metrics SET coldkey = ? WHERE hotkey = ?
-                    """, (coldkey, hotkey))
-                    logger.debug(f"Updated coldkey for hotkey {hotkey} from {result['coldkey']} to {coldkey}")
-            
-            # Now update coldkey_metrics table
-            for coldkey, hotkeys in coldkey_to_hotkeys.items():
-                # Update coldkey metrics
-                await self.stake_tracker._update_coldkey_metrics(coldkey)
+                if hotkey in existing_hotkeys:
+                    # Update existing
+                    updated_count += 1
+                    updated_stake += stake
+                else:
+                    # Add new
+                    new_count += 1
+                    new_stake += stake
                 
-            # Verify results
-            result = await self.db_manager.fetch_one("""
-                SELECT COUNT(*) as count FROM coldkey_metrics
+                # Insert or update miner_metrics table
+                await self.db_manager.execute_query("""
+                    INSERT OR REPLACE INTO miner_metrics 
+                    (hotkey, coldkey, total_stake, manual_stake, earned_stake, first_stake_timestamp, last_update,
+                     total_tranches, active_tranches, avg_tranche_age, oldest_tranche_age, manual_tranches, emission_tranches)
+                    VALUES (?, ?, ?, ?, 0, ?, ?, 0, 0, 0, 0, 0, 0)
+                """, [hotkey, coldkey, stake, stake, timestamp, timestamp])
+                
+                # Create a corresponding tranche
+                await self.db_manager.execute_query("""
+                    INSERT INTO stake_tranches
+                    (hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update, is_active)
+                    VALUES (?, ?, ?, ?, ?, 0, ?, 1)
+                """, [hotkey, coldkey, stake, stake, timestamp, timestamp])
+                
+                # Add a stake transaction record
+                await self.db_manager.execute_query("""
+                    INSERT INTO stake_transactions
+                    (block_number, timestamp, transaction_type, flow_type, hotkey, coldkey, 
+                     amount, stake_after, manual_stake_after, earned_stake_after, change_type)
+                    VALUES (0, ?, 'initial_import', 'inflow', ?, ?, ?, ?, ?, 0, 'manual')
+                """, [timestamp, hotkey, coldkey, stake, stake, stake])
+            
+            # Update coldkey metrics
+            await self._update_coldkey_metrics()
+            
+            # Log results
+            logger.info(f"Initialized {total_hotkeys} hotkeys with {total_stake:.2f} total stake from metagraph")
+            logger.info(f"Added {new_count} new hotkeys with {new_stake:.2f} stake")
+            logger.info(f"Updated {updated_count} existing hotkeys with {updated_stake:.2f} stake")
+            
+            # Verify that miner_metrics has entries with non-zero stake
+            verification_result = await self.db_manager.fetch_one("""
+                SELECT COUNT(*) as count, SUM(total_stake) as total_stake
+                FROM miner_metrics
+                WHERE total_stake > 0
             """)
-            coldkey_count = result['count'] if result else 0
             
-            if coldkey_count > 0:
-                logger.info(f"Successfully updated {coldkey_count} coldkey metrics records")
+            if verification_result and verification_result['count'] > 0:
+                logger.info(f"Verification successful: {verification_result['count']} miners with {verification_result['total_stake']:.2f} total stake")
+                return True
             else:
-                logger.warning("No coldkey metrics records were created")
-                
-            # Return success/failure
-            return coldkey_count > 0
+                logger.error("Verification failed: No miners with stake found after initialization")
+                return False
                 
         except Exception as e:
-            logger.error(f"Error updating coldkey-hotkey relationships: {e}")
+            logger.error(f"Error initializing hotkeys from metagraph: {e}")
             logger.debug(traceback.format_exc())
             return False
     
-    def start_background_thread(self, thread_priority: str = 'low'):
+    async def remove_hotkey(self, hotkey: str) -> bool:
         """
-        Start the background monitoring thread.
+        Remove a hotkey from the vesting system.
         
         Args:
-            thread_priority: Priority of the monitoring thread ('low', 'normal', 'high')
+            hotkey: Hotkey to remove
+            
+        Returns:
+            bool: True if removal was successful
         """
         try:
-            # Convert priority string to nice value
-            thread_nice_value = {
-                'low': 10,
-                'normal': 0,
-                'high': -10
-            }.get(thread_priority.lower(), 0)
+            # Get the coldkey to update coldkey metrics after removal
+            coldkey_result = await self.db_manager.fetch_one("""
+                SELECT coldkey FROM miner_metrics WHERE hotkey = ?
+            """, [hotkey])
             
-            # Start blockchain monitoring thread
-            if hasattr(self, 'blockchain_monitor') and self.blockchain_monitor is not None:
-                self.blockchain_monitor.start_background_thread(thread_nice_value=thread_nice_value)
-                logger.info(f"Started blockchain monitor thread (priority: {thread_priority})")
+            coldkey = coldkey_result['coldkey'] if coldkey_result else None
             
-            # Start transaction monitoring thread if enabled
-            if self.detailed_transaction_tracking and hasattr(self, 'transaction_monitor') and self.transaction_monitor is not None:
-                success = self.transaction_monitor.start_monitoring(thread_nice_value=thread_nice_value)
-                if not success:
-                    logger.warning("Failed to start transaction monitoring thread")
-                else:
-                    logger.info(f"Started transaction monitoring thread (priority: {thread_priority})")
-                    
-            logger.info("Background monitoring threads started successfully")
+            # Delete from miner_metrics
+            await self.db_manager.execute_query("""
+                DELETE FROM miner_metrics WHERE hotkey = ?
+            """, [hotkey])
+            
+            # Delete from stake_tranches
+            await self.db_manager.execute_query("""
+                DELETE FROM stake_tranches WHERE hotkey = ?
+            """, [hotkey])
+            
+            # Delete from stake_transactions
+            await self.db_manager.execute_query("""
+                DELETE FROM stake_transactions WHERE hotkey = ?
+            """, [hotkey])
+            
+            logger.info(f"Removed hotkey {hotkey} from vesting system")
+            
+            # Update coldkey metrics if a coldkey was found
+            if coldkey:
+                try:
+                    await self._update_coldkey_metrics(coldkey)
+                    logger.debug(f"Updated metrics for coldkey {coldkey} after removing hotkey {hotkey}")
+                except Exception as e:
+                    logger.error(f"Error updating coldkey metrics after hotkey removal: {e}")
+            
             return True
+        except Exception as e:
+            logger.error(f"Error removing hotkey {hotkey}: {e}")
+            return False
+
+    async def get_database_info(self) -> Dict:
+        """
+        Get information about the vesting database.
+        
+        Returns:
+            Dict: Information about tables and metrics
+        """
+        info = {
+            'tables': {
+                'miner_metrics': {'count': 0, 'total_stake': 0},
+                'coldkey_metrics': {'count': 0, 'total_stake': 0},
+                'stake_transactions': {'count': 0},
+                'stake_tranches': {'count': 0, 'active_count': 0, 'total_remaining': 0},
+                'vesting_module_state': {'count': 0}
+            },
+            'last_updated': None
+        }
+        
+        # List of tables to check
+        tables = [
+            'miner_metrics', 'coldkey_metrics', 'stake_transactions',
+            'stake_tranches', 'vesting_module_state'
+        ]
+        
+        try:
+            # Check each table
+            for table_name in tables:
+                count_result = await self.db_manager.fetch_one(f"""
+                    SELECT COUNT(*) as count FROM {table_name}
+                """)
+                
+                info['tables'][table_name]['count'] = count_result['count']
+            
+            # Get total stake from miner_metrics
+            stake_result = await self.db_manager.fetch_one("""
+                SELECT SUM(total_stake) as total_stake FROM miner_metrics
+            """)
+            
+            info['tables']['miner_metrics']['total_stake'] = float(stake_result['total_stake'] or 0)
+            
+            # Get stake from coldkey_metrics
+            coldkey_result = await self.db_manager.fetch_one("""
+                SELECT SUM(total_stake) as total_stake FROM coldkey_metrics
+            """)
+            
+            info['tables']['coldkey_metrics']['total_stake'] = float(coldkey_result['total_stake'] or 0)
+            
+            # Get tranche stats
+            tranche_result = await self.db_manager.fetch_one("""
+                SELECT 
+                    COUNT(*) as count,
+                    SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active_count,
+                    SUM(remaining_amount) as total_remaining
+                FROM stake_tranches
+            """)
+            
+            info['tables']['stake_tranches']['active_count'] = tranche_result['active_count']
+            info['tables']['stake_tranches']['total_remaining'] = float(tranche_result['total_remaining'] or 0)
+            
+            # Get last updated timestamp from module state
+            timestamp_result = await self.db_manager.fetch_one("""
+                SELECT MAX(last_timestamp) as last_updated FROM vesting_module_state
+            """)
+            
+            if timestamp_result and timestamp_result['last_updated']:
+                info['last_updated'] = timestamp_result['last_updated']
+            
+            return info
+        except Exception as e:
+            logger.error(f"Error getting database info: {e}")
+            return info
+
+    async def _update_hotkey_coldkey_mapping(self, metagraph) -> bool:
+        """
+        Update hotkey to coldkey mappings from the metagraph.
+        
+        Args:
+            metagraph: Bittensor metagraph
+            
+        Returns:
+            bool: True if update was successful
+        """
+        try:
+            # Get hotkeys and coldkeys from metagraph
+            hotkeys = metagraph.hotkeys
+            coldkeys = metagraph.coldkeys if hasattr(metagraph, 'coldkeys') else None
+            
+            if not coldkeys or len(coldkeys) != len(hotkeys):
+                logger.warning("Metagraph does not have valid coldkeys")
+                return False
+                
+            updates = 0
+            total = len(hotkeys)
+            
+            logger.info(f"Updating hotkey-coldkey mappings for {total} hotkeys")
+            
+            # Store hotkey to coldkey relationships in miner_metrics table if needed
+            for i, (hotkey, coldkey) in enumerate(zip(hotkeys, coldkeys)):
+                try:
+                    # Check if we already have this hotkey and its coldkey
+                    existing = await self.db_manager.fetch_one("""
+                        SELECT coldkey FROM miner_metrics WHERE hotkey = ?
+                    """, [hotkey])
+                    
+                    if not existing:
+                        # New hotkey - insert with zero stake
+                        await self.db_manager.execute_query("""
+                            INSERT INTO miner_metrics
+                            (hotkey, coldkey, total_stake, manual_stake, earned_stake, 
+                            first_stake_timestamp, last_update, total_tranches, active_tranches,
+                            avg_tranche_age, oldest_tranche_age, manual_tranches, emission_tranches)
+                            VALUES (?, ?, 0, 0, 0, ?, ?, 0, 0, 0, 0, 0, 0)
+                        """, [hotkey, coldkey, int(datetime.now(timezone.utc).timestamp()), 
+                             int(datetime.now(timezone.utc).timestamp())])
+                        logger.debug(f"Created new miner_metrics entry for hotkey {hotkey}, coldkey {coldkey}")
+                        updates += 1
+                    elif existing['coldkey'] != coldkey:
+                        # Update coldkey if different
+                        await self.db_manager.execute_query("""
+                            UPDATE miner_metrics SET coldkey = ? WHERE hotkey = ?
+                        """, [coldkey, hotkey])
+                        updates += 1
+                except Exception as miner_metrics_error:
+                    logger.error(f"Error updating miner_metrics for hotkey {hotkey}, coldkey {coldkey}: {miner_metrics_error}")
+            
+            logger.info(f"Updated {updates}/{total} hotkey-coldkey mappings")
+            
+            # Update all coldkey metrics
+            await self.update_all_coldkey_metrics()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating hotkey-coldkey mappings: {e}")
+            return False
+
+    def start_background_thread(self, thread_priority: str = 'low'):
+        """
+        Start a background thread for monitoring.
+        
+        This starts an asyncio-based thread that runs the update() method periodically.
+        
+        Args:
+            thread_priority: Priority level for the thread
+        """
+        try:
+            import threading
+            import time
+            import asyncio
+            
+            if self.monitoring_thread is not None and self.monitoring_thread.is_alive():
+                logger.warning("Background thread is already running")
+                return
+                
+            def _background_thread():
+                logger.info(f"Starting background thread with priority {thread_priority}")
+                
+                # Try to set thread priority
+                if thread_priority.lower() == 'high':
+                    nice_value = -10
+                elif thread_priority.lower() == 'normal':
+                    nice_value = 0
+                else:
+                    nice_value = 10
+                    
+                try:
+                    import os
+                    os.nice(nice_value)
+                    logger.info(f"Set thread priority with nice value {nice_value}")
+                except Exception as e:
+                    logger.warning(f"Could not set thread priority: {e}")
+                
+                # Create a new event loop for this thread
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Run the monitoring method periodically
+                while not self.stop_event.is_set():
+                    try:
+                        if self.stopping:
+                            logger.info("Stopping background thread due to stop flag")
+                            break
+                            
+                        # Call update method
+                        logger.debug("Running periodic update in background thread")
+                        loop.run_until_complete(self.update(None))
+                        
+                        # Sleep for the query interval
+                        sleep_time = self.query_interval_seconds
+                        logger.debug(f"Sleeping for {sleep_time} seconds until next update")
+                        
+                        # Use a loop with small sleeps to allow for faster shutdown
+                        for _ in range(sleep_time):
+                            if self.stop_event.is_set():
+                                break
+                            time.sleep(1)
+                            
+                    except Exception as e:
+                        logger.error(f"Error in background thread: {e}")
+                        logger.debug(traceback.format_exc())
+                        time.sleep(10)  # Sleep a bit longer on error
+                
+                loop.close()
+                logger.info("Background thread exiting")
+            
+            # Create and start the thread
+            self.monitoring_thread = threading.Thread(
+                target=_background_thread,
+                daemon=True,
+                name="VestingMonitor"
+            )
+            self.monitoring_thread.start()
+            logger.info(f"Started background thread: {self.monitoring_thread.name}")
+            
         except Exception as e:
             logger.error(f"Error starting background threads: {e}")
             return False 
+

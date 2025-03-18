@@ -651,9 +651,8 @@ def initialize_database():
         """INSERT OR IGNORE INTO db_version (version) VALUES (1)"""
     )
     
-    # Add vesting system tables 
-    vesting_statements = get_vesting_tables_statements()
-    statements.extend(vesting_statements)
+    # Note: Vesting tables are now initialized separately in the vesting database
+    # Do not include vesting_statements in the main database
     
     return statements
 

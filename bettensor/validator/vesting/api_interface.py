@@ -11,13 +11,17 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Any, Optional, Union, Tuple
+from typing import Dict, List, Any, Optional, Union, Tuple, TYPE_CHECKING
+
 import aiohttp
 import numpy as np
 
 import bittensor as bt
 from bettensor.validator.database.database_manager import DatabaseManager
-from bettensor.validator.vesting.system import VestingSystem
+
+# Use TYPE_CHECKING to avoid circular import
+if TYPE_CHECKING:
+    from bettensor.validator.vesting.system import VestingSystem
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +36,7 @@ class VestingAPIInterface:
     
     def __init__(
         self,
-        vesting_system: VestingSystem,
+        vesting_system: 'VestingSystem',
         api_base_url: str,
         api_key: Optional[str] = None,
         poll_interval_seconds: int = 300,

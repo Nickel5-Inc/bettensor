@@ -140,7 +140,7 @@ async def batch_handle_deregistrations(vesting_system: Optional[VestingSystem],
 # Factory Functions
 # ----------------------
 
-def get_vesting_system(subtensor, subnet_id, db_manager) -> VestingSystem:
+def get_vesting_system(subtensor, subnet_id, db_manager, explicit_endpoint=None) -> VestingSystem:
     """
     Get or create a vesting system instance.
     
@@ -148,14 +148,20 @@ def get_vesting_system(subtensor, subnet_id, db_manager) -> VestingSystem:
         subtensor: Subtensor instance
         subnet_id: Subnet ID
         db_manager: Database manager instance
+        explicit_endpoint: Optional explicit substrate endpoint URL
         
     Returns:
         VestingSystem: The vesting system instance
     """
+    # Create transaction monitor with explicit endpoint if provided
+    # This creates a dedicated substrate connection for transaction monitoring
+    logger.info(f"Creating VestingSystem with subnet_id: {subnet_id}, explicit_endpoint: {explicit_endpoint}")
+    
     return VestingSystem(
         subtensor=subtensor,
         subnet_id=subnet_id,
-        db_manager=db_manager
+        db_manager=db_manager,
+        explicit_endpoint=explicit_endpoint
     )
 
 async def apply_vesting_multipliers(vesting_system: VestingSystem,

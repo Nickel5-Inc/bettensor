@@ -11,6 +11,7 @@ import logging
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple, Union, Any
+import traceback
 
 import numpy as np
 
@@ -107,7 +108,13 @@ class StakeTracker:
                 'manual_stake': 0.0,
                 'earned_stake': 0.0,
                 'first_stake_timestamp': int(timestamp.timestamp()),
-                'last_update': int(timestamp.timestamp())
+                'last_update': int(timestamp.timestamp()),
+                'total_tranches': 0,
+                'active_tranches': 0,
+                'avg_tranche_age': 0,
+                'oldest_tranche_age': 0,
+                'manual_tranches': 0,
+                'emission_tranches': 0
             }
             
         # Process stake change based on flow type
@@ -123,7 +130,7 @@ class StakeTracker:
             metrics['total_stake'] += amount
             
             # Create a new stake tranche
-            await self._create_new_tranche(
+            tranche_id = await self._create_new_tranche(
                 hotkey=hotkey,
                 coldkey=coldkey,
                 amount=amount,
@@ -142,7 +149,8 @@ class StakeTracker:
             success = await self._consume_tranches_filo(
                 hotkey=hotkey,
                 amount_to_consume=amount,
-                timestamp=timestamp
+                timestamp=timestamp,
+                reason=change_type
             )
             
             if not success:
@@ -167,11 +175,38 @@ class StakeTracker:
         # Update last update timestamp
         metrics['last_update'] = int(timestamp.timestamp())
         
-        # Update the database record
+        # Record this transaction in the consolidated transactions table
+        transaction_data = {
+            'block_number': 0,  # Will be updated by blockchain monitor
+            'timestamp': int(timestamp.timestamp()),
+            'transaction_type': change_type,
+            'flow_type': flow_type,
+            'hotkey': hotkey,
+            'coldkey': coldkey,
+            'amount': amount if flow_type == INFLOW else -amount, 
+            'stake_after': metrics['total_stake'],
+            'manual_stake_after': metrics['manual_stake'],
+            'earned_stake_after': metrics['earned_stake'],
+            'change_type': 'manual' if change_type != EMISSION else 'emission'
+        }
+        
         await self.db_manager.execute_query("""
-            INSERT OR REPLACE INTO stake_metrics
-            (hotkey, coldkey, total_stake, manual_stake, earned_stake, first_stake_timestamp, last_update)
-            VALUES (:hotkey, :coldkey, :total_stake, :manual_stake, :earned_stake, :first_stake_timestamp, :last_update)
+            INSERT INTO stake_transactions
+            (block_number, timestamp, transaction_type, flow_type, hotkey, coldkey, 
+            amount, stake_after, manual_stake_after, earned_stake_after, change_type)
+            VALUES (:block_number, :timestamp, :transaction_type, :flow_type, :hotkey, :coldkey,
+            :amount, :stake_after, :manual_stake_after, :earned_stake_after, :change_type)
+        """, transaction_data)
+        
+        # Update the database record for miner metrics
+        await self.db_manager.execute_query("""
+            INSERT OR REPLACE INTO miner_metrics
+            (hotkey, coldkey, total_stake, manual_stake, earned_stake, 
+            first_stake_timestamp, last_update, total_tranches, active_tranches,
+            avg_tranche_age, oldest_tranche_age, manual_tranches, emission_tranches)
+            VALUES (:hotkey, :coldkey, :total_stake, :manual_stake, :earned_stake, 
+            :first_stake_timestamp, :last_update, :total_tranches, :active_tranches,
+            :avg_tranche_age, :oldest_tranche_age, :manual_tranches, :emission_tranches)
         """, metrics)
         
         logger.info(f"Updated stake metrics for {hotkey[:10]}...: total={metrics['total_stake']:.4f}, manual={metrics['manual_stake']:.4f}, earned={metrics['earned_stake']:.4f}")
@@ -179,8 +214,8 @@ class StakeTracker:
         # Update coldkey metrics
         await self._update_coldkey_metrics(coldkey)
         
-        # Update aggregated tranche metrics
-        await self._update_aggregated_tranche_metrics(hotkey)
+        # Update tranche metrics
+        await self._update_tranche_metrics(hotkey)
         
         return metrics
     
@@ -191,13 +226,24 @@ class StakeTracker:
         Args:
             coldkey: Coldkey to update metrics for
         """
+        if not coldkey:
+            logger.error("Cannot update coldkey metrics: coldkey is empty or None")
+            return False
+        
         try:
             # Get all hotkeys associated with this coldkey
-            hotkeys = await self.get_all_hotkeys_for_coldkey(coldkey)
+            try:
+                hotkeys = await self.get_all_hotkeys_for_coldkey(coldkey)
+                logger.debug(f"Found {len(hotkeys)} hotkeys for coldkey {coldkey}")
+            except Exception as e:
+                logger.error(f"Error getting hotkeys for coldkey {coldkey}: {e}")
+                logger.debug(traceback.format_exc())
+                return False
             
             # If no hotkeys, no metrics to update
             if not hotkeys:
-                return
+                logger.warning(f"No hotkeys found for coldkey {coldkey}, cannot update metrics")
+                return False
             
             # Get current time
             timestamp = datetime.now(timezone.utc)
@@ -206,77 +252,71 @@ class StakeTracker:
             total_stake = 0.0
             manual_stake = 0.0
             earned_stake = 0.0
+            hotkeys_with_metrics = 0
             
             for hotkey in hotkeys:
-                metrics = await self.get_stake_metrics(hotkey)
-                if metrics:
-                    total_stake += metrics['total_stake']
-                    manual_stake += metrics['manual_stake']
-                    earned_stake += metrics['earned_stake']
+                try:
+                    metrics = await self.get_stake_metrics(hotkey)
+                    if metrics:
+                        total_stake += metrics['total_stake']
+                        manual_stake += metrics['manual_stake']
+                        earned_stake += metrics['earned_stake']
+                        hotkeys_with_metrics += 1
+                    else:
+                        logger.warning(f"No stake metrics found for hotkey {hotkey}")
+                except Exception as e:
+                    logger.error(f"Error getting stake metrics for hotkey {hotkey}: {e}")
+                    continue
+            
+            logger.debug(f"Aggregated metrics for coldkey {coldkey}: {hotkeys_with_metrics}/{len(hotkeys)} hotkeys with metrics, total stake: {total_stake}")
             
             # Update or insert coldkey metrics
-            await self.db_manager.execute_query("""
-                INSERT INTO coldkey_metrics 
-                (coldkey, total_stake, manual_stake, earned_stake, hotkey_count, last_update)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(coldkey) DO UPDATE SET
-                total_stake = excluded.total_stake,
-                manual_stake = excluded.manual_stake,
-                earned_stake = excluded.earned_stake,
-                hotkey_count = excluded.hotkey_count,
-                last_update = excluded.last_update
-            """, (
-                coldkey,
-                total_stake,
-                manual_stake,
-                earned_stake,
-                len(hotkeys),
-                timestamp
-            ))
-            
+            try:
+                await self.db_manager.execute_query("""
+                    INSERT INTO coldkey_metrics 
+                    (coldkey, total_stake, manual_stake, earned_stake, hotkey_count, last_update)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(coldkey) DO UPDATE SET
+                    total_stake = excluded.total_stake,
+                    manual_stake = excluded.manual_stake,
+                    earned_stake = excluded.earned_stake,
+                    hotkey_count = excluded.hotkey_count,
+                    last_update = excluded.last_update
+                """, [coldkey, total_stake, manual_stake, earned_stake, hotkeys_with_metrics, int(timestamp.timestamp())])
+                
+                logger.debug(f"Updated coldkey metrics for {coldkey}: total={total_stake:.4f}, manual={manual_stake:.4f}, earned={earned_stake:.4f}")
+                return True
+            except Exception as e:
+                logger.error(f"Error updating coldkey metrics for {coldkey}: {e}")
+                logger.debug(traceback.format_exc())
+                return False
         except Exception as e:
-            logger.error(f"Error updating coldkey metrics for {coldkey}: {e}")
+            logger.error(f"Failed to update coldkey metrics for {coldkey}: {e}")
+            logger.debug(traceback.format_exc())
+            return False
     
     async def get_stake_metrics(self, hotkey: str) -> Optional[Dict]:
         """
-        Get current stake metrics for a hotkey.
+        Get stake metrics for a specific hotkey.
         
         Args:
-            hotkey: Hotkey to get metrics for
+            hotkey: Miner hotkey
             
         Returns:
-            Dict: Stake metrics or None if not found
+            Dict or None: Stake metrics or None if not found
         """
         try:
-            result = await self.db_manager.fetch_one("""
-                SELECT * FROM stake_metrics WHERE hotkey = ?
-            """, (hotkey,))
+            # Retrieve metrics from new miner_metrics table
+            result = await self.db_manager.execute_query("""
+                SELECT * FROM miner_metrics WHERE hotkey = ?
+            """, [hotkey], fetch_one=True)
             
-            return dict(result) if result else None
-            
+            if result:
+                return dict(result)
+            else:
+                return None
         except Exception as e:
-            logger.error(f"Error getting stake metrics for {hotkey}: {e}")
-            return None
-    
-    async def get_coldkey_metrics(self, coldkey: str) -> Optional[Dict]:
-        """
-        Get aggregated metrics for a coldkey.
-        
-        Args:
-            coldkey: Coldkey to get metrics for
-            
-        Returns:
-            Dict: Coldkey metrics or None if not found
-        """
-        try:
-            result = await self.db_manager.fetch_one("""
-                SELECT * FROM coldkey_metrics WHERE coldkey = ?
-            """, (coldkey,))
-            
-            return dict(result) if result else None
-            
-        except Exception as e:
-            logger.error(f"Error getting coldkey metrics for {coldkey}: {e}")
+            logger.error(f"Error retrieving stake metrics for {hotkey}: {e}")
             return None
     
     async def get_all_hotkeys_for_coldkey(self, coldkey: str) -> List[str]:
@@ -284,559 +324,261 @@ class StakeTracker:
         Get all hotkeys associated with a coldkey.
         
         Args:
-            coldkey: Coldkey to get hotkeys for
+            coldkey: Coldkey to look up
             
         Returns:
-            List[str]: List of hotkeys
+            List[str]: List of associated hotkeys
         """
         try:
-            results = await self.db_manager.fetch_all("""
-                SELECT hotkey FROM stake_metrics WHERE coldkey = :coldkey
-            """, {"coldkey": coldkey})
+            # Query from new miner_metrics table
+            results = await self.db_manager.execute_query("""
+                SELECT hotkey FROM miner_metrics WHERE coldkey = :coldkey
+            """, {'coldkey': coldkey})
             
             return [row['hotkey'] for row in results]
-            
         except Exception as e:
-            logger.error(f"Error getting hotkeys for coldkey {coldkey}: {e}")
+            logger.error(f"Error retrieving hotkeys for coldkey {coldkey}: {e}")
             return []
     
-    async def calculate_holding_metrics(
-        self,
-        hotkey: str,
-        window_days: int = 30
-    ) -> Tuple[float, int]:
+    async def get_all_stake_metrics(self) -> List[Dict]:
         """
-        Calculate stake holding metrics for a hotkey.
-        
-        This method calculates:
-        1. Holding percentage: What percentage of emissions are still held
-        2. Holding duration: Weighted average duration of holding (in days)
-        
-        Args:
-            hotkey: Hotkey to calculate metrics for
-            window_days: Window in days to consider for metrics
-            
-        Returns:
-            Tuple[float, int]: (holding_percentage, holding_duration)
-        """
-        try:
-            # First check if we have cached metrics
-            metrics = await self.db_manager.fetch_one("""
-                SELECT weighted_holding_days, total_emission_received, remaining_emission_stake, holding_percentage, last_update
-                FROM aggregated_tranche_metrics
-                WHERE hotkey = ?
-            """, (hotkey,))
-            
-            if metrics:
-                # Check if metrics are recent enough (within last hour)
-                last_update = metrics['last_update']
-                current_time = datetime.now(timezone.utc)
-                
-                if (current_time - last_update).total_seconds() < 3600:  # 1 hour cache
-                    # Use cached metrics
-                    holding_percentage = metrics['holding_percentage']
-                    holding_duration = int(min(metrics['weighted_holding_days'], window_days))
-                    
-                    logger.debug(
-                        f"Using cached holding metrics for {hotkey}: "
-                        f"holding_percentage={holding_percentage:.2%}, "
-                        f"holding_duration={holding_duration} days"
-                    )
-                    
-                    return holding_percentage, holding_duration
-            
-            # If no cached metrics or they're too old, recalculate
-            await self._update_aggregated_tranche_metrics(hotkey)
-            
-            # Fetch the updated metrics
-            updated_metrics = await self.db_manager.fetch_one("""
-                SELECT weighted_holding_days, holding_percentage
-                FROM aggregated_tranche_metrics
-                WHERE hotkey = ?
-            """, (hotkey,))
-            
-            if updated_metrics:
-                holding_percentage = updated_metrics['holding_percentage']
-                holding_duration = int(min(updated_metrics['weighted_holding_days'], window_days))
-                
-                logger.debug(
-                    f"Calculated fresh holding metrics for {hotkey}: "
-                    f"holding_percentage={holding_percentage:.2%}, "
-                    f"holding_duration={holding_duration} days"
-                )
-                
-                return holding_percentage, holding_duration
-            
-            # If still no metrics, return zeros
-            logger.warning(f"No holding metrics available for {hotkey}")
-            return 0.0, 0
-            
-        except Exception as e:
-            logger.error(f"Error calculating holding metrics for {hotkey}: {e}")
-            return 0.0, 0
-    
-    async def get_stake_distribution(self) -> Dict[str, List[float]]:
-        """
-        Get current stake distribution across all miners.
+        Get stake metrics for all miners.
         
         Returns:
-            Dict: Distribution data with keys 'hotkeys', 'stakes', 'manual_stakes', 'earned_stakes'
+            List[Dict]: List of stake metrics for all miners
         """
         try:
-            results = await self.db_manager.fetch_all("""
-                SELECT hotkey, total_stake, manual_stake, earned_stake 
-                FROM stake_metrics 
+            # Query from new miner_metrics table
+            results = await self.db_manager.execute_query("""
+                SELECT * 
+                FROM miner_metrics
                 ORDER BY total_stake DESC
             """)
             
-            hotkeys = []
-            stakes = []
-            manual_stakes = []
-            earned_stakes = []
-            
-            for row in results:
-                hotkeys.append(row['hotkey'])
-                stakes.append(row['total_stake'])
-                manual_stakes.append(row['manual_stake'])
-                earned_stakes.append(row['earned_stake'])
-            
-            return {
-                'hotkeys': hotkeys,
-                'stakes': stakes,
-                'manual_stakes': manual_stakes,
-                'earned_stakes': earned_stakes
-            }
-            
+            return [dict(row) for row in results]
         except Exception as e:
-            logger.error(f"Error getting stake distribution: {e}")
-            return {
-                'hotkeys': [],
-                'stakes': [],
-                'manual_stakes': [],
-                'earned_stakes': []
-            }
-    
-    async def get_stake_change_history(
-        self,
-        hotkey: Optional[str] = None,
-        coldkey: Optional[str] = None,
-        days: Optional[int] = None,
-        flow_type: Optional[str] = None
-    ) -> List[Dict]:
-        """
-        Get stake change history for a hotkey or coldkey.
-        
-        Args:
-            hotkey: Filter by hotkey (optional)
-            coldkey: Filter by coldkey (optional)
-            days: Number of days to look back (optional)
-            flow_type: Filter by flow type (optional)
-            
-        Returns:
-            List[Dict]: List of stake changes
-        """
-        try:
-            # Build query
-            query = "SELECT * FROM stake_change_history WHERE 1=1"
-            params = []
-            
-            # Apply filters
-            if hotkey:
-                query += " AND hotkey = ?"
-                params.append(hotkey)
-            
-            if coldkey:
-                query += " AND coldkey = ?"
-                params.append(coldkey)
-            
-            if flow_type:
-                query += " AND flow_type = ?"
-                params.append(flow_type)
-            
-            if days:
-                start_time = datetime.now(timezone.utc) - timedelta(days=days)
-                query += " AND timestamp >= ?"
-                params.append(start_time)
-            
-            query += " ORDER BY timestamp DESC"
-            
-            # Execute query
-            results = await self.db_manager.fetch_all(query, params)
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error getting stake change history: {e}")
+            logger.error(f"Error retrieving all stake metrics: {e}")
             return []
     
-    async def get_retention_metrics(self, hotkey: str, window_days: int = 30) -> Dict:
+    async def _create_new_tranche(
+        self, 
+        hotkey: str, 
+        coldkey: str, 
+        amount: float, 
+        is_emission: bool,
+        timestamp: Optional[datetime] = None
+    ) -> int:
         """
-        Get detailed retention metrics for a hotkey.
-        
-        Args:
-            hotkey: Hotkey to get metrics for
-            window_days: Number of days to look back
-            
-        Returns:
-            Dict: Retention metrics
-        """
-        try:
-            # Get current stake metrics
-            metrics = await self.get_stake_metrics(hotkey)
-            if not metrics:
-                return {
-                    'total_stake': 0,
-                    'manual_stake': 0,
-                    'earned_stake': 0,
-                    'total_inflow': 0,
-                    'total_outflow': 0,
-                    'total_emission': 0,
-                    'holding_percentage': 0,
-                    'holding_duration': 0
-                }
-            
-            # Calculate start time for the window
-            start_time = datetime.now(timezone.utc) - timedelta(days=window_days)
-            
-            # Get stake changes in the window
-            changes = await self.db_manager.fetch_all("""
-                SELECT * FROM stake_change_history 
-                WHERE hotkey = ? AND timestamp >= ?
-                ORDER BY timestamp
-            """, (hotkey, start_time))
-            
-            # Calculate total inflow, outflow, and emission
-            total_inflow = sum(c['amount'] for c in changes if c['flow_type'] == INFLOW)
-            total_outflow = sum(abs(c['amount']) for c in changes if c['flow_type'] == OUTFLOW)
-            total_emission = sum(c['amount'] for c in changes if c['flow_type'] == EMISSION)
-            
-            # Calculate holding metrics
-            holding_percentage, holding_duration = await self.calculate_holding_metrics(
-                hotkey, window_days
-            )
-            
-            return {
-                'total_stake': metrics['total_stake'],
-                'manual_stake': metrics['manual_stake'],
-                'earned_stake': metrics['earned_stake'],
-                'total_inflow': total_inflow,
-                'total_outflow': total_outflow,
-                'total_emission': total_emission,
-                'holding_percentage': holding_percentage,
-                'holding_duration': holding_duration
-            }
-            
-        except Exception as e:
-            logger.error(f"Error getting retention metrics for {hotkey}: {e}")
-            return {
-                'error': str(e)
-            }
-    
-    async def _create_new_tranche(self, hotkey: str, coldkey: str, amount: float, is_emission: bool, timestamp: datetime):
-        """
-        Create a new stake tranche entry.
+        Create a new stake tranche.
         
         Args:
             hotkey: Miner hotkey
             coldkey: Associated coldkey
-            amount: Amount of stake in the tranche
-            is_emission: Whether this is from emissions (True) or manual stake (False)
-            timestamp: When the tranche was created
+            amount: Initial amount
+            is_emission: Whether this is an emission reward
+            timestamp: Entry timestamp (defaults to now)
             
         Returns:
-            int: Tranche ID if successful, None otherwise
+            int: Tranche ID
         """
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+            
+        ts = int(timestamp.timestamp())
+        
         try:
-            # Log tranche creation
-            tranche_type = "emission" if is_emission else "manual"
-            logger.info(f"Creating new {tranche_type} stake tranche: hotkey={hotkey[:10]}..., amount={amount:.4f} TAO")
-            
-            # Insert new tranche
+            # Insert tranche into the consolidated tranche table
             result = await self.db_manager.execute_query("""
-                INSERT INTO stake_tranches 
-                (hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                hotkey, 
-                coldkey, 
-                amount, 
-                amount, 
-                int(timestamp.timestamp()), 
-                1 if is_emission else 0,
-                int(timestamp.timestamp())
-            ))
+                INSERT INTO stake_tranches
+                (hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """, [hotkey, coldkey, amount, amount, ts, 1 if is_emission else 0, ts], get_last_row_id=True)
             
-            # Get the tranche ID (last row ID)
-            tranche_id = result.lastrowid if hasattr(result, 'lastrowid') else None
+            tranche_id = result
+            logger.debug(f"Created new tranche {tranche_id} for {hotkey[:10]}...: amount={amount:.4f}, is_emission={is_emission}")
             
-            if tranche_id:
-                logger.debug(f"Created tranche ID {tranche_id}: {tranche_type}, {amount:.4f} TAO for {hotkey[:10]}...")
-                
-                # Count total tranches for this hotkey
-                count_result = await self.db_manager.fetch_one("""
-                    SELECT COUNT(*) as count, SUM(remaining_amount) as total
-                    FROM stake_tranches 
-                    WHERE hotkey = ? AND remaining_amount > 0
-                """, (hotkey,))
-                
-                if count_result:
-                    logger.debug(f"Hotkey {hotkey[:10]}... now has {count_result['count']} active tranches " +
-                                f"with {count_result['total']:.4f} total TAO")
-            else:
-                logger.warning(f"Failed to get tranche ID for new {tranche_type} stake: {amount:.4f} TAO for {hotkey[:10]}...")
+            # Update tranche metrics
+            await self._update_tranche_metrics(hotkey)
             
             return tranche_id
-            
         except Exception as e:
-            logger.error(f"Error creating new tranche: {e}")
-            return None
+            logger.error(f"Error creating new tranche for {hotkey}: {e}")
+            logger.debug(traceback.format_exc())
+            return -1
     
-    async def _consume_tranches_filo(self, hotkey: str, amount_to_consume: float, timestamp: datetime):
+    async def _consume_tranches_filo(
+        self, 
+        hotkey: str, 
+        amount_to_consume: float,
+        timestamp: Optional[datetime] = None,
+        reason: str = "withdrawal"
+    ) -> bool:
         """
-        Consume stake tranches using FILO accounting (Last In, First Out).
+        Consume stake tranches using First-In, Last-Out (FILO) strategy.
         
         Args:
             hotkey: Miner hotkey
-            amount_to_consume: Amount of stake to consume
-            timestamp: When the consumption occurred
+            amount_to_consume: Amount to consume
+            timestamp: Exit timestamp (defaults to now)
+            reason: Reason for consumption
             
         Returns:
-            Tuple[float, List[Dict]]: Amount consumed and details of consumed tranches
+            bool: True if sufficient tranches were found and consumed
         """
-        logger.info(f"Consuming {amount_to_consume:.4f} TAO from tranches for hotkey={hotkey[:10]}...")
-        
-        # Get all active tranches for this hotkey, ordered by timestamp descending (newest first)
-        tranches = await self.db_manager.fetch_all("""
-            SELECT id, hotkey, coldkey, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update
-            FROM stake_tranches
-            WHERE hotkey = ? AND remaining_amount > 0
-            ORDER BY entry_timestamp DESC
-        """, (hotkey,))
-        
-        if not tranches:
-            logger.warning(f"No active tranches found for hotkey {hotkey[:10]}...")
-            return 0, []
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
             
-        logger.debug(f"Found {len(tranches)} active tranches for hotkey {hotkey[:10]}...")
+        ts = int(timestamp.timestamp())
         
-        # Count emission vs manual tranches
-        emission_tranches = sum(1 for t in tranches if t['is_emission'])
-        manual_tranches = len(tranches) - emission_tranches
-        emission_amount = sum(t['remaining_amount'] for t in tranches if t['is_emission'])
-        manual_amount = sum(t['remaining_amount'] for t in tranches if not t['is_emission'])
-        logger.debug(f"Tranche breakdown: {emission_tranches} emission tranches ({emission_amount:.4f} TAO), " +
-                    f"{manual_tranches} manual tranches ({manual_amount:.4f} TAO)")
-        
-        total_consumed = 0
-        consumed_details = []
-        remaining_to_consume = amount_to_consume
-        
-        for tranche in tranches:
-            if remaining_to_consume <= 0:
-                break
-            
-            tranche_id = tranche['id']
-            tranche_remaining = tranche['remaining_amount']
-            
-            # Calculate how much to take from this tranche
-            amount_from_tranche = min(remaining_to_consume, tranche_remaining)
-            new_remaining = tranche_remaining - amount_from_tranche
-            
-            # Update the tranche's remaining amount
-            await self.db_manager.execute_query("""
-                UPDATE stake_tranches 
-                SET remaining_amount = ?, last_update = ? 
-                WHERE id = ?
-            """, (new_remaining, timestamp, tranche_id))
-            
-            # Record the exit (partial or complete)
-            await self.db_manager.execute_query("""
-                INSERT INTO stake_tranche_exits 
-                (tranche_id, exit_amount, exit_timestamp)
-                VALUES (?, ?, ?)
-            """, (tranche_id, amount_from_tranche, timestamp))
-            
-            # Track consumption
-            total_consumed += amount_from_tranche
-            remaining_to_consume -= amount_from_tranche
-            
-            # Record details for return
-            consumed_details.append({
-                'tranche_id': tranche_id,
-                'amount_consumed': amount_from_tranche,
-                'is_emission': tranche['is_emission'],
-                'entry_timestamp': tranche['entry_timestamp'],
-                'holding_days': (timestamp - tranche['entry_timestamp']).days,
-                'completely_consumed': new_remaining <= 0
-            })
-            
-            logger.debug(
-                f"Consumed {amount_from_tranche} TAO from {'emission' if tranche['is_emission'] else 'manual'} "
-                f"tranche {tranche_id} for {hotkey} (remaining: {new_remaining} TAO)"
-            )
-        
-        return total_consumed, consumed_details
-    
-    async def _update_aggregated_tranche_metrics(self, hotkey: str):
-        """
-        Calculate and update aggregated tranche metrics for a hotkey.
-        
-        This method computes metrics including:
-        - Weighted average holding duration for emissions
-        - Total emissions received
-        - Remaining emission stake
-        - Holding percentage (remaining vs. received emissions)
-        
-        These metrics are stored in the aggregated_tranche_metrics table
-        for efficient retrieval when calculating vesting multipliers.
-        
-        Args:
-            hotkey: The hotkey to update metrics for
-        """
         try:
-            current_time = datetime.now(timezone.utc)
-            
-            # Get all active tranches for this hotkey
-            tranches = await self.db_manager.fetch_all("""
-                SELECT id, initial_amount, remaining_amount, entry_timestamp, is_emission
-                FROM stake_tranches
-                WHERE hotkey = ?
-            """, (hotkey,))
+            # Get active tranches, newest first for FILO
+            tranches = await self.db_manager.execute_query("""
+                SELECT id, remaining_amount 
+                FROM stake_tranches 
+                WHERE hotkey = ? AND is_active = 1 AND remaining_amount > 0
+                ORDER BY entry_timestamp DESC
+            """, [hotkey])
             
             if not tranches:
-                # No tranches for this hotkey
-                await self.db_manager.execute_query("""
-                    INSERT INTO aggregated_tranche_metrics
-                    (hotkey, weighted_holding_days, total_emission_received, remaining_emission_stake, holding_percentage, last_update)
-                    VALUES (?, 0, 0, 0, 0, ?)
-                    ON CONFLICT(hotkey) DO UPDATE SET
-                    weighted_holding_days = 0,
-                    total_emission_received = 0,
-                    remaining_emission_stake = 0,
-                    holding_percentage = 0,
-                    last_update = excluded.last_update
-                """, (hotkey, current_time))
-                return
+                logger.warning(f"No active tranches found for {hotkey[:10]}...")
+                return False
+                
+            tranches = [dict(t) for t in tranches]
             
-            # Convert to numpy arrays for faster computation
-            tranche_ids = np.array([t['id'] for t in tranches])
-            initial_amounts = np.array([t['initial_amount'] for t in tranches])
-            remaining_amounts = np.array([t['remaining_amount'] for t in tranches])
-            entry_timestamps = np.array([t['entry_timestamp'] for t in tranches])
-            is_emission = np.array([t['is_emission'] for t in tranches], dtype=bool)
-            
-            # Calculate holding days for each tranche
-            holding_days = np.array([(current_time - ts).days for ts in entry_timestamps])
-            
-            # Filter for emission tranches
-            emission_mask = is_emission
-            emission_initial = initial_amounts[emission_mask]
-            emission_remaining = remaining_amounts[emission_mask]
-            emission_holding_days = holding_days[emission_mask]
-            
-            # Calculate total emission metrics
-            total_emission_received = np.sum(emission_initial) if len(emission_initial) > 0 else 0
-            remaining_emission_stake = np.sum(emission_remaining) if len(emission_remaining) > 0 else 0
-            
-            # Calculate holding percentage
-            holding_percentage = (remaining_emission_stake / total_emission_received) if total_emission_received > 0 else 0
-            
-            # Calculate weighted holding days (weighted by remaining amount)
-            if remaining_emission_stake > 0 and len(emission_remaining) > 0:
-                weights = emission_remaining / remaining_emission_stake
-                weighted_holding_days = np.sum(emission_holding_days * weights)
-            else:
-                weighted_holding_days = 0
-            
-            # Update the aggregated metrics
-            await self.db_manager.execute_query("""
-                INSERT INTO aggregated_tranche_metrics
-                (hotkey, weighted_holding_days, total_emission_received, remaining_emission_stake, holding_percentage, last_update)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(hotkey) DO UPDATE SET
-                weighted_holding_days = excluded.weighted_holding_days,
-                total_emission_received = excluded.total_emission_received,
-                remaining_emission_stake = excluded.remaining_emission_stake,
-                holding_percentage = excluded.holding_percentage,
-                last_update = excluded.last_update
-            """, (
-                hotkey,
-                weighted_holding_days,
-                total_emission_received,
-                remaining_emission_stake,
-                holding_percentage,
-                current_time
-            ))
-            
-            logger.debug(
-                f"Updated aggregated tranche metrics for {hotkey}: "
-                f"holding_days={weighted_holding_days:.2f}, "
-                f"emission_received={total_emission_received:.6f}, "
-                f"emission_remaining={remaining_emission_stake:.6f}, "
-                f"holding_percentage={holding_percentage:.2%}"
-            )
-        
-        except Exception as e:
-            logger.error(f"Error updating aggregated tranche metrics for {hotkey}: {e}") 
-    
-    async def get_tranche_details(self, hotkey: str, include_exits: bool = False) -> List[Dict]:
-        """
-        Get detailed information about all tranches for a hotkey.
-        
-        Args:
-            hotkey: The hotkey to get tranche details for
-            include_exits: Whether to include exit history for each tranche
-            
-        Returns:
-            List[Dict]: List of tranche details
-        """
-        try:
-            # Get all tranches for this hotkey
-            tranches = await self.db_manager.fetch_all("""
-                SELECT id, initial_amount, remaining_amount, entry_timestamp, is_emission, last_update
-                FROM stake_tranches
-                WHERE hotkey = ?
-                ORDER BY entry_timestamp ASC
-            """, (hotkey,))
-            
-            if not tranches:
-                return []
-            
-            # Convert to list of dicts
-            result = []
-            current_time = datetime.now(timezone.utc)
+            # Calculate total available amount
+            total_available = sum(t['remaining_amount'] for t in tranches)
+            if total_available < amount_to_consume:
+                logger.warning(f"Insufficient tranches for {hotkey[:10]}...: need {amount_to_consume:.4f}, have {total_available:.4f}")
+                return False
+                
+            # Consume tranches
+            remaining_to_consume = amount_to_consume
             
             for tranche in tranches:
-                tranche_dict = dict(tranche)
+                if remaining_to_consume <= 0:
+                    break
+                    
+                tranche_id = tranche['id']
+                available = tranche['remaining_amount']
                 
-                # Calculate holding days
-                tranche_dict['holding_days'] = (current_time - tranche['entry_timestamp']).days
+                # Determine how much to consume from this tranche
+                to_consume = min(available, remaining_to_consume)
+                remaining = available - to_consume
                 
-                # Calculate percentage remaining
-                if tranche['initial_amount'] > 0:
-                    tranche_dict['percent_remaining'] = tranche['remaining_amount'] / tranche['initial_amount']
+                # Update the tranche in the database
+                if remaining <= 0:
+                    # Fully consumed, mark as inactive
+                    await self.db_manager.execute_query("""
+                        UPDATE stake_tranches
+                        SET remaining_amount = 0, 
+                            is_active = 0,
+                            exit_timestamp = ?,
+                            exit_amount = ?,
+                            exit_reason = ?,
+                            last_update = ?
+                        WHERE id = ?
+                    """, [ts, to_consume, reason, ts, tranche_id])
                 else:
-                    tranche_dict['percent_remaining'] = 0.0
-                    
-                # Add tranche type
-                tranche_dict['type'] = 'emission' if tranche['is_emission'] else 'manual'
+                    # Partially consumed
+                    await self.db_manager.execute_query("""
+                        UPDATE stake_tranches
+                        SET remaining_amount = ?,
+                            exit_amount = COALESCE(exit_amount, 0) + ?,
+                            last_update = ?
+                        WHERE id = ?
+                    """, [remaining, to_consume, ts, tranche_id])
                 
-                # Include exit history if requested
-                if include_exits:
-                    exits = await self.db_manager.fetch_all("""
-                        SELECT exit_amount, exit_timestamp
-                        FROM stake_tranche_exits
-                        WHERE tranche_id = ?
-                        ORDER BY exit_timestamp ASC
-                    """, (tranche['id'],))
-                    
-                    tranche_dict['exits'] = [dict(exit) for exit in exits]
-                    tranche_dict['exit_count'] = len(exits)
+                logger.debug(f"Consumed {to_consume:.4f} from tranche {tranche_id} for {hotkey[:10]}..., remaining={remaining:.4f}")
                 
-                result.append(tranche_dict)
+                remaining_to_consume -= to_consume
             
-            return result
+            # Update tranche metrics after consumption
+            await self._update_tranche_metrics(hotkey)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error consuming tranches for {hotkey}: {e}")
+            logger.debug(traceback.format_exc())
+            return False
+    
+    async def _update_tranche_metrics(self, hotkey: str):
+        """
+        Update aggregated tranche metrics for a hotkey.
+        
+        Args:
+            hotkey: Miner hotkey
+        """
+        try:
+            # Get current time
+            now = datetime.now(timezone.utc)
+            now_ts = int(now.timestamp())
+            
+            # Get metrics for this hotkey
+            metrics = await self.get_stake_metrics(hotkey)
+            if not metrics:
+                logger.warning(f"No metrics record found for {hotkey[:10]}... when updating tranche metrics")
+                return
+                
+            # Get all tranches for this hotkey
+            tranches = await self.db_manager.execute_query("""
+                SELECT * FROM stake_tranches WHERE hotkey = ?
+            """, [hotkey])
+            
+            if not tranches:
+                logger.debug(f"No tranches found for {hotkey[:10]}...")
+                return
+                
+            tranches = [dict(t) for t in tranches]
+            
+            # Calculate metrics
+            active_tranches = sum(1 for t in tranches if t['is_active'] == 1 and t['remaining_amount'] > 0)
+            total_tranches = len(tranches)
+            
+            manual_tranches = sum(1 for t in tranches if t['is_emission'] == 0)
+            emission_tranches = sum(1 for t in tranches if t['is_emission'] == 1)
+            
+            # Calculate tranche ages
+            tranche_ages = []
+            for t in tranches:
+                if t['is_active'] == 1 and t['remaining_amount'] > 0:
+                    age = now_ts - t['entry_timestamp']
+                    if age > 0:
+                        tranche_ages.append(age)
+            
+            avg_tranche_age = int(sum(tranche_ages) / len(tranche_ages)) if tranche_ages else 0
+            oldest_tranche_age = max(tranche_ages) if tranche_ages else 0
+            
+            # Update the miner_metrics record
+            updated_metrics = {
+                'hotkey': hotkey,
+                'coldkey': metrics['coldkey'],
+                'total_stake': metrics['total_stake'],
+                'manual_stake': metrics['manual_stake'],
+                'earned_stake': metrics['earned_stake'],
+                'first_stake_timestamp': metrics['first_stake_timestamp'],
+                'last_update': now_ts,
+                'total_tranches': total_tranches,
+                'active_tranches': active_tranches,
+                'avg_tranche_age': avg_tranche_age,
+                'oldest_tranche_age': oldest_tranche_age,
+                'manual_tranches': manual_tranches,
+                'emission_tranches': emission_tranches
+            }
+            
+            await self.db_manager.execute_query("""
+                UPDATE miner_metrics
+                SET total_tranches = :total_tranches,
+                    active_tranches = :active_tranches,
+                    avg_tranche_age = :avg_tranche_age,
+                    oldest_tranche_age = :oldest_tranche_age,
+                    manual_tranches = :manual_tranches,
+                    emission_tranches = :emission_tranches,
+                    last_update = :last_update
+                WHERE hotkey = :hotkey
+            """, updated_metrics)
+            
+            logger.debug(f"Updated tranche metrics for {hotkey[:10]}...: active={active_tranches}/{total_tranches}, avg_age={avg_tranche_age}s")
             
         except Exception as e:
-            logger.error(f"Error getting tranche details for {hotkey}: {e}")
-            return [] 
+            logger.error(f"Error updating tranche metrics for {hotkey}: {e}")
+            logger.debug(traceback.format_exc()) 

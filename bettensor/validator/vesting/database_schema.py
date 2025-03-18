@@ -35,25 +35,28 @@ def get_vesting_tables() -> Dict[str, Dict[str, Any]]:
         Dict[str, Dict[str, Any]]: Dictionary of table names to table definitions
     """
     tables = {
-        # Table for tracking individual stake transactions
+        # Consolidated table for tracking all stake transactions
         "stake_transactions": {
             "columns": [
                 ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
                 ("block_number", "INTEGER NOT NULL"),
                 ("timestamp", "INTEGER NOT NULL"),
-                ("transaction_type", "TEXT NOT NULL"),
-                ("flow_type", "TEXT NOT NULL"),  # inflow, outflow, neutral, emission
+                ("transaction_type", "TEXT NOT NULL"),  # add_stake, remove_stake, etc.
+                ("flow_type", "TEXT NOT NULL"),         # inflow, outflow, neutral, emission
                 ("hotkey", "TEXT NOT NULL"),
                 ("coldkey", "TEXT"),
-                ("call_amount", "REAL"),  # Amount specified in the call
-                ("final_amount", "REAL"),  # Actual amount after fees
-                ("fee", "REAL"),  # Transaction fee
+                ("amount", "REAL NOT NULL"),            # positive for additions, negative for removals
+                ("stake_after", "REAL NOT NULL"),       # total stake after this transaction
+                ("manual_stake_after", "REAL NOT NULL"),# manual stake after this transaction
+                ("earned_stake_after", "REAL NOT NULL"),# earned stake after this transaction
                 ("tx_hash", "TEXT"),
                 ("origin_netuid", "INTEGER"),
                 ("destination_netuid", "INTEGER"),
                 ("destination_coldkey", "TEXT"),
                 ("destination_hotkey", "TEXT"),
-                ("validated", "INTEGER DEFAULT 0")  # Boolean flag
+                ("change_type", "TEXT"),                # manual, emission, epoch
+                ("epoch", "INTEGER"),
+                ("validated", "INTEGER DEFAULT 0")
             ],
             "indices": [
                 ("idx_stake_transactions_hotkey", "hotkey"),
@@ -65,30 +68,8 @@ def get_vesting_tables() -> Dict[str, Dict[str, Any]]:
             ]
         },
         
-        # Table for tracking balance changes over time
-        "stake_balance_changes": {
-            "columns": [
-                ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
-                ("block_number", "INTEGER NOT NULL"),
-                ("timestamp", "INTEGER NOT NULL"),
-                ("hotkey", "TEXT NOT NULL"),
-                ("coldkey", "TEXT"),
-                ("stake", "REAL NOT NULL"),
-                ("stake_change", "REAL"),
-                ("change_type", "TEXT"),  # manual, emission, epoch
-                ("epoch", "INTEGER")
-            ],
-            "indices": [
-                ("idx_stake_balance_changes_hotkey", "hotkey"),
-                ("idx_stake_balance_changes_coldkey", "coldkey"),
-                ("idx_stake_balance_changes_block", "block_number"),
-                ("idx_stake_balance_changes_timestamp", "timestamp"),
-                ("idx_stake_balance_changes_epoch", "epoch")
-            ]
-        },
-        
-        # Table for tracking stake metrics per hotkey
-        "stake_metrics": {
+        # Consolidated metrics table for miners
+        "miner_metrics": {
             "columns": [
                 ("hotkey", "TEXT PRIMARY KEY"),
                 ("coldkey", "TEXT"),
@@ -96,14 +77,20 @@ def get_vesting_tables() -> Dict[str, Dict[str, Any]]:
                 ("manual_stake", "REAL NOT NULL DEFAULT 0"),
                 ("earned_stake", "REAL NOT NULL DEFAULT 0"),
                 ("first_stake_timestamp", "INTEGER"),
-                ("last_update", "INTEGER NOT NULL")
+                ("last_update", "INTEGER NOT NULL"),
+                ("total_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("active_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("avg_tranche_age", "INTEGER NOT NULL DEFAULT 0"),
+                ("oldest_tranche_age", "INTEGER NOT NULL DEFAULT 0"),
+                ("manual_tranches", "INTEGER NOT NULL DEFAULT 0"),
+                ("emission_tranches", "INTEGER NOT NULL DEFAULT 0")
             ],
             "indices": [
-                ("idx_stake_metrics_coldkey", "coldkey")
+                ("idx_miner_metrics_coldkey", "coldkey")
             ]
         },
         
-        # Table for tracking aggregated stake metrics per coldkey
+        # Coldkey metrics table (aggregation across multiple hotkeys)
         "coldkey_metrics": {
             "columns": [
                 ("coldkey", "TEXT PRIMARY KEY"),
@@ -116,42 +103,7 @@ def get_vesting_tables() -> Dict[str, Dict[str, Any]]:
             "indices": []
         },
         
-        # Table for tracking stake change history for analytics
-        "stake_change_history": {
-            "columns": [
-                ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
-                ("timestamp", "INTEGER NOT NULL"),
-                ("hotkey", "TEXT NOT NULL"),
-                ("coldkey", "TEXT"),
-                ("change_type", "TEXT NOT NULL"),  # manual, emission, epoch
-                ("flow_type", "TEXT NOT NULL"),  # inflow, outflow, neutral, emission
-                ("amount", "REAL NOT NULL"),
-                ("total_stake_after", "REAL NOT NULL"),
-                ("manual_stake_after", "REAL NOT NULL"),
-                ("earned_stake_after", "REAL NOT NULL")
-            ],
-            "indices": [
-                ("idx_stake_change_history_hotkey", "hotkey"),
-                ("idx_stake_change_history_coldkey", "coldkey"),
-                ("idx_stake_change_history_timestamp", "timestamp"),
-                ("idx_stake_change_history_type", "change_type"),
-                ("idx_stake_change_history_flow", "flow_type")
-            ]
-        },
-        
-        # Table for tracking last processed block per module
-        "vesting_module_state": {
-            "columns": [
-                ("module_name", "TEXT PRIMARY KEY"),
-                ("last_block", "INTEGER"),
-                ("last_timestamp", "INTEGER"),
-                ("last_epoch", "INTEGER"),
-                ("module_data", "TEXT")  # JSON serialized state
-            ],
-            "indices": []
-        },
-        
-        # Table for tracking stake tranches (individual stake deposits)
+        # Consolidated tranche table with exit information
         "stake_tranches": {
             "columns": [
                 ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
@@ -161,47 +113,29 @@ def get_vesting_tables() -> Dict[str, Dict[str, Any]]:
                 ("remaining_amount", "REAL NOT NULL"),
                 ("entry_timestamp", "INTEGER NOT NULL"),
                 ("is_emission", "INTEGER NOT NULL"),
-                ("last_update", "INTEGER NOT NULL")
+                ("last_update", "INTEGER NOT NULL"),
+                ("exit_timestamp", "INTEGER"),
+                ("exit_amount", "REAL"),
+                ("exit_reason", "TEXT"),
+                ("is_active", "INTEGER NOT NULL DEFAULT 1")
             ],
             "indices": [
-                ("idx_stake_tranches_hotkey", "hotkey")
+                ("idx_stake_tranches_hotkey", "hotkey"),
+                ("idx_stake_tranches_active", "is_active"),
+                ("idx_stake_tranches_entry", "entry_timestamp")
             ]
         },
         
-        # Table for tracking tranche exits (withdrawals from tranches)
-        "stake_tranche_exits": {
+        # Module state table (unchanged)
+        "vesting_module_state": {
             "columns": [
-                ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
-                ("tranche_id", "INTEGER NOT NULL"),
-                ("exit_timestamp", "INTEGER NOT NULL"),
-                ("exit_amount", "REAL NOT NULL"),
-                ("exit_reason", "TEXT NOT NULL"),
-                ("FOREIGN KEY (tranche_id) REFERENCES stake_tranches(id) ON DELETE CASCADE", "")
+                ("module_name", "TEXT PRIMARY KEY"),
+                ("last_block", "INTEGER"),
+                ("last_timestamp", "INTEGER"),
+                ("last_epoch", "INTEGER"),
+                ("module_data", "TEXT")  # JSON serialized state
             ],
-            "indices": [
-                ("idx_stake_tranche_exits_tranche_id", "tranche_id")
-            ]
-        },
-        
-        # Table for tracking aggregated tranche metrics per hotkey
-        "aggregated_tranche_metrics": {
-            "columns": [
-                ("hotkey", "TEXT PRIMARY KEY"),
-                ("coldkey", "TEXT"),
-                ("total_tranches", "INTEGER NOT NULL DEFAULT 0"),
-                ("active_tranches", "INTEGER NOT NULL DEFAULT 0"),
-                ("avg_tranche_age", "INTEGER NOT NULL DEFAULT 0"),
-                ("oldest_tranche_age", "INTEGER NOT NULL DEFAULT 0"),
-                ("total_tranche_amount", "REAL NOT NULL DEFAULT 0"),
-                ("manual_tranches", "INTEGER NOT NULL DEFAULT 0"),
-                ("emission_tranches", "INTEGER NOT NULL DEFAULT 0"),
-                ("emission_amount", "REAL NOT NULL DEFAULT 0"),
-                ("manual_amount", "REAL NOT NULL DEFAULT 0"),
-                ("last_update", "INTEGER NOT NULL")
-            ],
-            "indices": [
-                ("idx_aggregated_tranche_metrics_coldkey", "coldkey")
-            ]
+            "indices": []
         }
     }
     
@@ -252,7 +186,7 @@ def create_vesting_tables(db_manager) -> bool:
 
 async def create_vesting_tables_async(db_manager) -> bool:
     """
-    Asynchronously create all vesting system tables in the database.
+    Create all vesting system tables in the database asynchronously.
     
     Args:
         db_manager: Database manager instance
