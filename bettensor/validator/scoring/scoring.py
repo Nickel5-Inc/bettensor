@@ -19,6 +19,9 @@ from datetime import datetime, timezone, timedelta, date
 import json
 import random
 import numpy as np
+import bittensor as bt
+from datetime import datetime, timezone, timedelta, date
+from typing import List, Dict, Optional
 import time
 import traceback
 import copy
@@ -43,22 +46,86 @@ class ScoringSystem:
         db_manager: DatabaseManager,
         num_miners: int = 256,
         max_days: int = 45,
-        reference_date: datetime = datetime(
-            year=2024, month=9, day=30, tzinfo=timezone.utc
-        ),
-        validator = None,
-        
-        
+        current_date: Optional[datetime] = None,
+        force_rebuild: bool = False,
+    ):
+        """Initialize the scoring system.
+
+        Args:
+            db_manager (DatabaseManager): Database manager instance
+            num_miners (int, optional): Number of miners to track. Defaults to 256.
+            max_days (int, optional): Number of days to track. Defaults to 45.
+            current_date (Optional[datetime], optional): Current date to use. Defaults to None.
+            force_rebuild (bool, optional): Whether to force rebuild scores. Defaults to False.
+        """
+        self.db_manager = db_manager
+        self.num_miners = num_miners
+        self.max_days = max_days
+        self.force_rebuild = force_rebuild
+        self.validator = None  # Initialize validator as None
+        self.miner_data = None  # Initialize miner_data as None
+
+        # Set current date
+        if current_date is None:
+            current_date = datetime.now(timezone.utc)
+        self.current_date = current_date.replace(
+            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+        )
+
+        # Initialize arrays
+        self.clv_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.roi_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.sortino_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.entropy_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.composite_scores = np.zeros((num_miners, max_days, 6), dtype=np.float32)  # 6 = daily + 5 tiers
+        self.amount_wagered = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.tiers = np.ones((num_miners, max_days), dtype=np.int32)
+
+        # Scoring weights
+        self.clv_weight = 0.25
+        self.roi_weight = 0.25
+        self.sortino_weight = 0.25
+        self.entropy_weight = 0.25
+        self.entropy_window = self.max_days
+
+        self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager)
+        self.incentives = []
+
+        self.last_update_date = None  # Will store the last day processed as a date object (no time)
+        self.scoring_data = None  # Initialize scoring_data as None
+
+    def set_validator(self, validator):
+        """Set the validator instance and initialize ScoringData."""
+        self.validator = validator
+        self.scoring_data = ScoringData(self)
+
+    def __init__(
+        self,
+        db_manager: DatabaseManager,
+        num_miners: int = 256,
+        max_days: int = 45,
+        current_date: Optional[datetime] = None,
+        force_rebuild: bool = False,
     ):
         """
         Initialize the ScoringSystem.
-
+        
         Args:
-            db_path (str): Path to the database.
-            num_miners (int): Number of miners.
-            max_days (int): Maximum number of days to track.
-            reference_date (datetime, optional): Reference date for scoring. Defaults to January 1, 2024.
+            db_manager: Database manager instance for executing queries
+            num_miners (int): Number of miners in the system
+            max_days (int, optional): Maximum number of days to track. Defaults to 45.
+            current_date (datetime, optional): Current date to use. Defaults to None (uses current UTC date).
+            force_rebuild (bool, optional): Whether to force a rebuild of historical scores. Defaults to False.
         """
+        self.db_manager = db_manager
+        self.num_miners = num_miners
+        self.max_days = max_days
+        self.force_rebuild = force_rebuild
+        
+        # Initialize the current date and day index
+        self.current_date = current_date or datetime.now(timezone.utc)
+        self.current_day = self.current_date.timetuple().tm_yday % self.max_days
+
         #numpy max integer
         max_int = np.iinfo(np.int64).max
         np.set_printoptions(threshold=max_int)
@@ -67,15 +134,14 @@ class ScoringSystem:
         self.num_tiers = (
             7  # 5 tiers + 2 for invalid UIDs (0) and empty network slots (-1)
         )
-        
-        # Initialize internal state variables
-        self.init = False  # Flag to track if this is the first initialization
-        self.current_day = None
-        self.current_date = None
-        self.last_update_date = None  # Will store the last day processed as a date object (no time)
+        self.valid_uids = set()  # Initialize as an empty set
+        self.validator = None
+        self.reference_date = datetime(
+            year=2024, month=9, day=30, tzinfo=timezone.utc
+        )
         self.invalid_uids = []
         self.epsilon = 1e-8  # Small constant to prevent division by zero
-        self.db_manager = db_manager
+        
         # Initialize tier configurations
         self.tier_configs = [
             {
@@ -132,23 +198,22 @@ class ScoringSystem:
         }
 
         # Initialize score arrays
-        self.clv_scores = np.zeros((num_miners, max_days))
-        self.roi_scores = np.zeros((num_miners, max_days))
-        self.sortino_scores = np.zeros((num_miners, max_days))
-        self.amount_wagered = np.zeros((num_miners, max_days))
-        self.entropy_scores = np.zeros((num_miners, max_days))
-        self.tiers = np.ones((num_miners, max_days), dtype=int)
+        self.clv_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.roi_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.sortino_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.entropy_scores = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.composite_scores = np.zeros((num_miners, max_days, 6), dtype=np.float32)  # 6 = daily + 5 tiers
+        self.amount_wagered = np.zeros((num_miners, max_days), dtype=np.float32)
+        self.tiers = np.ones((num_miners, max_days), dtype=np.int32)
 
         # Initialize composite scores. The last dimension is for a daily score [0], and the other 5 are a "tier score"
         # tier score is calculated as a rolling average over the scoring window of that tier. every miner gets a tier score for every tier
 
-        self.composite_scores = np.zeros((num_miners, max_days, 6))
-
         # Scoring weights
-        self.clv_weight = 0.30
-        self.roi_weight = 0.30
-        self.sortino_weight = 0.30
-        self.entropy_weight = 0.10
+        self.clv_weight = 0.3
+        self.roi_weight = 0.3
+        self.sortino_weight = 0.3
+        self.entropy_weight = 0.1
         self.entropy_window = self.max_days
 
 
@@ -157,9 +222,7 @@ class ScoringSystem:
         self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager)
         self.incentives = []
 
-        self.valid_uids = set()  # Initialize as an empty set
-        self.validator = validator
-        self.reference_date = reference_date
+        self.last_update_date = None  # Will store the last day processed as a date object (no time)
 
         self.scoring_data = ScoringData(self)
 
@@ -1544,6 +1607,21 @@ class ScoringSystem:
         attempt to rebuild them from historical prediction data.
         """
         try:
+            # If force_rebuild is True and we're not explicitly skipping rebuild, do it
+            if self.force_rebuild and not skip_rebuild:
+                bt.logging.info("Force rebuild enabled, initiating historical score rebuild...")
+                try:
+                    # Clear existing scores
+                    clear_scores_query = "DELETE FROM scores"
+                    await self.db_manager.execute_query(clear_scores_query)
+                    await self.rebuild_historical_scores()
+                    bt.logging.info("Forced historical score rebuild completed")
+                    return
+                except Exception as e:
+                    bt.logging.error(f"Error during forced rebuild: {e}")
+                    bt.logging.error(traceback.format_exc())
+                    raise
+
             # First do a simple check for non-zero scores
             quick_check_query = """
                 SELECT COUNT(*) as valid_scores
@@ -1557,7 +1635,6 @@ class ScoringSystem:
             
             if valid_scores == 0 and not skip_rebuild:
                 bt.logging.warning("No valid scores found in database, checking for historical data...")
-                
                 # Check if we have historical prediction data to rebuild from
                 check_predictions_query = """
                     SELECT 
@@ -1666,8 +1743,8 @@ class ScoringSystem:
                     
                     # Only rebuild if less than 60% of entries are valid
                     completeness_ratio = result['valid_entries'] / expected_entries if expected_entries > 0 else 0
-                    if completeness_ratio < 0.6:  # Less than 60% complete
-                        bt.logging.warning(f"Score completeness ratio ({completeness_ratio:.1%}) below 60%, initiating rebuild...")
+                    if completeness_ratio < 0.6 or self.force_rebuild:  # Less than 60% complete or force rebuild
+                        bt.logging.warning(f"Score completeness ratio ({completeness_ratio:.1%}) below 60% or force rebuild enabled, initiating rebuild...")
                         await self.rebuild_historical_scores()
                         bt.logging.info("Historical scores rebuilt successfully")
                         return
@@ -1713,10 +1790,10 @@ class ScoringSystem:
                             self.composite_scores[miner_uid, day_id, tier_index] = score["composite_score"] or 0.0
             
             bt.logging.info(f"Populated {populated_count} score entries from database")
-            
+                
         except Exception as e:
             bt.logging.error(f"Error loading scores from database: {e}")
-            bt.logging.error(f"Traceback: {traceback.format_exc()}")
+            bt.logging.error(traceback.format_exc())
             raise
 
     def _ensure_datetime(self, date):
@@ -2410,118 +2487,76 @@ class ScoringSystem:
                 process_date = end_date - timedelta(days=days_ago)
                 historical_day = (self.current_day - days_ago) % self.max_days
                 
-                # Get games and predictions like the normal scoring run
+                bt.logging.info(f"Processing historical day {process_date.date()} (index: {historical_day})")
+                
+                # First get all predictions made on this date
+                predictions_query = """
+                    SELECT p.*
+                    FROM predictions p
+                    WHERE DATE(p.prediction_date) = DATE(:process_date)
+                    ORDER BY p.prediction_date ASC
+                """
+                
+                day_predictions = await self.db_manager.fetch_all(
+                    predictions_query, 
+                    {"process_date": process_date.isoformat()}
+                )
+
+                if not day_predictions:
+                    bt.logging.info(f"No predictions found for {process_date.date()}")
+                    continue
+
+                # Get all game IDs from these predictions
+                game_ids = list(set(p['game_id'] for p in day_predictions))
+                
+                # Then get the games data
                 games_query = """
                     SELECT g.*
                     FROM game_data g
-                    WHERE DATE(g.event_start_date) = DATE(:date)
+                    WHERE g.external_id IN ({})
                     AND g.outcome IS NOT NULL
                     AND g.outcome != 'Unfinished'
                     AND g.outcome != 3
-                """
-                
-                # Pass parameters as a dictionary
-                day_games = await self.db_manager.fetch_all(
-                    games_query, 
-                    {"date": process_date.isoformat()}
-                )
-                
-                if day_games:
-                    game_ids = [g['external_id'] for g in day_games]
-                    
-                    # Modified predictions query to use named parameters
-                    predictions_query = """
-                        SELECT p.*
-                        FROM predictions p
-                        WHERE p.game_id IN ({})
-                    """.format(','.join(f':id_{i}' for i in range(len(game_ids))))
-                    
-                    # Create parameters dictionary for game IDs
-                    params = {f'id_{i}': gid for i, gid in enumerate(game_ids)}
-                    
-                    # Pass parameters as a dictionary
-                    day_predictions = await self.db_manager.fetch_all(predictions_query, params)
-
-                    bt.logging.info(
-                        f"Processing {process_date}: {len(day_games)} games, "
-                        f"{len(day_predictions)} predictions"
-                    )
-
-                # Add a diagnostic query to understand the missing IDs
-                diagnostic_query = """
-                    SELECT 
-                        COUNT(*) as total_predictions,
-                        SUM(CASE WHEN prediction_id IS NULL THEN 1 ELSE 0 END) as null_ids,
-                        SUM(CASE WHEN prediction_id IS NOT NULL THEN 1 ELSE 0 END) as valid_ids
-                    FROM predictions 
-                    WHERE game_id IN ({})
+                    ORDER BY g.event_start_date ASC
                 """.format(','.join(f':id_{i}' for i in range(len(game_ids))))
                 
-                # Create parameters dictionary for game IDs
-                diagnostic_params = {f'id_{i}': gid for i, gid in enumerate(game_ids)}
-                
-                diagnostic_result = await self.db_manager.fetch_one(diagnostic_query, diagnostic_params)
-                if diagnostic_result:
-                    bt.logging.info(
-                        f"Prediction ID statistics for {process_date}:\n"
-                        f"  Total predictions: {diagnostic_result['total_predictions']}\n"
-                        f"  Missing IDs: {diagnostic_result['null_ids']}\n"
-                        f"  Valid IDs: {diagnostic_result['valid_ids']}"
-                    )
+                params = {f'id_{i}': gid for i, gid in enumerate(game_ids)}
+                day_games = await self.db_manager.fetch_all(games_query, params)
 
-                if not day_games or not day_predictions:
+                bt.logging.info(
+                    f"Found for {process_date.date()}: {len(day_games)} games with outcomes, "
+                    f"{len(day_predictions)} predictions"
+                )
+
+                if not day_games:
                     continue
-                    
+                
                 try:
-                    # Format arrays exactly as in normal scoring
-                    game_ids = [g['external_id'] for g in day_games]
-                    game_id_to_idx = {gid: idx for idx, gid in enumerate(game_ids)}
-                    
-                    # Track game IDs for debugging
-                    game_ids = set(g['external_id'] for g in day_games)
-                    bt.logging.info(f"Processing games: {game_ids}")
-
-                    # Add games to entropy system first and wait for all to complete
-                    game_tasks = []
+                    # Format game data for validation
+                    game_data = {}
                     for game in day_games:
-                        try:
-                            odds = [
-                                float(game['team_a_odds']), 
-                                float(game['team_b_odds']), 
-                                float(game['tie_odds']) if game['tie_odds'] is not None else 0.0
-                            ]
-                            
-                            # Initialize game with all possible outcomes
-                            game_id = game['external_id']
-                            num_outcomes = 3 if game['tie_odds'] else 2
-                            
-                            # First initialize the game pools for all possible outcomes
-                            self.entropy_system.game_pools[game_id] = defaultdict(
-                                lambda: {"predictions": [], "entropy_score": 0.0}
-                            )
-                            for outcome in range(num_outcomes):
-                                self.entropy_system.game_pools[game_id][outcome] = {
-                                    "predictions": [],
-                                    "entropy_score": 0.0
-                                }
-                                
-                            # Then add the game normally
-                            task = self.entropy_system.add_new_game(
-                                game_id=game_id,
-                                num_outcomes=num_outcomes,
-                                odds=odds
-                            )
-                            game_tasks.append(task)
-                            bt.logging.debug(f"Added game {game_id} with {num_outcomes} outcomes to entropy system")
-                        except Exception as e:
-                            bt.logging.error(f"Error adding game {game['external_id']} to entropy system: {e}")
-                            continue
+                        game_id = game['external_id']
+                        game_data[game_id] = {
+                            'external_id': game_id,
+                            'team_a': game['team_a'],
+                            'team_b': game['team_b'],
+                            'team_a_odds': game['team_a_odds'],
+                            'team_b_odds': game['team_b_odds'],
+                            'tie_odds': game['tie_odds'],
+                            'event_start_date': game['event_start_date'],
+                            'outcome': game['outcome']
+                        }
                     
-                    # Wait for all games to be added
-                    await asyncio.gather(*game_tasks)
-                    bt.logging.info("All game tasks completed")
-
-                    # Now process predictions, but only for games we just added
+                    # Validate historical predictions
+                    valid_predictions, validation_stats = await self.miner_data.validate_historical_predictions(
+                        day_predictions, game_data
+                    )
+                    
+                    if not valid_predictions:
+                        bt.logging.warning(f"No valid predictions found for {process_date.date()} after validation")
+                        continue
+                    
+                    # Format arrays for score calculation using only valid predictions
                     pred_array = np.array([
                         [
                             int(p['miner_uid']), 
@@ -2531,9 +2566,8 @@ class ScoringSystem:
                             float(p.get('payout', 0)) if p.get('payout') is not None else 0.0,
                             float(p['wager']) if p['wager'] is not None else 0.0
                         ]
-                        for p in day_predictions
-                        if int(p['game_id']) in game_ids  # Only include predictions for games we added
-                        and p['predicted_odds'] is not None 
+                        for p in valid_predictions
+                        if p['predicted_odds'] is not None 
                         and p['wager'] is not None
                     ])
                     
@@ -2566,18 +2600,58 @@ class ScoringSystem:
                         self.sortino_scores[:, historical_day] = sortino_scores
                         
                         # Add predictions to entropy system - only process predictions that have IDs
-                        valid_predictions = [
-                            pred for pred in day_predictions 
+                        valid_predictions_with_ids = [
+                            pred for pred in valid_predictions 
                             if 'prediction_id' in pred and pred['prediction_id'] is not None
                         ]
                         
-                        if len(valid_predictions) != len(day_predictions):
+                        if len(valid_predictions_with_ids) != len(valid_predictions):
                             bt.logging.warning(
-                                f"Skipping {len(day_predictions) - len(valid_predictions)} predictions "
-                                f"without prediction IDs for {process_date}"
+                                f"Skipping {len(valid_predictions) - len(valid_predictions_with_ids)} predictions "
+                                f"without prediction IDs for {process_date.date()}"
                             )
                         
-                        for pred in valid_predictions:
+                        # Add games to entropy system first and wait for all to complete
+                        game_tasks = []
+                        for game in day_games:
+                            try:
+                                odds = [
+                                    float(game['team_a_odds']), 
+                                    float(game['team_b_odds']), 
+                                    float(game['tie_odds']) if game['tie_odds'] is not None else 0.0
+                                ]
+                                
+                                # Initialize game with all possible outcomes
+                                game_id = game['external_id']
+                                num_outcomes = 3 if game['tie_odds'] else 2
+                                
+                                # First initialize the game pools for all possible outcomes
+                                self.entropy_system.game_pools[game_id] = defaultdict(
+                                    lambda: {"predictions": [], "entropy_score": 0.0}
+                                )
+                                for outcome in range(num_outcomes):
+                                    self.entropy_system.game_pools[game_id][outcome] = {
+                                        "predictions": [],
+                                        "entropy_score": 0.0
+                                    }
+                                    
+                                # Then add the game normally
+                                task = self.entropy_system.add_new_game(
+                                    game_id=game_id,
+                                    num_outcomes=num_outcomes,
+                                    odds=odds
+                                )
+                                game_tasks.append(task)
+                                bt.logging.debug(f"Added game {game_id} with {num_outcomes} outcomes to entropy system")
+                            except Exception as e:
+                                bt.logging.error(f"Error adding game {game['external_id']} to entropy system: {e}")
+                                continue
+                        
+                        # Wait for all games to be added
+                        await asyncio.gather(*game_tasks)
+                        bt.logging.info("All game tasks completed")
+                        
+                        for pred in valid_predictions_with_ids:
                             try:
                                 self.entropy_system.add_prediction(
                                     prediction_id=pred['prediction_id'],
@@ -2627,9 +2701,9 @@ class ScoringSystem:
                                         # Recalculate tier score for this day
                                         await self._update_composite_scores(day_idx)
                                         bt.logging.debug(f"Filled gap in tier {tier} scores for day {day_idx}")
-                    
+                
                 except Exception as e:
-                    bt.logging.error(f"Error processing day {process_date}: {str(e)}")
+                    bt.logging.error(f"Error processing day {process_date.date()}: {str(e)}")
                     bt.logging.error(traceback.format_exc())
                     continue
             

@@ -36,8 +36,6 @@ from bettensor.validator.vesting.integration import VestingIntegration, get_vest
 from bettensor import __spec_version__
 from types import SimpleNamespace
 import configparser
-from bettensor.validator.vesting.database_schema import create_vesting_tables_async
-import pandas as pd
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -428,245 +426,64 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 bt.logging.error(f"Error initializing MinerDataMixin: {e}")
                 bt.logging.error(traceback.format_exc())
 
-            # Set up scoring system with correct parameters
+            # Read force_rebuild_scores from setup.cfg
+            config_parser = configparser.ConfigParser()
+            try:
+                config_parser.read('setup.cfg')
+                force_rebuild = config_parser.getboolean('metadata', 'force_rebuild_scores', fallback=False)
+                bt.logging.info(f"Force rebuild scores setting: {force_rebuild}")
+            except configparser.Error as e:
+                bt.logging.error(f"Error reading force_rebuild_scores from setup.cfg: {e}")
+                force_rebuild = False
+
+            # Create a MinerDataMixin instance for the scoring system
+            scoring_miner_data = MinerDataMixin(self.db_manager, self.metagraph, set(self.metagraph.uids))
+
+            # Initialize the scoring system with force_rebuild setting and miner_data
             self.scoring_system = ScoringSystem(
-                db_manager=self.db_manager,
+                self.db_manager,
                 num_miners=256,
                 max_days=45,
-                reference_date=datetime.now(timezone.utc),
-                validator=self
+                current_date=datetime.now(timezone.utc),
+                force_rebuild=force_rebuild
             )
-            
-            # Set up the weight setting functions
+            # Set the validator and miner_data attributes
+            self.scoring_system.set_validator(self)
+            self.scoring_system.miner_data = scoring_miner_data
+            await self.scoring_system.initialize()
+
+            # After initialization, set force_rebuild_scores back to False to prevent future automatic rebuilds
+            if force_rebuild:
+                try:
+                    config_parser.set('metadata', 'force_rebuild_scores', 'False')
+                    with open('setup.cfg', 'w') as f:
+                        config_parser.write(f)
+                    bt.logging.info("Reset force_rebuild_scores to False after initialization")
+                except Exception as e:
+                    bt.logging.error(f"Error resetting force_rebuild_scores in setup.cfg: {e}")
+
+            # Setup Validator Components
+            self.api_client = BettensorAPIClient(self.db_manager)
+
+            self.sports_data = SportsData(
+                db_manager=self.db_manager,
+                api_client=self.api_client,
+                entropy_system=self.scoring_system.entropy_system,
+            )
+
             self.weight_setter = WeightSetter(
                 metagraph=self.metagraph,
                 wallet=self.wallet,
                 subtensor=self.subtensor,
                 neuron_config=self.config,
-                db_path=self.config.db,
+                db_path=self.db_path,
             )
 
-            # Initialize vesting system and integration
-            try:
-                bt.logging.info("Initializing vesting system...")
-                
-                # Try to read vesting config from setup.cfg
-                config_parser = configparser.ConfigParser()
-                try:
-                    config_parser.read('setup.cfg')
-                    vesting_cfg = config_parser['vesting'] if 'vesting' in config_parser else {}
-                except Exception as e:
-                    bt.logging.debug(f"Could not read vesting config from setup.cfg: {e}")
-                    vesting_cfg = {}
-                
-                # Check DB state to see if it was recently redownloaded
-                # Initialize need_metagraph_init with a default value
-                need_metagraph_init = True
-                
-                try:
-                    # Ensure state directory exists
-                    state_dir = Path(os.path.dirname(self.config.db)) / "state"
-                    state_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Instead of querying a non-existent database table, read from state_metadata.json
-                    metadata_file = state_dir / "state_metadata.json"
-                    
-                    if metadata_file.exists():
-                        try:
-                            with open(metadata_file, 'r') as f:
-                                metadata = json.load(f)
-                            
-                            if 'last_update' in metadata:
-                                # Parse ISO format datetime string
-                                last_update_str = metadata['last_update']
-                                last_update_dt = datetime.fromisoformat(last_update_str.replace('Z', '+00:00'))
-                                last_updated = int(last_update_dt.timestamp())
-                                
-                                current_time = int(datetime.now(timezone.utc).timestamp())
-                                time_diff_hours = (current_time - last_updated) / 3600
-                                
-                                if time_diff_hours > 24:  # If the state is more than 24 hours old
-                                    bt.logging.info(f"State data is {time_diff_hours:.1f} hours old. Need to refresh from metagraph.")
-                                    need_metagraph_init = True
-                                else:
-                                    bt.logging.info(f"State data is recent ({time_diff_hours:.1f} hours old). No need to refresh.")
-                                    need_metagraph_init = False
-                            else:
-                                bt.logging.warning("No last_update field found in state_metadata.json")
-                                need_metagraph_init = True
-                        except Exception as e:
-                            bt.logging.warning(f"Error reading state_metadata.json: {e}")
-                            need_metagraph_init = True
-                    else:
-                        bt.logging.warning(f"State metadata file not found at {metadata_file}")
-                        # Create a default metadata file
-                        current_time = datetime.now(timezone.utc)
-                        default_metadata = {
-                            "last_update": current_time.isoformat(),
-                            "files": {}
-                        }
-                        try:
-                            with open(metadata_file, 'w') as f:
-                                json.dump(default_metadata, f, indent=2)
-                            bt.logging.info(f"Created default state metadata file at {metadata_file}")
-                        except Exception as e:
-                            bt.logging.warning(f"Failed to create default metadata file: {e}")
-                        need_metagraph_init = True
-                except Exception as e:
-                    bt.logging.warning(f"Error checking database state: {e}")
-                    bt.logging.debug(traceback.format_exc())
-                    need_metagraph_init = True
-                
-                bt.logging.info(f"Setting need_metagraph_init = {need_metagraph_init}")
-                
-                # Get vesting configuration parameters (command line takes precedence over setup.cfg)
-                # Core parameters
-                vesting_enabled_str = getattr(self.config, 'vesting.enabled', vesting_cfg.get('enabled', 'False'))
-                vesting_enabled = vesting_enabled_str.lower() == 'true' if isinstance(vesting_enabled_str, str) else bool(vesting_enabled_str)
-                
-                min_stake = getattr(self.config, 'vesting.minimum_stake', 
-                                   float(vesting_cfg.get('minimum_stake', 0.3)))
-                
-                retention_window = getattr(self.config, 'vesting.retention_window', 
-                                          int(vesting_cfg.get('retention_window', 30)))
-                
-                retention_target = getattr(self.config, 'vesting.retention_target', 
-                                          float(vesting_cfg.get('retention_target', 0.9)))
-                
-                max_multiplier = getattr(self.config, 'vesting.max_multiplier', 
-                                        float(vesting_cfg.get('max_multiplier', 1.5)))
-                
-                # Threading parameters
-                use_bg_thread_str = getattr(self.config, 'vesting.use_background_thread', 
-                                           vesting_cfg.get('use_background_thread', 'True'))
-                use_bg_thread = use_bg_thread_str.lower() == 'true' if isinstance(use_bg_thread_str, str) else bool(use_bg_thread_str)
-                
-                thread_priority = getattr(self.config, 'vesting.thread_priority', 
-                                         vesting_cfg.get('thread_priority', 'low'))
-                
-                query_interval = getattr(self.config, 'vesting.query_interval_seconds', 
-                                        int(vesting_cfg.get('query_interval_seconds', 300)))
-                
-                tx_query_interval = getattr(self.config, 'vesting.transaction_query_interval_seconds', 
-                                           int(vesting_cfg.get('transaction_query_interval_seconds', 60)))
-                
-                detailed_tx_str = getattr(self.config, 'vesting.detailed_transaction_tracking', 
-                                         vesting_cfg.get('detailed_transaction_tracking', 'True'))
-                detailed_tx = detailed_tx_str.lower() == 'true' if isinstance(detailed_tx_str, str) else bool(detailed_tx_str)
-                
-                # Create and initialize the vesting system
-                try:
-                    bt.logging.info("Creating vesting system with explicit chain endpoint if available")
-                    explicit_endpoint = None
-                    
-                    # Check if we have a chain_endpoint from the subtensor
-                    if hasattr(self.subtensor, 'chain_endpoint') and self.subtensor.chain_endpoint:
-                        explicit_endpoint = self.subtensor.chain_endpoint
-                        bt.logging.info(f"Using explicit endpoint from subtensor: {explicit_endpoint}")
-                    else:
-                        bt.logging.warning("No chain_endpoint available from subtensor")
-                        # Try to get the URL from substrate if available
-                        if hasattr(self.subtensor, 'substrate') and self.subtensor.substrate:
-                            if hasattr(self.subtensor.substrate, 'url'):
-                                explicit_endpoint = self.subtensor.substrate.url
-                                bt.logging.info(f"Extracted URL from subtensor.substrate: {explicit_endpoint}")
-                            else:
-                                bt.logging.warning("subtensor.substrate has no url attribute")
-                        else:
-                            bt.logging.warning("Subtensor has no substrate attribute or it's None")
-                    
-                    self.vesting_system = get_vesting_system(
-                        subtensor=self.subtensor,
-                        subnet_id=self.config.netuid,
-                        db_manager=self.vesting_db_manager,  # Use dedicated vesting database manager
-                        explicit_endpoint=explicit_endpoint  # Pass explicit endpoint if available
-                    )
-                    
-                    # Initialize the vesting system with better error handling
-                    try:
-                        bt.logging.info("Starting vesting system initialization...")
-                        
-                        # Log detailed connection info before initializing
-                        if hasattr(self.subtensor, 'chain_endpoint'):
-                            bt.logging.info(f"Subtensor chain_endpoint: {self.subtensor.chain_endpoint}")
-                        
-                        # Log substrate instance details
-                        if hasattr(self.subtensor, 'substrate'):
-                            if self.subtensor.substrate:
-                                substrate_id = id(self.subtensor.substrate)
-                                bt.logging.info(f"Subtensor has substrate instance (id: {substrate_id})")
-                                if hasattr(self.subtensor.substrate, 'url'):
-                                    bt.logging.info(f"Substrate URL: {self.subtensor.substrate.url}")
-                            else:
-                                bt.logging.warning("Subtensor substrate is None")
-                        else:
-                            bt.logging.warning("Subtensor has no substrate attribute")
-                        
-                        # Update VestingSystem parameters before initialization
-                        self.vesting_system.minimum_stake = min_stake
-                        self.vesting_system.retention_window_days = retention_window
-                        self.vesting_system.retention_target = retention_target
-                        self.vesting_system.max_multiplier = max_multiplier
-                        self.vesting_system.use_background_thread = use_bg_thread
-                        self.vesting_system.thread_priority = thread_priority
-                        self.vesting_system.query_interval_seconds = query_interval
-                        self.vesting_system.transaction_query_interval_seconds = tx_query_interval
-                        self.vesting_system.detailed_transaction_tracking = detailed_tx
-                        
-                        # Call initialize with no parameters
-                        success = await self.vesting_system.initialize()
-                        
-                        if success:
-                            bt.logging.info("Vesting system initialized successfully")
-                            
-                            # After initialization, explicitly initialize hotkeys from the metagraph
-                            bt.logging.info("Initializing vesting hotkeys from metagraph...")
-                            metagraph_init_success = await self.vesting_system.initialize_from_metagraph(force_refresh=need_metagraph_init)
-                            if metagraph_init_success:
-                                bt.logging.info("✅ Successfully initialized hotkeys from metagraph")
-                                # Get counts of miners with stake
-                                info = await self.vesting_system.get_diagnostic_info()
-                                if 'tables' in info and 'miner_metrics' in info['tables']:
-                                    bt.logging.info(f"Initialized {info['tables']['miner_metrics']['count']} miner records with {info['tables']['miner_metrics'].get('total_stake', 0)} total stake")
-                            else:
-                                bt.logging.warning("❌ Failed to initialize hotkeys from metagraph")
-                        else:
-                            bt.logging.warning("Vesting system initialization returned False")
-                    
-                    except Exception as e:
-                        bt.logging.error(f"Error initializing vesting system: {e}")
-                        bt.logging.error(traceback.format_exc())
-                        success = False
-                    
-                    if not success:
-                        bt.logging.error("Failed to initialize vesting system, some functionality may be limited")
-                
-                except Exception as e:
-                    bt.logging.error(f"Failed to create vesting system: {e}")
-                    bt.logging.error(traceback.format_exc())
-                    success = False
-
-                # Create and install the integration with the scoring system
-                self.vesting_integration = VestingIntegration(
-                    scoring_system=self.scoring_system,
-                    vesting_system=self.vesting_system
-                )
-                
-                # Install the integration
-                enabled_status = "enabled" if vesting_enabled else "shadow mode (tracking but not impacting weights)"
-                bt.logging.info(f"Installing vesting integration in {enabled_status}")
-                self.vesting_integration.install(impact_weights=vesting_enabled)
-                
-                bt.logging.info("Vesting system initialized and integrated successfully")
-            except Exception as e:
-                bt.logging.error(f"Failed to initialize vesting system: {e}")
-                bt.logging.debug(traceback.format_exc())
-                self.vesting_system = None
-                self.vesting_integration = None
+            self.website_handler = WebsiteHandler(self)
 
             self.is_initialized = True
             return True
-            
+        
         except Exception as e:
             bt.logging.error(f"Exception during initialization: {e}")
             bt.logging.error(traceback.format_exc())
