@@ -121,25 +121,25 @@ class ScoringSystem:
             },  # Tier 1
             {
                 "window": 7,
-                "min_wager": 4000,
+                "min_wager": 0,#4000,
                 "capacity": int(num_miners * 0.2),
                 "incentive": 0.05,
             },  # Tier 2
             {
                 "window": 15,
-                "min_wager": 10000,
+                "min_wager": 5000,#10000,
                 "capacity": int(num_miners * 0.2),
                 "incentive": 0.23,
             },  # Tier 3
             {
                 "window": 30,
-                "min_wager": 20000,
+                "min_wager": 15000,#20000,
                 "capacity": int(num_miners * 0.1),
                 "incentive": 0.27,
             },  # Tier 4
             {
                 "window": 45,
-                "min_wager": 35000,
+                "min_wager": 30000,#35000,
                 "capacity": int(num_miners * 0.05),
                 "incentive": 0.43,
             },  # Tier 5
@@ -517,29 +517,27 @@ class ScoringSystem:
         for tier in range(self.num_tiers - 1, 1, -1):  # Start from highest tier (5) down to tier 2
             current_tier_miners = np.where(tiers == tier)[0]
             # Only consider valid miners from tier 2 and above
-            lower_tier_miners = np.where((tiers == tier - 1) & np.isin(np.arange(len(tiers)), list(valid_uids)))[0]
+            lower_tier_miners = np.where((tiers <= tier - 1) & np.isin(np.arange(len(tiers)), list(valid_uids)))[0]
             # Calculate open slots based on tier capacity and current occupancy
             tier_capacity = self.tier_configs[tier]["capacity"]
             current_occupancy = len(current_tier_miners)
             open_slots = max(0, tier_capacity - current_occupancy)
-            
-            if open_slots > 0:
-                # Identify eligible miners from lower tier based on min_wager
-                eligible_miners = [
-                    miner for miner in lower_tier_miners
-                    if self._meets_tier_requirements(miner, tier) and miner in valid_uids
-                ]
-                bt.logging.debug(
-                    f"Tier {tier-1}: {len(eligible_miners)} eligible miners for {open_slots} openslots"
-                )
+            eligible_miners = [
+                miner for miner in lower_tier_miners
+                if self._meets_tier_requirements(miner, tier) and miner in valid_uids
+            ]
+            bt.logging.debug(
+                f"Tier {tier-1}: {len(eligible_miners)} eligible miners for {open_slots} openslots"
+            )
 
-                if eligible_miners:
-                    # Sort eligible miners by composite scores descending
-                    eligible_miners_sorted = sorted(
-                        eligible_miners,
-                        key=lambda x: composite_scores_day[x, tier - 2],
-                        reverse=True
-                    )
+            # Sort eligible miners by composite scores descending
+            eligible_miners_sorted = sorted(
+                eligible_miners,
+                key=lambda x: composite_scores_day[x, tier - 1],
+                reverse=True
+            )
+            if eligible_miners:
+                if open_slots > 0:
 
                     # Promote the best miners to fill open slots
                     promotions = eligible_miners_sorted[:open_slots]
@@ -547,38 +545,30 @@ class ScoringSystem:
                         tiers[miner] = tier
                         bt.logging.info(f"Miner {miner} promoted to tier {tier-1}")
 
-            else:
-                # If tier is full, consider swaps with lower tier miners
-                if len(lower_tier_miners) > 0:
+                else:
+                    # If tier is full, consider swaps with lower tier miners
                     # Sort current tier miners by score ascending (worst first)
                     current_sorted = sorted(
                         current_tier_miners,
-                        key=lambda x: composite_scores_day[x, tier - 1]
+                        key=lambda x: composite_scores_day[x, tier - 1],
+                        reverse=False
                     )
                     
-                    # Sort lower tier miners by score descending (best first)
-                    lower_sorted = sorted(
-                        lower_tier_miners,
-                        key=lambda x: composite_scores_day[x, tier - 2],
-                        reverse=True
-                    )
-
                     # Check each potential swap
-                    for lower_miner in lower_sorted:
-                        if not self._meets_tier_requirements(lower_miner, tier) or lower_miner not in valid_uids:
-                            continue
+                    for lower_miner in eligible_miners_sorted:
                             
                         # Compare with worst performing miner in current tier
                         for current_miner in current_sorted:
-                            lower_score = composite_scores_day[lower_miner, tier - 2]
+                            lower_score = composite_scores_day[lower_miner, tier - 1]
                             current_score = composite_scores_day[current_miner, tier - 1]
 
                             if lower_score > current_score:
                                 # Swap tiers
-                                tiers[lower_miner], tiers[current_miner] = tier, tier - 1
+                                lower_tier = tiers[lower_miner]
+                                tiers[lower_miner], tiers[current_miner] = tier, lower_tier
                                 bt.logging.info(
                                     f"Swapped miner {lower_miner} (↑tier {tier}) with "
-                                    f"miner {current_miner} (↓tier {tier-1})"
+                                    f"miner {current_miner} (↓tier {lower_tier})"
                                 )
                                 # Update sorted lists
                                 current_sorted.remove(current_miner)
@@ -2166,7 +2156,7 @@ class ScoringSystem:
                     ])
                     
                     closing_line_odds = np.array([
-                        [float(g['team_a_odds']), float(g['team_b_odds']), 
+                        [int(g['external_id']), float(g['team_a_odds']), float(g['team_b_odds']), 
                          float(g['tie_odds']) if g['tie_odds'] else 0.0]
                         for g in day_games
                     ])
