@@ -837,7 +837,7 @@ class ScoringSystem:
             
             # Sort by tier (ascending order - higher tier numbers first), then by score (high to low)
             # This ensures tier 5 is at the top, followed by tier 4, etc.
-            sort_indices = np.lexsort((-all_scores, miner_tiers))[::1]  # Reverse to put higher tiers first
+            sort_indices = np.lexsort((all_scores, miner_tiers))[::1]  # Reverse to put higher tiers first
             sorted_miners = all_miners[sort_indices]
             
             # Create continuous ranks from 0 to 1
@@ -845,7 +845,7 @@ class ScoringSystem:
             continuous_ranks = np.linspace(0, 1, total_miners)
             
             # Apply exponential function to create Pareto-like distribution
-            pareto_exponent = 12  # Controls the steepness (higher = steeper curve)
+            pareto_exponent = 7  # Controls the steepness (higher = steeper curve)
             
             # Calculate weights using the exponential curve - maintain the curve's shape
             for i, miner in enumerate(sorted_miners):
