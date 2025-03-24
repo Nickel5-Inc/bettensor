@@ -767,30 +767,30 @@ class ScoringSystem:
             has_predictions = recent_wagers > 0
             
             # Get miners meeting minimum stake requirement if service is available
-            # meets_min_stake = np.ones(self.num_miners, dtype=bool)
-            # if self.min_stake_service is not None:
-            #     bt.logging.info("Applying minimum stake requirement for weights")
-            #     min_stake_list = self.min_stake_service.get_min_stake_for_all_uids()
-            #     if len(min_stake_list) == self.num_miners:
-            #         meets_min_stake = np.array(min_stake_list)
-            #         bt.logging.info(f"Miners meeting minimum stake: {np.sum(meets_min_stake)}/{self.num_miners}")
+            meets_min_stake = np.ones(self.num_miners, dtype=bool)
+            if self.min_stake_service is not None:
+                bt.logging.info("Applying minimum stake requirement for weights")
+                min_stake_list = self.min_stake_service.get_min_stake_for_all_uids()
+                if len(min_stake_list) == self.num_miners:
+                    meets_min_stake = np.array(min_stake_list)
+                    bt.logging.info(f"Miners meeting minimum stake: {np.sum(meets_min_stake)}/{self.num_miners}")
                     
-            #         # Log detailed breakdown by tier
-            #         current_tiers = self.tiers[:, day]
-            #         for tier in range(1, self.num_tiers):
-            #             tier_miners = np.where(current_tiers == tier)[0]
-            #             if len(tier_miners) > 0:
-            #                 meet_stake_in_tier = np.sum(meets_min_stake[tier_miners])
-            #                 bt.logging.info(f"Tier {tier}: {meet_stake_in_tier}/{len(tier_miners)} miners meet min stake")
-            #     else:
-            #         bt.logging.warning(f"Min stake list length ({len(min_stake_list)}) doesn't match num_miners ({self.num_miners}). Skipping min stake check.")
+                    # Log detailed breakdown by tier
+                    current_tiers = self.tiers[:, day]
+                    for tier in range(1, self.num_tiers):
+                        tier_miners = np.where(current_tiers == tier)[0]
+                        if len(tier_miners) > 0:
+                            meet_stake_in_tier = np.sum(meets_min_stake[tier_miners])
+                            bt.logging.info(f"Tier {tier}: {meet_stake_in_tier}/{len(tier_miners)} miners meet min stake")
+                else:
+                    bt.logging.warning(f"Min stake list length ({len(min_stake_list)}) doesn't match num_miners ({self.num_miners}). Skipping min stake check.")
             
             valid_miners = np.array(list(set(range(self.num_miners)) - self.invalid_uids))
             valid_miners = valid_miners[
                 (current_tiers[valid_miners] >= 2) &  # Tier 1+ only
                 (current_tiers[valid_miners] < self.num_tiers) &
-                has_predictions[valid_miners] #&
-                #meets_min_stake[valid_miners]  # Add min stake requirement
+                has_predictions[valid_miners] &
+                meets_min_stake[valid_miners]  # Add min stake requirement
             ]
             
             # Setup weights array with zeros
@@ -897,24 +897,24 @@ class ScoringSystem:
                 weights[list(self.invalid_uids)] = 0
             
             # Apply penalties for miners not meeting min stake requirements
-            # if self.min_stake_service is not None:
-            #     for miner in range(self.num_miners):
-            #         if not meets_min_stake[miner]:
-            #             if weights[miner] > 0:
-            #                 bt.logging.info(f"Zeroing weight for miner {miner} due to insufficient stake")
-            #                 weights[miner] = 0
+            if self.min_stake_service is not None:
+                for miner in range(self.num_miners):
+                    if not meets_min_stake[miner]:
+                        if weights[miner] > 0:
+                            bt.logging.info(f"Zeroing weight for miner {miner} due to insufficient stake")
+                            weights[miner] = 0
                 
-            #     # Log how many miners got zeroed due to min stake
-            #     zeroed_count = self.num_miners - np.sum(meets_min_stake)
-            #     bt.logging.info(f"Zeroed weights for {zeroed_count} miners due to insufficient stake")
+                # Log how many miners got zeroed due to min stake
+                zeroed_count = self.num_miners - np.sum(meets_min_stake)
+                bt.logging.info(f"Zeroed weights for {zeroed_count} miners due to insufficient stake")
             
-            # # Renormalize after applying penalties
-            # if np.sum(weights) > 0:
-            #     weights = weights / np.sum(weights)
-            # else:
-            #     bt.logging.warning("Total weight is zero. Distributing weights equally among valid miners.")
-            #     if hasattr(self, 'valid_uids') and self.valid_uids:
-            #         weights[list(self.valid_uids)] = 1 / len(self.valid_uids)
+            # Renormalize after applying penalties
+            if np.sum(weights) > 0:
+                weights = weights / np.sum(weights)
+            else:
+                bt.logging.warning("Total weight is zero. Distributing weights equally among valid miners.")
+                if hasattr(self, 'valid_uids') and self.valid_uids:
+                    weights[list(self.valid_uids)] = 1 / len(self.valid_uids)
             
             # Log weight distribution by tier
             for tier in populated_tiers:

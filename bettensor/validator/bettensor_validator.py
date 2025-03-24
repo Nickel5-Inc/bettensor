@@ -289,7 +289,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         scoring_miner_data = MinerDataMixin(self.db_manager, self.metagraph, set(self.metagraph.uids))
 
         # Initialize the MinStakeService
-        #self.min_stake_service = MinStakeService(self.subtensor)
+        self.min_stake_service = MinStakeService(self.subtensor)
 
         # Initialize the scoring system with force_rebuild setting and miner_data
         self.scoring_system = ScoringSystem(
@@ -298,7 +298,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             max_days=45,
             current_date=datetime.now(timezone.utc),
             force_rebuild=force_rebuild,
-            #min_stake_service=self.min_stake_service
+            min_stake_service=self.min_stake_service
         )
         # Set the validator and miner_data attributes
         self.scoring_system.set_validator(self)

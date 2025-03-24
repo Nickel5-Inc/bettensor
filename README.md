@@ -116,6 +116,28 @@ Whether you're new to Bettensor or an experienced miner, the Miner Guide provide
 The incentive mechanism is intricate and rewards the best miners disproportionately. Details around the mechanism can be found [here](https://nickel5.substack.com/p/sports-prediction-and-betting-models).
 
 
+## Minimum Staking Requirement
+
+To ensure commitment to the network and prevent abuse, miners are required to meet a minimum staking threshold to receive weight from validators. This stake requirement helps maintain network quality and security.
+
+### How to Add Stake to Your Hotkey
+
+Miners can earn stake through incentive mechanisms or by manually adding it using the btcli command:
+
+#### Adding stake to a single hotkey:
+```bash
+btcli stake add --amount .3 --netuid 30 --wallet.name <YOUR_COLDKEY> --wallet.hotkey <YOUR_HOTKEY>
+```
+
+#### Adding stake to multiple hotkeys simultaneously:
+```bash
+btcli stake add --amount .6 --netuid 30 --wallet.name <YOUR_COLDKEY> --wallet.hotkey hotkey1,hotkey2
+```
+
+>[!NOTE]
+>The minimum stake amount is decided by validators. Miners without sufficient stake will not receive weight in the network, regardless of their performance or tier. Make sure to check your stake levels regularly.
+
+
 ## Details for Current Release Version (v2.0.0, Beta)
 
 - Currently Supported Sports: Baseball, Football (Soccer), American Football

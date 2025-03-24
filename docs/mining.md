@@ -8,13 +8,14 @@ This guide provides detailed information for setting up and running a Bettensor 
 2. [Miner Setup](#miner-setup)
 3. [Choosing Your Interface](#choosing-your-interface)
 4. [Running Your Miner](#running-your-miner)
-5. [Submitting Predictions](#submitting-predictions)
-6. [Model Predictions](#model-predictions)
-7. [Managing Multiple Miners](#managing-multiple-miners)
-8. [Security Considerations](#security-considerations)
-9. [Troubleshooting](#troubleshooting)
-10. [Frequently Asked Questions](#frequently-asked-questions)
-11. [Database Setup](#database-setup)
+5. [Minimum Stake Requirement](#minimum-stake-requirement)
+6. [Submitting Predictions](#submitting-predictions)
+7. [Model Predictions](#model-predictions)
+8. [Managing Multiple Miners](#managing-multiple-miners)
+9. [Security Considerations](#security-considerations)
+10. [Troubleshooting](#troubleshooting)
+11. [Frequently Asked Questions](#frequently-asked-questions)
+12. [Database Setup](#database-setup)
 
 ## Getting Started
 
@@ -75,7 +76,7 @@ The Local Interface runs on your local machine and is not accessible from the in
 - You prefer to manage your miner(s) directly on your local machine.
 
 ### Central Server
-
+NOTE: Currently disabled feature
 The Central Server option connects your miner to our web dashboard, allowing for remote management and access to advanced features.
 
 **Choose Central Server if:**
@@ -85,7 +86,7 @@ The Central Server option connects your miner to our web dashboard, allowing for
 - You're interested in more comprehensive data analysis and visualization tools.
 
 >[!IMPORTANT]
-> The Central Server option provides a more streamlined experience and shows more comprehensive data than the local interface. However, it does require your miner to accept connections from our server. 
+> Feature is currently disabled. 
 
 
 
@@ -98,6 +99,51 @@ pm2 logs miner0
 ```
 
 Wait for some game data to be received before proceeding to submit predictions. 
+
+## Minimum Stake Requirement
+
+Bettensor now implements a minimum stake requirement for miners to receive weight from validators. This requirement helps ensure that participants are committed to the network and helps prevent abuse.
+
+### Why Stake is Required
+
+1. **Network Security**: Minimum stake requirements protect the network from sybil attacks and other forms of abuse.
+2. **Quality Assurance**: Staking demonstrates commitment to the network's success and incentivizes miners to provide quality predictions.
+3. **Alignment of Incentives**: Miners with stake in the network are incentivized to act in ways that benefit the network as a whole.
+
+### Checking Your Current Stake
+
+You can check your current stake level on taostats, or with the following command:
+
+```bash
+btcli stake show --netuid 30 --wallet.name <YOUR_COLDKEY> --wallet.hotkey <YOUR_HOTKEY>
+```
+
+### Adding Stake to Your Hotkey
+
+You can add stake to your hotkey using the btcli command:
+
+#### Adding stake to a single hotkey:
+```bash
+btcli stake add --amount .3 --netuid 30 --wallet.name <YOUR_COLDKEY> --wallet.hotkey <YOUR_HOTKEY>
+```
+
+#### Adding stake to multiple hotkeys simultaneously:
+```bash
+btcli stake add --amount .6 --netuid 30 --wallet.name <YOUR_COLDKEY> --wallet.hotkey hotkey1,hotkey2
+```
+
+### Important Notes on Staking
+
+- The minimum stake amount is determined by validators and may change over time.
+- Miners without sufficient stake will receive **zero weight** in the network, regardless of their performance or tier.
+- Your stake level is checked during each weight calculation cycle.
+- Stake can be earned through incentive mechanisms or manually added as shown above.
+- You can stake any amount, but only miners meeting the minimum threshold will receive weight.
+- Newly registered miners will **always** need to manually add stake to begin with, otherwise they will never receive incentive
+
+
+>[!IMPORTANT]
+>Even if you are in a higher tier and have excellent performance metrics, you will not receive any weight if you do not meet the minimum stake requirement. Make sure to regularly check your stake levels, especially after any network updates.
 
 ## Submitting Predictions
 

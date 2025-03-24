@@ -21,6 +21,7 @@ WALLET_NAME=""
 WALLET_HOTKEY=""
 LOGGING_LEVEL=""
 USE_BT_API=""
+SUBTENSOR_CHAIN_ENDPOINT=""
 
 # Miner-specific variables
 AXON_PORT=""
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --logging.level) LOGGING_LEVEL="$2"; shift 2 ;;
         --axon.port) AXON_PORT="$2"; shift 2 ;;
         --validator_min_stake) VALIDATOR_MIN_STAKE="$2"; shift 2 ;;
+        --subtensor.chain_endpoint) SUBTENSOR_CHAIN_ENDPOINT="$2"; shift 2 ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
         
     esac
