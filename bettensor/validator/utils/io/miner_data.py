@@ -172,8 +172,8 @@ class MinerDataMixin:
             all_predictions = []
             for miner_uid, pred_dict in predictions_list:
                 for pred_id, pred in pred_dict.items():
-                    # Convert prediction_date to UTC if it's not already
-                    pred_date = getattr(pred, 'prediction_date', current_time.isoformat())
+                    # Use validator's datetime as prediction time prevent fake prediction time sent by miner
+                    pred_date = current_time.isoformat()
                     if isinstance(pred_date, str):
                         pred_datetime = datetime.fromisoformat(pred_date)
                         if pred_datetime.tzinfo is None:
