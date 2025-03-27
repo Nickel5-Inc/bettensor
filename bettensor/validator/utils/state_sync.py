@@ -22,6 +22,8 @@ import async_timeout
 import aiofiles
 import hashlib
 import azure.core
+import configparser
+from bettensor.validator.utils.database.database_factory import DatabaseFactory
 
 class StateSync:
     def __init__(self, 
@@ -337,225 +339,307 @@ class StateSync:
             return False
 
     async def pull_state(self):
-        """Pull latest state from Azure blob storage if needed."""
+        """Pull state from Azure and restore it."""
         if not self.azure_enabled:
+            bt.logging.error("Azure blob storage not configured")
             return False
 
-        max_retries = 3
-        retry_count = 0
-        db_file = self.state_dir / "validator.db"
+        # Get database type
+        db_type = await self._get_database_type()
         
-        while retry_count < max_retries:
-            try:
-                db_manager = self.db_manager
-                bt.logging.info(f"Starting state pull process (attempt {retry_count + 1}/{max_retries})...")
-                
-                # Create temporary directory for downloads
-                temp_dir = self.state_dir / "temp"
-                temp_dir.mkdir(exist_ok=True)
-                backup_file = None
+        # Determine backup file name
+        if db_type == "postgres":
+            db_backup = self.state_dir / "postgres_backup.dump"
+            db_backup_blob = "postgres_backup.dump"
+        else:
+            db_backup = self.state_dir / "validator.db.backup"
+            db_backup_blob = "validator.db"
+
+        # Create state directory if it doesn't exist
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Download state files
+            state_files = [
+                {"local_path": self.state_dir / "state.pt", "blob_name": "state.pt"},
+                {"local_path": db_backup, "blob_name": db_backup_blob},
+                {"local_path": self.state_dir / "metagraph.bin", "blob_name": "metagraph.bin"}
+            ]
+
+            for state_file in state_files:
+                local_path = state_file["local_path"]
+                blob_name = state_file["blob_name"]
                 
                 try:
-                    # Download files to temp directory first
-                    for filename in self.state_files:
-                        blob_client = self.container.get_blob_client(filename)
-                        temp_file = temp_dir / filename
-                        
-                        bt.logging.debug(f"Downloading {filename} to temporary location")
-                        try:
-                            # Download without conditional headers
-                            download_stream = await blob_client.download_blob(
-                                timeout=300,  # 5 minute timeout
-                                max_concurrency=3,  # Limit concurrent connections
-                                validate_content=True,  # Validate downloaded content
-                                if_match=None,  # Don't use conditional headers
-                                if_none_match=None,
-                                if_modified_since=None,
-                                if_unmodified_since=None
-                            )
-                            
-                            async with aiofiles.open(temp_file, 'wb') as f:
-                                async for chunk in download_stream.chunks():
-                                    await f.write(chunk)
-                            
-                            os.chmod(temp_file, 0o666)
-                            bt.logging.debug(f"Successfully downloaded {filename}")
-                            
-                        except azure.core.exceptions.ResourceModifiedError as e:
-                            bt.logging.warning(f"Resource modified during download of {filename}, retrying without conditions")
-                            # Retry without any conditions
-                            download_stream = await blob_client.download_blob(
-                                timeout=300,
-                                max_concurrency=3,
-                                validate_content=True
-                            )
-                            async with aiofiles.open(temp_file, 'wb') as f:
-                                async for chunk in download_stream.chunks():
-                                    await f.write(chunk)
-                            os.chmod(temp_file, 0o666)
-                            bt.logging.debug(f"Successfully downloaded {filename} on retry")
-                            
-                        except Exception as e:
-                            bt.logging.error(f"Error downloading {filename}: {str(e)}")
-                            raise
-                    
-                    # Special handling for database file
-                    temp_db = temp_dir / "validator.db"
-                    if temp_db.exists():
-                        bt.logging.info("Verifying downloaded database integrity...")
-                        try:
-                            # Verify database integrity
-                            async def verify_database(db_path):
-                                try:
-                                    conn = sqlite3.connect(db_path)
-                                    cursor = conn.cursor()
-                                    
-                                    # Run integrity check
-                                    cursor.execute("PRAGMA integrity_check")
-                                    integrity_result = cursor.fetchone()[0]
-                                    
-                                    # Run quick check
-                                    cursor.execute("PRAGMA quick_check")
-                                    quick_check = cursor.fetchone()[0]
-                                    
-                                    cursor.close()
-                                    conn.close()
-                                    
-                                    return integrity_result == "ok" and quick_check == "ok"
-                                except Exception as e:
-                                    bt.logging.error(f"Database verification failed: {e}")
-                                    return False
+                    await self._download_state_file(local_path, blob_name)
+                except Exception as e:
+                    bt.logging.warning(f"Failed to download {blob_name}: {e}")
+                    # Continue with other files
 
-                            # Verify the downloaded database
-                            if not await verify_database(temp_db):
-                                raise sqlite3.DatabaseError("Database integrity check failed")
-                            
-                            # Now handle the database swap
-                            try:
-                                # Wait for any pending operations to complete
-                                await db_manager.wait_for_locks_to_clear(timeout=60)
-                                
-                                # Clean up any existing WAL/SHM files
-                                wal_file = db_file.with_suffix('.db-wal')
-                                shm_file = db_file.with_suffix('.db-shm')
-                                if wal_file.exists():
-                                    wal_file.unlink()
-                                if shm_file.exists():
-                                    shm_file.unlink()
-                                
-                                # Create backup of existing database
-                                if db_file.exists():
-                                    backup_file = db_file.with_suffix('.bak')
-                                    shutil.copy2(db_file, backup_file)
-                                    os.chmod(backup_file, 0o666)
-                                    
-                                    # Verify backup integrity
-                                    if not await verify_database(backup_file):
-                                        bt.logging.error("Backup creation failed integrity check")
-                                        raise sqlite3.DatabaseError("Backup creation failed")
-                                
-                                # Move new database into place
-                                shutil.move(temp_db, db_file)
-                                os.chmod(db_file, 0o666)
-                                
-                                # Verify final database
-                                if not await verify_database(db_file):
-                                    raise sqlite3.DatabaseError("Final database failed integrity check")
-                                
-                                # Move other state files
-                                for filename in self.state_files:
-                                    if filename != "validator.db":
-                                        src = temp_dir / filename
-                                        dst = self.state_dir / filename
-                                        if src.exists():
-                                            shutil.move(src, dst)
-                                            os.chmod(dst, 0o666)
-                                
-                                # Initialize new database connection
-                                try:
-                                    # Verify connection works
-                                    async with db_manager.engine.connect() as conn:
-                                        bt.logging.debug("Verifying connection")
-                                        await conn.execute(text("SELECT 1"))
-                                        
-                                except Exception as e:
-                                    bt.logging.error(f"Database initialization failed: {e}")
-                                    if backup_file and backup_file.exists():
-                                        shutil.move(backup_file, db_file)
-                                    raise
-                                
-                                # Clean up backup file after successful swap
-                                if backup_file and backup_file.exists():
-                                    backup_file.unlink()
-                                
-                                # Update metadata file after successful pull
-                                await self._update_metadata_file()
-                                await self._update_hash_file()
-                                
-                                # Update last pull block
-                                if hasattr(self.validator, 'subtensor'):
-                                    self.validator.last_state_pull = self.validator.subtensor.block
-                                
-                                bt.logging.info("State pull method done")
-                                return True
-                                
-                            except sqlite3.DatabaseError as e:
-                                bt.logging.error(f"Database error during swap: {e}")
-                                retry_count += 1
-                                if retry_count < max_retries:
-                                    bt.logging.info(f"Retrying after database error (attempt {retry_count + 1})...")
-                                    # Clean up and try again
-                                    if backup_file and backup_file.exists():
-                                        shutil.move(backup_file, db_file)
-                                    continue
-                                raise
-                                
-                        except sqlite3.Error as e:
-                            bt.logging.error(f"Database integrity check failed: {e}")
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                bt.logging.info(f"Retrying after integrity check failure (attempt {retry_count + 1})...")
-                                continue
-                            raise
-                        
-                finally:
-                    # Cleanup temp directory
-                    if temp_dir.exists():
-                        shutil.rmtree(temp_dir)
+            # Restore database from backup
+            if db_backup.exists():
+                if db_type == "postgres":
+                    success = await self._restore_postgres_database(db_backup)
+                else:
+                    success = await self._restore_sqlite_database(db_backup)
                     
-                    # Cleanup backup file if it still exists
-                    if backup_file and backup_file.exists():
-                        try:
-                            backup_file.unlink()
-                        except Exception as e:
-                            bt.logging.warning(f"Failed to remove backup file: {e}")
-
-            except Exception as e:
-                bt.logging.error(f"Error during state pull: {str(e)}")
-                bt.logging.error(traceback.format_exc())
-                retry_count += 1
-                
-                if retry_count < max_retries:
-                    # Clean up any WAL/SHM files before retrying
-                    try:
-                        wal_file = db_file.with_suffix('.db-wal')
-                        shm_file = db_file.with_suffix('.db-shm')
-                        if wal_file.exists():
-                            wal_file.unlink()
-                        if shm_file.exists():
-                            shm_file.unlink()
-                        bt.logging.info("Cleaned up WAL/SHM files before retry")
-                    except Exception as cleanup_error:
-                        bt.logging.warning(f"Error cleaning up WAL/SHM files: {cleanup_error}")
-                    
-                    # Wait before retrying
-                    await asyncio.sleep(2 * retry_count)  # Exponential backoff
-                    continue
-                
+                if not success:
+                    bt.logging.error("Failed to restore database from backup")
+                    return False
+            else:
+                bt.logging.error("Database backup not found")
                 return False
 
-        bt.logging.error(f"Failed to pull state after {max_retries} attempts")
-        return False
+            # Validate that we downloaded and restored successfully
+            success = await self._validate_state_files()
+            if not success:
+                bt.logging.error("State validation failed")
+                return False
+            
+            bt.logging.info("State pulled and restored successfully")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error during state pull: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
+
+    async def _get_database_type(self):
+        """
+        Determine the database type from configuration.
+        
+        Returns:
+            str: "postgres" or "sqlite"
+        """
+        # First check environment variable
+        if os.environ.get("BETTENSOR_DB_TYPE"):
+            return os.environ.get("BETTENSOR_DB_TYPE").lower()
+            
+        # Then check setup.cfg
+        config_parser = configparser.ConfigParser()
+        try:
+            config_parser.read('setup.cfg')
+            
+            # Check for database section
+            if 'database' in config_parser:
+                db_section = config_parser['database']
+                return db_section.get('default_type', 'sqlite').lower()
+            else:
+                # Check metadata section for backward compatibility
+                return config_parser.get('metadata', 'database_type', fallback='sqlite').lower()
+                
+        except configparser.Error as e:
+            bt.logging.error(f"Error reading database configuration from setup.cfg: {e}")
+            return "sqlite"
+
+    async def _upload_database_backup(self, backup_path, db_type):
+        """
+        Upload database backup to Azure.
+        
+        Args:
+            backup_path: Path to backup file
+            db_type: Database type ("postgres" or "sqlite")
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not backup_path.exists():
+            bt.logging.error(f"Backup file not found: {backup_path}")
+            return False
+            
+        try:
+            # Determine blob name based on database type
+            if db_type == "postgres":
+                blob_name = "postgres_backup.dump"
+            else:
+                blob_name = "validator.db"
+                
+            # Upload to Azure
+            with open(backup_path, "rb") as data:
+                await self.blob_client.upload_blob(name=blob_name, data=data, overwrite=True)
+                
+            bt.logging.info(f"Uploaded {db_type} backup to Azure")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error uploading {db_type} backup to Azure: {e}")
+            return False
+
+    async def _restore_postgres_database(self, backup_path):
+        """
+        Restore PostgreSQL database from backup.
+        
+        Args:
+            backup_path: Path to PostgreSQL backup file (pg_dump format)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Get database connection info
+            db_config = {}
+            for env_var, config_key in [
+                ("BETTENSOR_DB_HOST", "host"),
+                ("BETTENSOR_DB_PORT", "port"),
+                ("BETTENSOR_DB_USER", "user"),
+                ("BETTENSOR_DB_PASSWORD", "password"),
+                ("BETTENSOR_DB_NAME", "dbname")
+            ]:
+                if os.environ.get(env_var):
+                    if config_key == "port":
+                        db_config[config_key] = int(os.environ.get(env_var))
+                    else:
+                        db_config[config_key] = os.environ.get(env_var)
+            
+            # If not set in environment, use defaults
+            if "host" not in db_config:
+                db_config["host"] = "localhost"
+            if "port" not in db_config:
+                db_config["port"] = 5432
+            if "user" not in db_config:
+                db_config["user"] = "postgres"
+            if "password" not in db_config:
+                db_config["password"] = ""
+            if "dbname" not in db_config:
+                db_config["dbname"] = "bettensor_validator"
+                
+            # Build pg_restore command
+            cmd = [
+                "pg_restore",
+                "-h", db_config["host"],
+                "-p", str(db_config["port"]),
+                "-U", db_config["user"],
+                "-d", db_config["dbname"],
+                "-c",  # Clean (drop) database objects before recreating
+                "-v",  # Verbose output
+                str(backup_path)
+            ]
+            
+            # Set password environment variable for pg_restore
+            env = os.environ.copy()
+            if db_config["password"]:
+                env["PGPASSWORD"] = db_config["password"]
+                
+            # Execute pg_restore
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                bt.logging.error(f"pg_restore failed: {stderr.decode()}")
+                return False
+                
+            bt.logging.info(f"Restored PostgreSQL database from backup")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error restoring PostgreSQL database: {e}")
+            bt.logging.error(traceback.format_exc())
+            return False
+
+    async def _restore_sqlite_database(self, backup_path):
+        """
+        Restore SQLite database from backup.
+        
+        Args:
+            backup_path: Path to SQLite database backup
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Determine target path
+            target_path = self.state_dir / "validator.db"
+            
+            # Remove existing database if it exists
+            if target_path.exists():
+                target_path.unlink()
+                
+            # Copy backup to target path
+            import shutil
+            shutil.copy2(backup_path, target_path)
+            
+            bt.logging.info(f"Restored SQLite database from backup")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error restoring SQLite database: {e}")
+            return False
+
+    async def _download_state_file(self, local_path, blob_name):
+        """
+        Download a state file from Azure.
+        
+        Args:
+            local_path: Local path to save file
+            blob_name: Blob name in Azure
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Check if file exists in Azure
+            blob_properties = await self.blob_client.get_blob_properties(blob=blob_name)
+            if not blob_properties:
+                bt.logging.warning(f"Blob {blob_name} not found in Azure")
+                return False
+                
+            # Download blob
+            with open(local_path, "wb") as download_file:
+                download_stream = await self.blob_client.download_blob(blob_name)
+                data = await download_stream.readall()
+                download_file.write(data)
+                
+            bt.logging.info(f"Downloaded {blob_name} to {local_path}")
+            return True
+            
+        except Exception as e:
+            bt.logging.error(f"Error downloading {blob_name}: {e}")
+            return False
+
+    async def _validate_state_files(self):
+        """
+        Validate that all required state files exist.
+        
+        Returns:
+            bool: True if all files exist, False otherwise
+        """
+        required_files = [
+            self.state_dir / "state.pt"
+        ]
+        
+        # Check if database exists (either SQLite or PostgreSQL)
+        db_type = await self._get_database_type()
+        if db_type == "postgres":
+            # For PostgreSQL, we verify by trying to connect to the database
+            try:
+                db_config = {'type': 'postgres'}
+                db_manager = await DatabaseFactory.create_database_manager(db_config)
+                connection_ok = await db_manager.ensure_connection()
+                await db_manager.cleanup()
+                
+                if not connection_ok:
+                    bt.logging.error("Cannot connect to PostgreSQL database")
+                    return False
+            except Exception as e:
+                bt.logging.error(f"Error validating PostgreSQL database: {e}")
+                return False
+        else:
+            # For SQLite, check if the file exists
+            required_files.append(self.state_dir / "validator.db")
+        
+        # Check if all required files exist
+        for file_path in required_files:
+            if not file_path.exists():
+                bt.logging.error(f"Required state file not found: {file_path}")
+                return False
+                
+        return True
 
     async def _should_pull_state(self, remote_metadata: dict) -> bool:
         """
@@ -727,7 +811,7 @@ class StateSync:
             return False
 
     async def push_state(self):
-        """Push state with proper SQLAlchemy async handling and other state files."""
+        """Push state with proper database handling and other state files."""
         if not self.azure_enabled:
             bt.logging.error("Azure blob storage not configured")
             return False
@@ -735,70 +819,55 @@ class StateSync:
         success = False
         db_manager = self.db_manager
         validator = self.validator
-        temp_db = self.state_dir / "validator.db.backup"
+        
+        # Determine database type
+        db_type = await self._get_database_type()
+        
+        if db_type == "postgres":
+            temp_db = self.state_dir / "postgres_backup.dump"
+        else:
+            temp_db = self.state_dir / "validator.db.backup"
 
         try:
             if not validator:
                 bt.logging.error("No validator instance available")
                 return False
 
-            bt.logging.info("Preparing database for state push...")
+            bt.logging.info(f"Preparing {db_type} database for state push...")
 
-            # Create a verified database backup using the backup API
+            # Create a verified database backup
             backup_result = await db_manager.create_verified_backup(temp_db)
             bt.logging.debug(f"Backup result: {backup_result}")
             if not backup_result:
                 bt.logging.error("Database backup creation or verification failed")
                 return False
 
-            # Upload all state files to Azure
-            for filename in self.state_files:
-                filepath = self.state_dir / filename
-                if not filepath.exists():
-                    bt.logging.warning(f"State file {filename} does not exist, skipping.")
-                    continue
+            # Upload database backup
+            upload_success = await self._upload_database_backup(temp_db, db_type)
+            if not upload_success:
+                bt.logging.error("Failed to upload database backup")
+                return False
 
-                # Use temp database backup for validator.db
-                upload_path = temp_db if filename == "validator.db" else filepath
-
-                blob_client = self.container.get_blob_client(filename)
-                try:
-                    async with aiofiles.open(upload_path, 'rb') as f:
-                        data = await f.read()
-
-                    # Ensure data is bytes
-                    if isinstance(data, dict):
-                        bt.logging.error(f"Data for {filename} is a dict. Serializing to bytes.")
-                        data = json.dumps(data).encode('utf-8')
-
-                    await blob_client.upload_blob(data, overwrite=True)
-                    bt.logging.debug(f"Uploaded {filename} to Azure")
-                except Exception as e:
-                    bt.logging.error(f"Failed to upload {filename} to Azure: {e}")
-                    bt.logging.error(traceback.format_exc())
-                    return False
-
-            success = True
-
-            # Update metadata and hash files after successful upload
-            if success:
-                await self._update_metadata_file()
-                await self._update_hash_file()
+            # Upload other state files
+            for state_file in [
+                self.state_dir / "state.pt", 
+                self.state_dir / "metagraph.bin"
+            ]:
+                if state_file.exists():
+                    await self._upload_state_file(state_file)
 
             return True
-
         except Exception as e:
-            bt.logging.error(f"Error pushing state: {str(e)}")
+            bt.logging.error(f"Error during state push: {e}")
             bt.logging.error(traceback.format_exc())
             return False
         finally:
-            # Cleanup temporary database file
+            # Clean up temporary files
             if temp_db.exists():
                 try:
                     temp_db.unlink()
-                    bt.logging.debug(f"Temporary backup file {temp_db} deleted.")
                 except Exception as e:
-                    bt.logging.error(f"Error cleaning up temporary database: {e}")
+                    bt.logging.warning(f"Failed to remove temporary backup: {e}")
 
     async def _safe_checkpoint(self, checkpoint_type="FULL", max_retries=3):
         """Execute WAL checkpoint with retries and proper error handling"""

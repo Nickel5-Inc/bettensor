@@ -6,6 +6,7 @@ aiosqlite
 annotated-types
 anyio
 async-property
+asyncpg
 async-timeout
 attrs
 azure-core

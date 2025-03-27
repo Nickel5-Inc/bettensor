@@ -13,6 +13,7 @@ import requests
 import bittensor as bt
 import concurrent.futures
 import argparse
+import configparser
 from os import path, rename
 from copy import deepcopy
 from pathlib import Path
@@ -26,7 +27,8 @@ from bettensor.validator.utils.scoring.scoring import ScoringSystem
 from .utils.scoring.entropy_system import EntropySystem
 from bettensor.validator.utils.io.sports_data import SportsData
 from bettensor.validator.utils.scoring.weights_functions import WeightSetter
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.utils.database.database_manager import DatabaseManager as SQLiteDatabaseManager
+from bettensor.validator.utils.database.database_factory import DatabaseFactory
 from bettensor.validator.utils.io.miner_data import MinerDataMixin
 from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
 from bettensor.validator.utils.scoring.min_stake import MinStakeService
@@ -34,7 +36,6 @@ from bettensor.validator.utils.io.base_api_client import BaseAPIClient
 from bettensor.validator.utils.scoring.watchdog import Watchdog
 from bettensor import __spec_version__
 from types import SimpleNamespace
-import configparser
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -55,6 +56,42 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             type=str,
             default=DEFAULT_DB_PATH,
             help="Path to the validator database"
+        )
+        parser.add_argument(
+            "--db_type",
+            type=str,
+            default=None,
+            help="Database type to use ('sqlite' or 'postgres'). If not specified, uses the value in setup.cfg"
+        )
+        parser.add_argument(
+            "--postgres_host",
+            type=str,
+            default="localhost",
+            help="PostgreSQL host (when using postgres db_type)"
+        )
+        parser.add_argument(
+            "--postgres_port",
+            type=int,
+            default=5432,
+            help="PostgreSQL port (when using postgres db_type)"
+        )
+        parser.add_argument(
+            "--postgres_user",
+            type=str,
+            default="postgres",
+            help="PostgreSQL user (when using postgres db_type)"
+        )
+        parser.add_argument(
+            "--postgres_password",
+            type=str,
+            default="",
+            help="PostgreSQL password (when using postgres db_type)"
+        )
+        parser.add_argument(
+            "--postgres_dbname",
+            type=str,
+            default="bettensor_validator",
+            help="PostgreSQL database name (when using postgres db_type)"
         )
         parser.add_argument(
             "--load_state",
@@ -268,9 +305,11 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.max_targets = getattr(self.config, 'max_targets', 256)
         self.target_group = 0
 
-        # Initialize the database manager
-        self.db_manager = DatabaseManager(self.db_path)
-        await self.db_manager.initialize()
+        # Determine database configuration
+        db_config = self._get_database_config()
+
+        # Initialize the database manager using the factory
+        self.db_manager = await DatabaseFactory.create_database_manager(db_config)
 
         # Initialize MinerDataMixin with required parameters
         MinerDataMixin.__init__(self, self.db_manager, self.metagraph, set(self.metagraph.uids))
@@ -305,9 +344,6 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.scoring_system.miner_data = scoring_miner_data
         await self.scoring_system.initialize()
 
-        
-
-
         # After initialization, set force_rebuild_scores back to False to prevent future automatic rebuilds
         if force_rebuild:
             try:
@@ -340,6 +376,56 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.is_initialized = True
         return True
 
+    def _get_database_config(self):
+        """
+        Get database configuration from setup.cfg and command line arguments.
+        
+        Returns:
+            dict: Database configuration dictionary
+        """
+        # Read database configuration from setup.cfg
+        config_parser = configparser.ConfigParser()
+        try:
+            config_parser.read('setup.cfg')
+            
+            # Check for database section
+            if 'database' in config_parser:
+                db_section = config_parser['database']
+                default_db_type = db_section.get('default_type', 'sqlite')
+            else:
+                # Check metadata section for backward compatibility
+                default_db_type = config_parser.get('metadata', 'database_type', fallback='sqlite')
+                
+            bt.logging.info(f"Default database type from setup.cfg: {default_db_type}")
+            
+        except configparser.Error as e:
+            bt.logging.error(f"Error reading database configuration from setup.cfg: {e}")
+            default_db_type = 'sqlite'
+            
+        # Initialize database configuration
+        db_config = {}
+        
+        # Get database type (first from command line, then from setup.cfg)
+        db_type = getattr(self.config, 'db_type', None) or default_db_type
+        db_config['type'] = db_type.lower()
+        
+        # Get database-specific configuration
+        if db_config['type'] == 'postgres':
+            db_config.update({
+                'host': getattr(self.config, 'postgres_host', 'localhost'),
+                'port': getattr(self.config, 'postgres_port', 5432),
+                'user': getattr(self.config, 'postgres_user', 'postgres'),
+                'password': getattr(self.config, 'postgres_password', ''),
+                'dbname': getattr(self.config, 'postgres_dbname', 'bettensor_validator')
+            })
+            bt.logging.info(f"Using PostgreSQL database: {db_config['dbname']} on {db_config['host']}:{db_config['port']}")
+        else:
+            db_config.update({
+                'path': getattr(self.config, 'db', DEFAULT_DB_PATH)
+            })
+            bt.logging.info(f"Using SQLite database: {db_config['path']}")
+            
+        return db_config
 
     def _parse_args(self, parser):
         """Parses the command line arguments"""
