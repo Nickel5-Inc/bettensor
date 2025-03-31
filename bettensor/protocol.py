@@ -242,7 +242,7 @@ class GameData(bt.Synapse):
     def create(
         cls,
         db_path: str,
-        wallet: bt.wallet,
+        wallet: "bt.wallet",
         subnet_version: str,
         neuron_uid: int,  # Note: This is an int
         synapse_type: str,
@@ -280,5 +280,153 @@ class GameData(bt.Synapse):
 
     def deserialize(self):
         return self.gamedata_dict, self.prediction_dict, self.metadata
+
+
+class WebSocketMessage(BaseModel):
+    """Base class for WebSocket messages exchanged between miners and validators"""
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "ignore"
+    }
+
+    message_id: str = Field(..., description="Unique identifier for this message")
+    sender_hotkey: str = Field(..., description="Sender's hotkey address")
+    timestamp: str = Field(..., description="Timestamp of message creation")
+    message_type: str = Field(..., description="Type of message: prediction, confirmation, game_update, heartbeat")
+    
+    @classmethod
+    def create(cls, sender_hotkey, message_type, **kwargs):
+        """
+        Creates a new WebSocket message
+        Args:
+            sender_hotkey: Hotkey of the sender
+            message_type: Type of message
+            **kwargs: Additional fields for specific message types
+        Returns:
+            WebSocketMessage: A new message object
+        """
+        timestamp = datetime.now(timezone.utc).isoformat()
+        message_id = str(uuid.uuid4())
+        
+        return cls(
+            message_id=message_id,
+            sender_hotkey=sender_hotkey,
+            timestamp=timestamp,
+            message_type=message_type,
+            **kwargs
+        )
+
+class PredictionMessage(WebSocketMessage):
+    """WebSocket message containing a game prediction"""
+    prediction: TeamGamePrediction = Field(..., description="The game prediction")
+    
+    @classmethod
+    def create(cls, sender_hotkey, prediction):
+        """
+        Creates a new prediction message
+        Args:
+            sender_hotkey: Sender's hotkey address
+            prediction: TeamGamePrediction object
+        Returns:
+            PredictionMessage: A new prediction message
+        """
+        return super().create(
+            sender_hotkey=sender_hotkey,
+            message_type="prediction",
+            prediction=prediction
+        )
+
+class ConfirmationMessage(WebSocketMessage):
+    """WebSocket message confirming receipt of a prediction"""
+    prediction_id: str = Field(..., description="ID of the prediction being confirmed")
+    success: bool = Field(..., description="Whether the prediction was accepted")
+    message: str = Field(..., description="Additional information about the confirmation")
+    miner_stats: dict = Field(default=None, description="Updated miner stats")
+    
+    @classmethod
+    def create(cls, sender_hotkey, prediction_id, success, message, miner_stats=None):
+        """
+        Creates a new confirmation message
+        Args:
+            sender_hotkey: Sender's hotkey address
+            prediction_id: ID of the prediction being confirmed
+            success: Whether the prediction was accepted
+            message: Additional information
+            miner_stats: Updated miner stats
+        Returns:
+            ConfirmationMessage: A new confirmation message
+        """
+        return super().create(
+            sender_hotkey=sender_hotkey,
+            message_type="confirmation",
+            prediction_id=prediction_id,
+            success=success,
+            message=message,
+            miner_stats=miner_stats
+        )
+
+class GameUpdateMessage(WebSocketMessage):
+    """WebSocket message containing game updates"""
+    updated_games: dict = Field(..., description="Dictionary of updated games")
+    
+    @classmethod
+    def create(cls, sender_hotkey, updated_games):
+        """
+        Creates a new game update message
+        Args:
+            sender_hotkey: Sender's hotkey address
+            updated_games: Dictionary of updated games
+        Returns:
+            GameUpdateMessage: A new game update message
+        """
+        return super().create(
+            sender_hotkey=sender_hotkey,
+            message_type="game_update",
+            updated_games=updated_games
+        )
+
+class HeartbeatMessage(WebSocketMessage):
+    """WebSocket heartbeat message to keep connections alive"""
+    
+    @classmethod
+    def create(cls, sender_hotkey):
+        """
+        Creates a new heartbeat message
+        Args:
+            sender_hotkey: Sender's hotkey address
+        Returns:
+            HeartbeatMessage: A new heartbeat message
+        """
+        return super().create(
+            sender_hotkey=sender_hotkey,
+            message_type="heartbeat"
+        )
+
+class WebSocketConnection:
+    """
+    Represents a WebSocket connection between miners and validators.
+    This is not a Pydantic model but a reference class for WebSocket connections.
+    """
+    def __init__(self, hotkey, role, websocket=None):
+        self.hotkey = hotkey  # The hotkey of the connected party
+        self.role = role      # Either "miner" or "validator"
+        self.websocket = websocket  # The actual WebSocket connection
+        self.connected_at = datetime.now(timezone.utc)
+        self.last_heartbeat = datetime.now(timezone.utc)
+        self.active = True    # Whether the connection is active
+        
+    def is_stale(self, timeout_seconds=300):
+        """Check if the connection is stale (no heartbeat for some time)"""
+        elapsed = (datetime.now(timezone.utc) - self.last_heartbeat).total_seconds()
+        return elapsed > timeout_seconds
+        
+    def update_heartbeat(self):
+        """Update the last heartbeat time"""
+        self.last_heartbeat = datetime.now(timezone.utc)
+        
+    def close(self):
+        """Mark the connection as inactive"""
+        self.active = False
 
 

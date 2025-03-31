@@ -4,6 +4,7 @@ import sys
 import copy
 import json
 import math
+import threading
 import time
 import traceback
 import uuid
@@ -19,8 +20,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from typing import Dict, Tuple, Optional
 from datetime import datetime, timedelta, timezone
+from bettensor import protocol
 from bettensor.base.neuron import BaseNeuron
-from bettensor.protocol import TeamGamePrediction
+from bettensor.protocol import TeamGamePrediction, GameData
 from bettensor.validator.io.website_handler import WebsiteHandler
 from bettensor.validator.scoring.scoring import ScoringSystem
 from bettensor.validator.scoring.entropy_system import EntropySystem
@@ -36,6 +38,7 @@ from bettensor.validator.vesting.integration import VestingIntegration, get_vest
 from bettensor import __spec_version__
 from types import SimpleNamespace
 import configparser
+from bettensor.validator.io.websocket_handler import ValidatorWebSocketManager
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -74,6 +77,26 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             type=float,
             default=0.9,
             help="The alpha value for the validator."
+        )
+        
+        # WebSocket configuration parameters
+        parser.add_argument(
+            "--websocket.enabled",
+            type=str,
+            default="True",
+            help="Enable WebSocket connections for real-time communications (True/False)"
+        )
+        parser.add_argument(
+            "--websocket.heartbeat_interval",
+            type=int,
+            default=60,
+            help="Interval in seconds between heartbeat messages"
+        )
+        parser.add_argument(
+            "--websocket.connection_timeout",
+            type=int,
+            default=300,
+            help="Time in seconds after which a connection is considered stale"
         )
         
         # Vesting system parameters
@@ -194,6 +217,10 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
         self.is_initialized = False
 
+        # WebSocket manager for real-time communication
+        self.websocket_manager = None
+        self.websocket_enabled = True  # Will be properly set during initialization
+
     @classmethod
     async def create(cls):
         """Create a new validator instance."""
@@ -292,6 +319,21 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         bt.logging.info("Serving axon...")
 
         self.axon = bt.axon(wallet=self.wallet)
+        
+        # Initialize WebSocket manager if enabled
+        if self.websocket_enabled:
+            self.websocket_manager = ValidatorWebSocketManager(validator=self)
+            
+            # Register prediction handler
+            self.websocket_manager.register_prediction_handler(self.handle_websocket_prediction)
+            
+            # Integrate WebSocket routes with Axon's FastAPI app
+            asyncio.create_task(self.websocket_manager.integrate_with_axon(self.axon.app))
+            
+            # Start WebSocket manager
+            asyncio.create_task(self.websocket_manager.start())
+            
+            bt.logging.info("WebSocket server initialized and integrated with Axon")
 
         self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
 
@@ -407,6 +449,10 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 # Load state AFTER checking registration
                 await self.load_state()
 
+                # Set WebSocket enabled flag from config
+                self.websocket_enabled = getattr(self.config, "websocket.enabled", "True").lower() == "true"
+                bt.logging.info(f"WebSocket support is {'enabled' if self.websocket_enabled else 'disabled'}")
+                
                 # Setup axon
                 self.serve_axon()
 
@@ -912,6 +958,15 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 except Exception as e:
                     bt.logging.error(f"Error cleaning up vesting database: {e}")
                 
+            # Stop WebSocket manager if it exists
+            if hasattr(self, 'websocket_manager') and self.websocket_manager:
+                bt.logging.info("Shutting down WebSocket manager...")
+                try:
+                    await self.websocket_manager.stop()
+                    bt.logging.info("WebSocket manager shut down successfully")
+                except Exception as e:
+                    bt.logging.error(f"Error shutting down WebSocket manager: {e}")
+                
             bt.logging.info("Shutdown completed successfully")
             sys.exit(0)
             
@@ -976,6 +1031,15 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
                 bt.logging.info("Vesting database connections closed")
             except Exception as e:
                 bt.logging.error(f"Error closing vesting database connections: {e}")
+                
+        # Stop WebSocket manager if it exists
+        if hasattr(self, 'websocket_manager') and self.websocket_manager:
+            bt.logging.info("Shutting down WebSocket manager...")
+            try:
+                await self.websocket_manager.stop()
+                bt.logging.info("WebSocket manager shut down successfully")
+            except Exception as e:
+                bt.logging.error(f"Error shutting down WebSocket manager: {e}")
                 
         bt.logging.info("Cleanup complete")
 
@@ -1141,3 +1205,175 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             bt.logging.error(f"Error checking transaction monitoring status: {e}")
             bt.logging.error(traceback.format_exc())
             return False
+
+    async def handle_websocket_prediction(self, miner_hotkey, prediction):
+        """
+        Handle a prediction received via WebSocket.
+        
+        Args:
+            miner_hotkey: The miner's hotkey
+            prediction: The TeamGamePrediction object
+        """
+        try:
+            bt.logging.info(f"Received WebSocket prediction from miner {miner_hotkey}")
+            
+            # Find miner UID from hotkey
+            try:
+                miner_uid = self.metagraph.hotkeys.index(miner_hotkey)
+            except ValueError:
+                bt.logging.error(f"Unknown miner hotkey: {miner_hotkey}")
+                if self.websocket_manager:
+                    await self.websocket_manager.send_confirmation(
+                        miner_hotkey=miner_hotkey,
+                        prediction_id=prediction.prediction_id,
+                        success=False,
+                        message="Unknown miner hotkey"
+                    )
+                return
+            
+            # Process the prediction
+            predictions_dict = {prediction.prediction_id: prediction}
+            validation_results = {}
+            
+            # Use existing validation logic
+            existing_prediction_ids = await self._get_existing_predictions([prediction.prediction_id])
+            is_valid, message, error_code, severity = await self.validate_prediction(
+                miner_uid=miner_uid,
+                prediction_id=prediction.prediction_id,
+                prediction_data=prediction.dict(),
+                existing_predictions=existing_prediction_ids
+            )
+            
+            validation_results[prediction.prediction_id] = (is_valid, message)
+            
+            # Insert valid predictions into the database
+            if is_valid:
+                await self.insert_predictions([miner_uid], predictions_dict)
+                
+                # Get miner stats for the confirmation
+                miner_stats = await self.db_manager.fetch_one(
+                    "SELECT * FROM miner_stats WHERE miner_uid = ?", (miner_uid,)
+                )
+                
+                # Convert miner_stats to a dictionary if it's not None
+                miner_stats_dict = dict(miner_stats) if miner_stats else {}
+                
+                # Send confirmation via WebSocket
+                if self.websocket_manager:
+                    await self.websocket_manager.send_confirmation(
+                        miner_hotkey=miner_hotkey,
+                        prediction_id=prediction.prediction_id,
+                        success=True,
+                        message="Prediction accepted",
+                        miner_stats=miner_stats_dict
+                    )
+            else:
+                # Send error confirmation via WebSocket
+                if self.websocket_manager:
+                    await self.websocket_manager.send_confirmation(
+                        miner_hotkey=miner_hotkey,
+                        prediction_id=prediction.prediction_id,
+                        success=False,
+                        message=message
+                    )
+            
+        except Exception as e:
+            bt.logging.error(f"Error handling WebSocket prediction: {str(e)}")
+            bt.logging.error(traceback.format_exc())
+            
+            # Send error confirmation via WebSocket
+            if self.websocket_manager:
+                try:
+                    await self.websocket_manager.send_confirmation(
+                        miner_hotkey=miner_hotkey,
+                        prediction_id=prediction.prediction_id,
+                        success=False,
+                        message=f"Server error: {str(e)}"
+                    )
+                except Exception as confirm_error:
+                    bt.logging.error(f"Error sending error confirmation: {str(confirm_error)}")
+
+    def start(self):
+        """Start the validator and its components"""
+        bt.logging.info(f"Starting validator with hotkey {self.wallet.hotkey.ss58_address}")
+        
+        # Initialize and connect to database
+        self.database.connect()
+        
+        # Start Axon server with WebSocket support
+        self.axon.start()
+        
+        # Initialize WebSocket manager if enabled
+        if getattr(self.config, "websocket_enabled", False):
+            try:
+                from bettensor.validator.io.websocket_handler import ValidatorWebSocketManager
+                from bettensor.validator.io.prediction_handler import PredictionHandler
+                
+                # Create WebSocket manager
+                self.websocket_manager = ValidatorWebSocketManager(self)
+                
+                # Create prediction handler
+                self.prediction_handler = PredictionHandler(self)
+                
+                # Register prediction handler with WebSocket manager
+                self.prediction_handler.register_with_websocket_manager(self.websocket_manager)
+                
+                # Integrate with Axon
+                app = getattr(self.axon, "app", None)
+                if app:
+                    asyncio.run_coroutine_threadsafe(self.websocket_manager.integrate_with_axon(app), self.loop)
+                    
+                    # Start WebSocket manager
+                    asyncio.run_coroutine_threadsafe(self.websocket_manager.start(), self.loop)
+                    
+                    bt.logging.info("WebSocket manager initialized and integrated with Axon")
+                else:
+                    bt.logging.error("Cannot integrate WebSocket manager: Axon app not found")
+            except Exception as e:
+                bt.logging.error(f"Failed to initialize WebSocket manager: {str(e)}")
+                bt.logging.error(traceback.format_exc())
+        
+        # Register forward for sports odds predictions
+        def handle_sports_odds(synapse: GameData) -> GameData:
+            # Process the prediction using the HTTP handler
+            if hasattr(self, 'prediction_handler'):
+                self.loop.run_until_complete(self.prediction_handler.handle_http_prediction(synapse, synapse.dendrite.hotkey))
+            return synapse
+            
+        self.axon.attach(
+            forward_fn=handle_sports_odds,
+            blacklist_fn=None,
+            priority_fn=None
+        )
+        
+        # Start the scheduler
+        self.scheduler.start()
+        
+        # Start other threads or tasks as needed
+        self.stats_thread = threading.Thread(target=self._stats_loop, daemon=True)
+        self.stats_thread.start()
+        
+        bt.logging.info("Validator started")
+        
+    def stop(self):
+        """Stop the validator and its components"""
+        bt.logging.info("Stopping validator")
+        
+        # Stop WebSocket manager if enabled
+        if hasattr(self, 'websocket_manager'):
+            try:
+                asyncio.run_coroutine_threadsafe(self.websocket_manager.stop(), self.loop)
+                bt.logging.info("WebSocket manager stopped")
+            except Exception as e:
+                bt.logging.error(f"Error stopping WebSocket manager: {str(e)}")
+        
+        # Stop Axon server
+        self.axon.stop()
+        
+        # Stop the scheduler
+        self.scheduler.stop()
+        
+        # Disconnect from database
+        self.database.disconnect()
+        
+        bt.logging.info("Validator stopped")

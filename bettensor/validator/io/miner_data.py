@@ -396,35 +396,71 @@ class MinerDataMixin:
 
         # Convert miner_uid to integer for indexing
         miner_uid_int = int(miner_uid)
-        axon = self.metagraph.axons[miner_uid_int]
-
-        # Create synapse with confirmation data
-        synapse = GameData.create(
-            db_path=self.db_path,
-            wallet=self.wallet,
-            subnet_version=self.subnet_version,
-            neuron_uid=miner_uid_int,
-            synapse_type="confirmation",
-            confirmation_dict=confirmation_dict,
-        )
-
-        bt.logging.info(f"Sending confirmation synapse to miner {miner_uid}, axon: {axon}")
+        
+        # Try to get the miner's hotkey
         try:
-            # Use the forward method directly instead of query to avoid event loop conflicts
-            response = await self.dendrite.forward(
-                axons=axon,
-                synapse=synapse,
-                timeout=self.timeout,
-                deserialize=True,
+            miner_hotkey = self.metagraph.hotkeys[miner_uid_int]
+        except IndexError:
+            bt.logging.error(f"Miner UID {miner_uid_int} out of range in metagraph")
+            return None
+        
+        # First, try to send confirmation via WebSocket if available
+        websocket_sent = False
+        if hasattr(self.validator, 'websocket_manager') and self.validator.websocket_manager:
+            # Iterate through predictions and send individual confirmations
+            for pred_id, (success, message) in predictions.items():
+                if pred_id == 'miner_stats':
+                    continue
+                    
+                try:
+                    # Send confirmation via WebSocket
+                    websocket_sent = await self.validator.websocket_manager.send_confirmation(
+                        miner_hotkey=miner_hotkey,
+                        prediction_id=pred_id,
+                        success=(success_str.lower() == "true"),
+                        message=message_str,
+                        miner_stats=miner_stats_str
+                    )
+                    
+                    if websocket_sent:
+                        bt.logging.debug(f"Confirmation for prediction {pred_id} sent to miner {miner_uid} via WebSocket")
+                    
+                except Exception as e:
+                    bt.logging.error(f"Error sending WebSocket confirmation to miner {miner_uid}: {e}")
+                    bt.logging.debug(traceback.format_exc())
+                    websocket_sent = False
+        
+        # If WebSocket failed or is not available, fall back to HTTP
+        if not websocket_sent:
+            axon = self.metagraph.axons[miner_uid_int]
+
+            # Create synapse with confirmation data
+            synapse = GameData.create(
+                db_path=self.db_path,
+                wallet=self.wallet,
+                subnet_version=self.subnet_version,
+                neuron_uid=miner_uid_int,
+                synapse_type="confirmation",
+                confirmation_dict=confirmation_dict,
             )
-            
-            bt.logging.info(f"Confirmation synapse sent to miner {miner_uid}")
-            return response
-            
-        except Exception as e:
-            bt.logging.error(f"An error occurred while sending confirmation synapse: {e}")
-            bt.logging.error(f"Traceback: {traceback.format_exc()}")
-            raise
+
+            bt.logging.info(f"Sending confirmation synapse to miner {miner_uid} via HTTP, axon: {axon}")
+            try:
+                # Use the forward method directly instead of query to avoid event loop conflicts
+                response = await self.dendrite.forward(
+                    axons=axon,
+                    synapse=synapse,
+                    timeout=self.timeout,
+                    deserialize=True,
+                )
+                
+                bt.logging.info(f"Confirmation synapse sent to miner {miner_uid} via HTTP")
+                return response
+                
+            except Exception as e:
+                bt.logging.error(f"An error occurred while sending confirmation synapse via HTTP: {e}")
+                bt.logging.error(f"Traceback: {traceback.format_exc()}")
+                raise
 
     async def process_prediction(self, processed_uids: torch.tensor, synapses: list) -> list:
         """processes responses received by miners"""

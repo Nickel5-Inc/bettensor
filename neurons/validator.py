@@ -14,6 +14,7 @@ from datetime import datetime, timezone, timedelta
 import asyncio
 from bettensor.protocol import GameData
 from bettensor.validator.bettensor_validator import BettensorValidator
+from bettensor.validator.core.event_driven_validator import EventDrivenValidator
 from bettensor.validator.scoring.watchdog import Watchdog
 from bettensor.validator.io.auto_updater import check_and_install_dependencies, perform_update
 from functools import partial
@@ -271,6 +272,10 @@ async def run(validator: BettensorValidator):
     STATE_PUSH_INTERVAL = 3600  # 1 hour
     STATE_CHECK_INTERVAL = 300  # 5 minutes
     MAX_PUSH_DURATION = 120  # 2 minutes
+    
+    # Track WebSocket health
+    last_websocket_health_check = time.time()
+    WEBSOCKET_HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 
     try:
         # Ensure neuron is initialized
@@ -321,9 +326,36 @@ async def run(validator: BettensorValidator):
             ))
 
             await asyncio.sleep(2)
+            
+            # Check WebSocket health and connection status if enabled
+            if (time.time() - last_websocket_health_check >= WEBSOCKET_HEALTH_CHECK_INTERVAL and 
+                hasattr(validator, 'websocket_manager') and 
+                validator.websocket_manager is not None):
+                    
+                # Log WebSocket status
+                active_connections = validator.websocket_manager.get_active_connection_count()
+                total_miners = len(validator.metagraph.hotkeys) if validator.metagraph else 0
+                
+                if total_miners > 0:
+                    connection_percentage = (active_connections / total_miners) * 100
+                    bt.logging.info(f"WebSocket status: {active_connections}/{total_miners} miners connected ({connection_percentage:.1f}%)")
+                    
+                    # If connection percentage is too low, check if WebSocket server is healthy
+                    if connection_percentage < 25:  # Arbitrary threshold
+                        bt.logging.warning(f"Low WebSocket connection rate ({connection_percentage:.1f}%). Checking WebSocket server health...")
+                        try:
+                            is_healthy = validator.websocket_manager.check_health()
+                            if not is_healthy:
+                                bt.logging.error("WebSocket server is unhealthy. Attempting restart...")
+                                await validator.websocket_manager.restart()
+                        except Exception as e:
+                            bt.logging.error(f"Error checking WebSocket health: {str(e)}")
+                
+                last_websocket_health_check = time.time()
 
-            # Query and process axons
+            # Query and process axons - only if needed as fallback when WebSocket connections are insufficient
             if (current_block - validator.last_queried_block) > validator.query_axons_interval:
+                # Call this method but it will internally decide whether to actually run or skip
                 tasks.append((
                     query_and_process_axons(validator),
                     TASK_TIMEOUTS['query_and_process_axons']
@@ -410,11 +442,7 @@ async def run(validator: BettensorValidator):
                     bt.logging.error("State synchronization timed out.")
                 except Exception as e:
                     bt.logging.error(f"State synchronization error: {e}")
-            
 
-
-            
-           
 
     except Exception as e:
         bt.logging.error(f"Error in main loop: {e}")
@@ -761,9 +789,31 @@ async def filter_and_update_axons(validator):
 @time_task("query_and_process_axons")
 @cancellable_task
 async def query_and_process_axons(validator):
-    """Queries axons and processes the responses in batches with non-blocking response handling"""
+    """
+    Queries axons and processes the responses in batches with non-blocking response handling.
+    This method is now only used as a fallback when WebSocket connections are not available or have failed.
+    """
     try:
-        bt.logging.info("\n--------------------------------Querying and processing axons--------------------------------\n")
+        bt.logging.info("\n--------------------------------Querying and processing axons (HTTP Fallback)--------------------------------\n")
+        
+        # First check if WebSocket is enabled and has active connections
+        if (hasattr(validator, 'websocket_manager') and 
+            validator.websocket_manager is not None and 
+            validator.websocket_manager.is_running() and
+            validator.websocket_manager.get_active_connection_count() > 0):
+            
+            # Count how many miners we're connected to via WebSocket
+            active_connections = validator.websocket_manager.get_active_connection_count()
+            total_miners = len(validator.metagraph.hotkeys)
+            connection_percentage = (active_connections / total_miners) * 100 if total_miners > 0 else 0
+            
+            # If we have a significant portion of miners connected via WebSocket, skip HTTP polling
+            if connection_percentage >= 50:  # Threshold: 50% of miners connected
+                bt.logging.info(f"Skipping HTTP polling as {active_connections}/{total_miners} miners ({connection_percentage:.1f}%) are connected via WebSocket")
+                validator.last_queried_block = validator.subtensor.block
+                return None
+            
+            bt.logging.info(f"Only {connection_percentage:.1f}% of miners connected via WebSocket, proceeding with HTTP fallback")
         
         async with validator.operation_lock:
             validator.last_queried_block = validator.subtensor.block
@@ -796,12 +846,33 @@ async def query_and_process_axons(validator):
 
             uids_to_query, list_of_uids, blacklisted_uids, uids_not_to_query = filtered_axons
             
+            # Check which miners are already connected via WebSocket
+            connected_miners = set()
+            if hasattr(validator, 'websocket_manager') and validator.websocket_manager is not None:
+                connected_miners = set(validator.websocket_manager.get_connected_hotkeys())
+            
+            # Only query miners that aren't connected via WebSocket
+            uids_to_query_filtered = []
+            list_of_uids_filtered = []
+            
+            for i, axon in enumerate(uids_to_query):
+                if axon.hotkey not in connected_miners:
+                    uids_to_query_filtered.append(axon)
+                    list_of_uids_filtered.append(list_of_uids[i])
+            
+            bt.logging.info(f"Querying {len(uids_to_query_filtered)} miners via HTTP (skipping {len(connected_miners)} WebSocket-connected miners)")
+            
+            # If no miners to query, return early
+            if not uids_to_query_filtered:
+                bt.logging.info("No miners to query via HTTP, all required miners are connected via WebSocket")
+                return None
+            
             # Batch size configuration
             BATCH_SIZE = 16
             MAX_CONCURRENT_REQUESTS = 3  # Limit concurrent outgoing requests
             
             # Split axons into batches
-            axon_batches = [uids_to_query[i:i + BATCH_SIZE] for i in range(0, len(uids_to_query), BATCH_SIZE)]
+            axon_batches = [uids_to_query_filtered[i:i + BATCH_SIZE] for i in range(0, len(uids_to_query_filtered), BATCH_SIZE)]
             
             # Semaphore to limit outgoing requests
             request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -874,9 +945,9 @@ async def query_and_process_axons(validator):
                 
             # Process all collected responses
             if total_responses:
-                await validator.process_prediction(list_of_uids, total_responses)
+                await validator.process_prediction(list_of_uids_filtered, total_responses)
             
-            bt.logging.info(f"Processed {processed_count} valid responses from {len(uids_to_query)} total axons")
+            bt.logging.info(f"Processed {processed_count} valid responses from {len(uids_to_query_filtered)} total axons via HTTP")
             return total_responses
 
     except Exception as e:
@@ -1060,10 +1131,38 @@ async def main():
         bt.logging.error(f"Error during pycache cleanup: {str(e)}")
     
     try:
-        _validator = await BettensorValidator.create()
+        # Check if we should use the new event-driven validator
+        # This can be controlled via environment variable or config parameter
+        use_event_driven = os.environ.get("USE_EVENT_DRIVEN", "true").lower() == "true"
         
-        bt.logging.debug("Starting main validator process loop")
-        await run(_validator)
+        if use_event_driven:
+            bt.logging.info("Using new event-driven validator architecture")
+            
+            # Create and initialize the event-driven validator
+            _validator = EventDrivenValidator.config()
+            await _validator.initialize()
+            
+            # Start the validator (which schedules all periodic tasks)
+            success = await _validator.start()
+            
+            if not success:
+                bt.logging.error("Failed to start event-driven validator")
+                return
+                
+            # Just wait until interrupted (the validator runs tasks in the background)
+            bt.logging.info("Event-driven validator running, press Ctrl+C to exit")
+            while True:
+                await asyncio.sleep(1)
+                
+        else:
+            bt.logging.info("Using legacy validator architecture")
+            
+            # Create and use the legacy validator
+            _validator = await BettensorValidator.create()
+            
+            bt.logging.debug("Starting main validator process loop")
+            await run(_validator)
+            
     except asyncio.CancelledError:
         bt.logging.info("Validator was cancelled, performing graceful shutdown")
         # Let the signal handler or finally block handle cleanup
@@ -1077,7 +1176,10 @@ async def main():
         if _validator:
             try:
                 bt.logging.info("Performing final cleanup...")
-                await asyncio.wait_for(_validator.cleanup(), timeout=10)
+                if isinstance(_validator, EventDrivenValidator):
+                    await asyncio.wait_for(_validator.stop(), timeout=10)
+                else:
+                    await asyncio.wait_for(_validator.cleanup(), timeout=10)
                 bt.logging.info("Final cleanup completed successfully")
             except (asyncio.TimeoutError, RuntimeError, Exception) as e:
                 bt.logging.warning(f"Final cleanup attempt failed: {str(e)}")

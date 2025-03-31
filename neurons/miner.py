@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # The MIT License (MIT)
 # Copyright © 2023 Yuma Rao
 # TODO(developer): Set your name
@@ -22,6 +23,8 @@ import os
 import torch
 import traceback
 import time
+import asyncio
+import signal
 import bittensor as bt
 from bettensor import __version__ as version
 from bettensor.miner.bettensor_miner import BettensorMiner
@@ -46,15 +49,11 @@ sys.path.append(parent_dir)
 sys.path.append(grandparent_dir)
 sys.path.append(great_grandparent_dir)
 
-# Optional: Print sys.path to verify the directories have been added
-print(sys.path)
 
-
-def main(miner: BettensorMiner):
+def run_legacy_miner(miner: BettensorMiner):
     """
-    This function executes the main miner loop. The miner is configured
-    upon the initialization of the miner. If you want to change the
-    miner configuration, please adjust the initialization parameters.
+    This function executes the main loop for the legacy miner.
+    The miner is configured upon initialization.
     """
 
     # Link the miner to the Axon
@@ -82,7 +81,7 @@ def main(miner: BettensorMiner):
     # Step 7: Keep the miner alive
     # This loop maintains the miner's operations until intentionally stopped.
     bt.logging.info(
-        "Miner has been initialized and we are connected to the network. Start main loop."
+        "Legacy miner has been initialized and we are connected to the network. Start main loop."
     )
 
     # When we init, set last_updated_block to current_block
@@ -236,6 +235,53 @@ def main(miner: BettensorMiner):
             continue
 
 
+async def run_event_driven_miner():
+    """
+    Initialize and run the event-driven miner.
+    """
+    try:
+        # Import here to avoid circular imports
+        from bettensor.miner.core.event_driven_miner import EventDrivenMiner
+        
+        # Create and initialize the miner
+        miner = await EventDrivenMiner.create()
+        
+        # Start the miner
+        await miner.start()
+        
+        # Log initialization success
+        bt.logging.info("Event-driven miner started successfully")
+        
+        # Setup signal handlers for graceful shutdown
+        loop = asyncio.get_event_loop()
+        
+        # Create a future that will be completed when the miner should stop
+        stop_future = loop.create_future()
+        
+        # Define signal handlers
+        def signal_handler(sig, frame):
+            if not stop_future.done():
+                bt.logging.info(f"Received signal {sig}, initiating shutdown...")
+                stop_future.set_result(None)
+        
+        # Register signal handlers
+        for sig in [signal.SIGINT, signal.SIGTERM]:
+            loop.add_signal_handler(sig, lambda s=sig: signal_handler(s, None))
+        
+        # Wait until the stop_future is completed (by a signal handler)
+        try:
+            await stop_future
+        finally:
+            # Stop the miner
+            bt.logging.info("Stopping event-driven miner...")
+            await miner.stop()
+            bt.logging.info("Event-driven miner stopped successfully")
+            
+    except Exception as e:
+        bt.logging.error(f"Error in event-driven miner: {e}")
+        bt.logging.error(traceback.format_exc())
+        
+
 # This is the main function, which runs the miner.
 if __name__ == "__main__":
     # Parse command line arguments and create config
@@ -285,6 +331,12 @@ if __name__ == "__main__":
         "--redis_host", type=str, default="localhost", help="Redis server host"
     )
     parser.add_argument("--redis_port", type=int, default=6379, help="Redis server port")
+    parser.add_argument(
+        "--use_event_driven",
+        type=str,
+        default=os.getenv("USE_EVENT_DRIVEN", "False"),
+        help="Use the new event-driven architecture (True/False)",
+    )
 
     # Add bittensor specific args
     bt.subtensor.add_args(parser)
@@ -294,9 +346,20 @@ if __name__ == "__main__":
 
     # Parse config
     config = bt.config(parser)
-
-    # Create a miner with the config
-    subnet_miner = BettensorMiner(config=config)
-    subnet_miner.start()
-
-    main(subnet_miner)
+    
+    # Determine which miner architecture to use
+    use_event_driven = config.use_event_driven.lower() == "true"
+    
+    if use_event_driven:
+        bt.logging.info("Using event-driven miner architecture")
+        # Run the event-driven miner with asyncio
+        try:
+            asyncio.run(run_event_driven_miner())
+        except KeyboardInterrupt:
+            bt.logging.info("Stopped by keyboard interrupt")
+    else:
+        bt.logging.info("Using legacy miner architecture")
+        # Create and run the legacy miner
+        subnet_miner = BettensorMiner(config=config)
+        subnet_miner.start()
+        run_legacy_miner(subnet_miner)

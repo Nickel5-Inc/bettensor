@@ -26,6 +26,7 @@ from bittensor import Synapse
 from bettensor.miner.utils.health_check import run_health_check
 import asyncio
 from bettensor import __spec_version__
+from bettensor.miner.utils.websocket_manager import MinerWebSocketManager
 
 
 class BettensorMiner(BaseNeuron):
@@ -142,6 +143,18 @@ class BettensorMiner(BaseNeuron):
         # Initialize MinerConfig
         self.miner_config = MinerConfig()
         self.validator_confirmation_dict = self.stats_handler.load_validator_confirmation_dict()
+
+        # Initialize WebSocket manager
+        self.websocket_enabled = getattr(self.args, "websocket_enabled", "True").lower() == "true"
+        self.websocket_manager = None
+        self.websocket_connect_task = None
+        
+        # Ensure event loop exists for async methods
+        try:
+            self.loop = asyncio.get_event_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
     def forward(self, synapse: GameData) -> GameData:
 
@@ -269,47 +282,96 @@ class BettensorMiner(BaseNeuron):
         return synapse
 
     def start(self):
-        bt.logging.info("Starting miner")
-        self.stats_handler.check_and_reset_daily_cash()
-        # Start Redis listener in a separate thread
-        self.redis_thread = threading.Thread(target=self.listen_for_redis_messages)
-        self.redis_thread.daemon = True
-        self.redis_thread.start()
-
-        # Start health check in a separate thread
-        self.health_thread = threading.Thread(target=self.health_check)
-        self.health_thread.daemon = True
-        self.health_thread.start()
-
-        # Start periodic prediction check in a separate thread
-        bt.logging.info("Starting periodic prediction check")
-        self.prediction_check_thread = threading.Thread(
-            target=self.run_periodic_prediction_check
-        )
-        self.prediction_check_thread.daemon = True
+        """Start the miner and all its components"""
+        bt.logging.info(f"Starting miner with hotkey {self.wallet.hotkey.ss58_address}")
+        
+        # Reset daily cash 
+        self.daily_cash['total'] = 0
+        self.daily_cash['games'] = 0
+        self.daily_cash['bets'] = 0
+        
+        # Start Redis message listening thread
+        self.redis_message_thread = threading.Thread(target=self._listen_for_redis_messages, daemon=True)
+        self.redis_message_thread.start()
+        
+        # Start health check thread
+        self.health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+        self.health_check_thread.start()
+        
+        # Start predictions check thread
+        self.prediction_check_thread = threading.Thread(target=self._check_predictions_loop, daemon=True)
         self.prediction_check_thread.start()
-
+        
+        # Initialize WebSocket client if enabled
+        if getattr(self.config, "websocket_enabled", False):
+            try:
+                from bettensor.miner.io.websocket_client import MinerWebSocketManager
+                from bettensor.miner.io.predictions import PredictionManager
+                
+                # Parse WebSocket configuration
+                heartbeat_interval = getattr(self.config, "websocket_heartbeat_interval", 60)
+                reconnect_base_interval = getattr(self.config, "websocket_reconnect_base_interval", 1)
+                max_reconnect_interval = getattr(self.config, "websocket_max_reconnect_interval", 60)
+                
+                # Create WebSocket manager
+                self.websocket_manager = MinerWebSocketManager(
+                    miner_hotkey=self.wallet.hotkey.ss58_address,
+                    metagraph=self.metagraph,
+                    timeout=30
+                )
+                
+                # Set wallet for signing messages
+                self.websocket_manager.set_wallet(self.wallet)
+                
+                # Apply configuration
+                self.websocket_manager.set_config(
+                    heartbeat_interval=heartbeat_interval,
+                    reconnect_base_interval=reconnect_base_interval,
+                    max_reconnect_interval=max_reconnect_interval
+                )
+                
+                # Create prediction manager
+                self.prediction_manager = PredictionManager(self)
+                
+                # Register handlers for WebSocket messages
+                self.websocket_manager.register_confirmation_handler(self.prediction_manager.handle_confirmation)
+                self.websocket_manager.register_game_update_handler(self.prediction_manager.handle_game_update)
+                
+                # Start WebSocket manager asynchronously
+                asyncio.run_coroutine_threadsafe(self.websocket_manager.start(), self.loop)
+                
+                bt.logging.info(f"WebSocket client started with configuration: "
+                               f"heartbeat={heartbeat_interval}s, "
+                               f"reconnect_base={reconnect_base_interval}s, "
+                               f"max_reconnect={max_reconnect_interval}s")
+            except Exception as e:
+                bt.logging.error(f"Failed to initialize WebSocket client: {str(e)}")
+                bt.logging.error(traceback.format_exc())
+        
         bt.logging.info("Miner started")
 
-    def run_periodic_prediction_check(self, interval_hours=1):
-        while True:
-            bt.logging.info(f"Running periodic prediction outcome check")
-            self.predictions_handler.check_and_correct_prediction_outcomes()
-            time.sleep(interval_hours * 3600)  # Sleep for the specified interval
-
     def stop(self):
+        """Stop the miner and all its components"""
         bt.logging.info("Stopping miner")
-        try:
-            current_state = self.state_manager.get_stats()
-            self.state_manager.save_state(current_state)
-        except Exception as e:
-            bt.logging.error(f"Error saving state: {e}")
+        
+        # Stop WebSocket manager if enabled
+        if hasattr(self, 'websocket_manager'):
+            try:
+                asyncio.run_coroutine_threadsafe(self.websocket_manager.stop(), self.loop)
+                bt.logging.info("WebSocket manager stopped")
+            except Exception as e:
+                bt.logging.error(f"Error stopping WebSocket manager: {str(e)}")
+        
+        # Stop Redis client
+        if hasattr(self, 'redis_client') and self.redis_client:
+            self.redis_client.close()
+            
         bt.logging.info("Miner stopped")
 
     def signal_handler(self, signum, frame):
-        bt.logging.info(f"Received signal {signum}. Shutting down...")
+        """Handle signal for graceful shutdown."""
+        bt.logging.info(f"Received signal {signum}, stopping miner")
         self.stop()
-        bt.logging.info("Exiting due to signal")
         sys.exit(0)
 
     def setup(self) -> Tuple[bt.wallet, bt.subtensor, bt.metagraph]:
@@ -512,164 +574,122 @@ class BettensorMiner(BaseNeuron):
                 time.sleep(5)  # Wait before trying to reconnect
 
     def process_prediction_request(self, data):
-        bt.logging.info(f"Processing prediction request: {data}")
-
-        predictions = data.get("predictions")
-        if not predictions:
-            bt.logging.warning(
-                "Received prediction request without 'predictions' field"
-            )
-            return self.create_prediction_response(success=False, original_response={})
-
+        """Process a prediction request from the CLI or GUI."""
+        start_time = time.time()
         try:
+            bt.logging.info(f"Processing prediction request: {data}")
+            
+            predictions = data.get("predictions")
+            if not predictions:
+                bt.logging.warning(
+                    "Received prediction request without 'predictions' field"
+                )
+                return self.create_prediction_response(False, {})
+
             results = []
             for prediction in predictions:
-                bt.logging.info(f"Processing prediction: {prediction}")
-
-                try:
-                    game_id = prediction.get("game_id")
-                    bt.logging.info(f"Extracted game_id: {game_id}")
-
-                    if not game_id:
-                        bt.logging.warning(
-                            f"Prediction missing game_id: {prediction}"
-                        )
-                        results.append(
-                            {
-                                "status": "error",
-                                "message": "Prediction missing game_id",
-                            }
-                        )
-                        continue
-                    bt.logging.info(
-                        f"Checking if game exists with game_id: {game_id}"
-                    )
-                    try:
-                        game_exists = self.games_handler.game_exists(game_id)
-                    except Exception as e:
-                        bt.logging.error(f"Error checking game existence: {str(e)}")
-                        results.append(
-                            {
-                                "status": "error",
-                                "message": f"Error checking game existence: {str(e)}",
-                            }
-                        )
-                        continue
-
-                    bt.logging.info(f"Game exists: {game_exists}")
-
-                    if not game_exists:
-                        bt.logging.warning(f"Game with ID {game_id} does not exist")
-                        results.append(
-                            {
-                                "status": "error",
-                                "message": f"Game with ID {game_id} does not exist",
-                            }
-                        )
-                        continue
-
-                    # Generate a new predictionID
-                    prediction["prediction_id"] = str(uuid.uuid4())
-
-                    # Set minerID and ensure predictionDate is in the correct format
-                    prediction["miner_uid"] = self.miner_uid
-                    prediction["prediction_date"] = datetime.now(
-                        timezone.utc
-                    ).isoformat()
-
-                    # Set initial outcome to 'Unfinished'
-                    prediction["outcome"] = "Unfinished"
-
-                    
-                    # Ensure all required fields are present
-                    required_fields = [
-                        "prediction_id",
-                        "game_id",
-                        "miner_uid",
-                        "prediction_date",
-                        "predicted_outcome",
-                        "team_a",
-                        "team_b",
-                        "wager",
-                        "team_a_odds",
-                        "team_b_odds",
-                        "tie_odds",
-                        "outcome",
-                    ]
-                    missing_fields = [
-                        field for field in required_fields if field not in prediction
-                    ]
-                    if missing_fields:
-                        bt.logging.warning(
-                            f"Prediction missing required fields: {missing_fields}"
-                        )
-                        results.append(
-                            {
-                                "status": "error",
-                                "message": f"Prediction missing required fields: {missing_fields}",
-                            }
-                        )
-                        continue
-
-                    bt.logging.info(f"Adding prediction to database: {prediction}")
-                   
-                   # add additional fields to prediction
-                    model_name = None
-                    confidence_score = None
-                    prediction["model_name"] = model_name
-                    prediction["confidence_score"] = confidence_score
-
-                     # Add the prediction to the database
-
-                    result = self.predictions_handler.add_prediction(prediction)
-                    bt.logging.info(f"Prediction added: {result}")
-                    results.append(result)
-
-                except Exception as e:
-                    bt.logging.error(f"Error processing prediction: {str(e)}")
-                    bt.logging.error(f"Traceback: {traceback.format_exc()}")
+                game_id = prediction.get("game_id")
+                if not game_id:
                     results.append(
                         {
-                            "status": "error",
-                            "message": f"Error processing prediction: {str(e)}",
-                            "traceback": traceback.format_exc(),
+                            "success": False,
+                            "message": "Missing game_id in prediction request",
                         }
                     )
+                    continue
 
-            bt.logging.info("All predictions processed, creating response")
-            response = self.create_prediction_response(
-                success=True, original_response={"results": results}
-            )
-            bt.logging.info(f"Created response: {response}")
+                outcome = prediction.get("outcome")
+                if not outcome:
+                    results.append(
+                        {
+                            "success": False,
+                            "message": "Missing outcome in prediction request",
+                        }
+                    )
+                    continue
 
-            # Here, add a log to confirm predictions are being sent to the validator
-            bt.logging.info(f"Sending processed predictions to validator: {results}")
+                odds = prediction.get("odds")
+                if not odds:
+                    results.append(
+                        {
+                            "success": False,
+                            "message": "Missing odds in prediction request",
+                        }
+                    )
+                    continue
 
+                wager = prediction.get("wager")
+                if not wager:
+                    results.append(
+                        {
+                            "success": False,
+                            "message": "Missing wager in prediction request",
+                        }
+                    )
+                    continue
+
+                model_name = prediction.get("model_name", "default")
+                confidence_score = prediction.get("confidence_score", 0.5)
+
+                # Check for valid wager
+                try:
+                    wager_float = float(wager)
+                    if wager_float <= 0:
+                        results.append(
+                            {
+                                "success": False,
+                                "message": f"Invalid wager amount: {wager}. Must be positive.",
+                            }
+                        )
+                        continue
+                except ValueError:
+                    results.append(
+                        {
+                            "success": False,
+                            "message": f"Invalid wager format: {wager}. Must be a number.",
+                        }
+                    )
+                    continue
+
+                # Get game data
+                game_data = self.predictions_handler.get_game_data(game_id)
+                if not game_data:
+                    results.append(
+                        {
+                            "success": False,
+                            "message": f"Game {game_id} not found",
+                        }
+                    )
+                    continue
+
+                # Prepare prediction data
+                prediction_data = {
+                    "outcome": outcome,
+                    "odds": odds,
+                    "wager": wager,
+                    "model_name": model_name,
+                    "confidence_score": confidence_score
+                }
+                
+                # Create and push prediction using async method
+                result = self.loop.run_until_complete(
+                    self.create_and_push_prediction(game_data, prediction_data)
+                )
+                
+                results.append(result)
+
+            # Create response
+            response = self.create_prediction_response(True, {"results": results})
+            
             return response
-
+            
         except Exception as e:
-            bt.logging.error(f"Error processing prediction request: {str(e)}")
-            bt.logging.error(f"Traceback: {traceback.format_exc()}")
-            response = self.create_prediction_response(
-                success=False, original_response={}
-            )
-
-            # Send the error response back to Redis
-            message_id = data.get("message_id")
-            if message_id:
-                redis_key = f"response:{message_id}"
-                redis_value = json.dumps(response)
-                bt.logging.info(
-                    f"Attempting to set Redis key for error: {redis_key} with value: {redis_value}"
-                )
-                self.redis_interface.set(redis_key, redis_value, ex=60)
-                bt.logging.info(f"Error response sent to Redis with key: {redis_key}")
-            else:
-                bt.logging.warning(
-                    "No message_id provided in the request, couldn't send error response to Redis"
-                )
-
-            return response
+            bt.logging.error(f"Error processing prediction request: {e}")
+            bt.logging.debug(traceback.format_exc())
+            return self.create_prediction_response(False, {"error": str(e)})
+        finally:
+            end_time = time.time()
+            bt.logging.debug(f"Prediction request processed in {end_time - start_time:.2f} seconds")
 
     def create_prediction_response(self, success, original_response):
         bt.logging.info("Creating prediction response")
@@ -792,3 +812,207 @@ class BettensorMiner(BaseNeuron):
         # Ensure the state is properly loaded
         self.state_manager.load_state()
         self.stats_handler.load_stats_from_state()
+
+    async def create_and_push_prediction(self, game_data, prediction_data):
+        """
+        Create and push a prediction to validators via WebSocket and/or HTTP.
+        
+        Args:
+            game_data: Game data for the prediction
+            prediction_data: Prediction data to send
+        """
+        try:
+            # Create prediction object
+            prediction_id = str(uuid.uuid4())
+            team_a = game_data.get("team_a", "Team A")
+            team_b = game_data.get("team_b", "Team B")
+            
+            # Fill in required fields
+            prediction = TeamGamePrediction(
+                prediction_id=prediction_id,
+                game_id=game_data["external_id"],
+                miner_uid=self.miner_uid,
+                prediction_date=datetime.now(timezone.utc).isoformat(),
+                predicted_outcome=prediction_data["outcome"],
+                predicted_odds=float(prediction_data["odds"]),
+                team_a=team_a,
+                team_b=team_b,
+                wager=float(prediction_data["wager"]),
+                team_a_odds=float(game_data["team_a_odds"]),
+                team_b_odds=float(game_data["team_b_odds"]),
+                tie_odds=float(game_data.get("tie_odds", 0)),
+                model_name=prediction_data.get("model_name", "default"),
+                confidence_score=float(prediction_data.get("confidence_score", 0.5)),
+                outcome="Unfinished",
+                payout=0.0
+            )
+            
+            # Save prediction to database
+            self.predictions_handler.save_prediction(prediction)
+            
+            # Push via WebSocket if enabled
+            if self.websocket_enabled and self.websocket_manager:
+                await self.websocket_manager.send_prediction(prediction)
+                bt.logging.info(f"Pushed prediction {prediction_id} via WebSocket")
+            
+            return {
+                "success": True,
+                "prediction_id": prediction_id,
+                "message": "Prediction pushed to validators"
+            }
+        
+        except Exception as e:
+            bt.logging.error(f"Error creating prediction: {e}")
+            bt.logging.debug(traceback.format_exc())
+            
+            return {
+                "success": False,
+                "message": f"Error creating prediction: {str(e)}"
+            }
+
+    async def handle_ws_confirmation(self, validator_hotkey, confirmation):
+        """
+        Handle a confirmation message received via WebSocket.
+        
+        Args:
+            validator_hotkey: The validator's hotkey
+            confirmation: The ConfirmationMessage object
+        """
+        try:
+            bt.logging.info(f"Received confirmation from validator {validator_hotkey} for prediction {confirmation.prediction_id}")
+            
+            # Update prediction confirmation
+            if confirmation.prediction_id != "miner_stats" and confirmation.prediction_id != "error":
+                self.predictions_handler.update_prediction_confirmations(
+                    [confirmation.prediction_id], 
+                    validator_hotkey, 
+                    self.validator_confirmation_dict
+                )
+            
+            # Update miner stats if included
+            if confirmation.miner_stats:
+                self.stats_handler.state_manager.update_stats_from_confirmation(confirmation.miner_stats)
+            
+            # Save validator confirmation dict
+            self.stats_handler.save_validator_confirmation_dict(self.validator_confirmation_dict)
+            
+        except Exception as e:
+            bt.logging.error(f"Error handling WebSocket confirmation: {e}")
+            bt.logging.debug(traceback.format_exc())
+
+    async def handle_ws_game_update(self, validator_hotkey, game_update):
+        """
+        Handle a game update message received via WebSocket.
+        
+        Args:
+            validator_hotkey: The validator's hotkey
+            game_update: The GameUpdateMessage object
+        """
+        try:
+            bt.logging.info(f"Received game updates from validator {validator_hotkey}")
+            
+            # Process updated games
+            if game_update.updated_games:
+                updated_games, new_games = self.games_handler.process_games(game_update.updated_games)
+                
+                # Process predictions for updated games
+                self.predictions_handler.process_predictions(updated_games, new_games)
+                
+                bt.logging.info(f"Processed {len(updated_games)} updated games and {len(new_games)} new games")
+            
+        except Exception as e:
+            bt.logging.error(f"Error handling WebSocket game update: {e}")
+            bt.logging.debug(traceback.format_exc())
+
+    @classmethod
+    def add_args(cls, parser):
+        """Add miner specific arguments to the parser."""
+        super().add_args(parser)
+
+        # Database connection parameters
+        parser.add_argument(
+            "--db_name",
+            type=str,
+            default="bettensor_miner",
+            help="Database name",
+        )
+        parser.add_argument(
+            "--db_user",
+            type=str,
+            default="postgres",
+            help="Database user",
+        )
+        parser.add_argument(
+            "--db_password",
+            type=str,
+            default="postgres",
+            help="Database password",
+        )
+        parser.add_argument(
+            "--db_host",
+            type=str,
+            default="localhost",
+            help="Database host",
+        )
+        parser.add_argument(
+            "--db_port",
+            type=int,
+            default=5432,
+            help="Database port",
+        )
+        parser.add_argument(
+            "--max_connections",
+            type=int,
+            default=10,
+            help="Maximum number of database connections",
+        )
+
+        # Redis connection parameters
+        parser.add_argument(
+            "--redis_host",
+            type=str,
+            default="localhost",
+            help="Redis host",
+        )
+        parser.add_argument(
+            "--redis_port",
+            type=int,
+            default=6379,
+            help="Redis port",
+        )
+
+        # Validator min stake
+        parser.add_argument(
+            "--validator_min_stake",
+            type=float,
+            default=0.0,
+            help="Minimum stake required for a validator to be considered valid",
+        )
+        
+        # WebSocket configuration
+        parser.add_argument(
+            "--websocket_enabled",
+            type=str,
+            default="True",
+            help="Enable WebSocket connections for real-time communications (True/False)",
+        )
+        parser.add_argument(
+            "--websocket_heartbeat_interval",
+            type=int,
+            default=60,
+            help="Interval in seconds between heartbeat messages",
+        )
+        parser.add_argument(
+            "--websocket_reconnect_base_interval",
+            type=int,
+            default=5,
+            help="Base interval in seconds for reconnection attempts",
+        )
+        parser.add_argument(
+            "--websocket_max_reconnect_interval",
+            type=int,
+            default=300,
+            help="Maximum interval in seconds for reconnection attempts",
+        )
+        
+        return parser

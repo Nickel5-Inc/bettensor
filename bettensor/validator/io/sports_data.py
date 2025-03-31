@@ -569,5 +569,65 @@ class SportsData:
             bt.logging.error(f"Error in ensure_predictions_have_entropy_score: {e}")
             bt.logging.error(f"Traceback:\n{traceback.format_exc()}")
 
+    async def _update_games_from_api(self, days_from_now: int):
+        """Private method to call the API and extract data for the specified days_from_now"""
+        try:
+            bt.logging.info(f"Updating games data for {days_from_now} days from now")
+            
+            # Get the date for which we want to fetch data
+            date_to_fetch = (datetime.now(timezone.utc) + timedelta(days=days_from_now)).strftime("%Y-%m-%d")
+            
+            # Get the game data from the API
+            all_gamedata = await self.api_client.get_gamedata_by_day(date_to_fetch)
+            gamedata_active = {key: value for key, value in all_gamedata.items() if value.active}
+            bt.logging.info(f"Fetched {len(gamedata_active)} active games from API")
+            
+            # Upsert the game data to the database
+            if gamedata_active:
+                # Store games in DB
+                await self._upsert_games_to_db(gamedata_active)
+                
+                # Broadcast game updates via WebSocket
+                await self._broadcast_game_updates(gamedata_active)
+                
+                bt.logging.info(f"Successfully updated games for {date_to_fetch}")
+            else:
+                bt.logging.info(f"No active games found for {date_to_fetch}")
+                
+            return all_gamedata
+            
+        except Exception as e:
+            bt.logging.error(f"Error updating games data: {e}")
+            bt.logging.error(traceback.format_exc())
+            return {}
+
+    async def _broadcast_game_updates(self, updated_games):
+        """
+        Broadcast game updates to connected miners via WebSocket.
+        
+        Args:
+            updated_games: Dictionary of updated games to broadcast
+        """
+        # Skip if WebSocket manager not available or not enabled
+        if not hasattr(self.validator, 'websocket_manager') or not self.validator.websocket_manager:
+            return
+            
+        try:
+            bt.logging.info(f"Broadcasting {len(updated_games)} game updates to connected miners")
+            
+            # Get list of connected miners
+            connected_miners = self.validator.websocket_manager.get_connected_miners()
+            if not connected_miners:
+                bt.logging.info("No miners connected for game update broadcast")
+                return
+                
+            # Send updates to all connected miners
+            await self.validator.websocket_manager.broadcast_game_updates(updated_games)
+            bt.logging.info(f"Game updates broadcast to {len(connected_miners)} miners")
+            
+        except Exception as e:
+            bt.logging.error(f"Error broadcasting game updates: {e}")
+            bt.logging.error(traceback.format_exc())
+
 
 
