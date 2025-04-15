@@ -9,6 +9,7 @@ import uuid
 import subprocess
 import json
 import hashlib
+import re
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -18,8 +19,8 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote_plus
 import asyncpg
 
-from bettensor.validator.utils.database.base_database_manager import BaseDatabaseManager
-from bettensor.validator.utils.database.database_init import initialize_database
+from bettensor.validator.database.base_database_manager import BaseDatabaseManager
+from bettensor.validator.database.database_init import initialize_database
 
 class PostgresDatabaseManager(BaseDatabaseManager):
     """
@@ -31,7 +32,7 @@ class PostgresDatabaseManager(BaseDatabaseManager):
     @classmethod
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super(PostgresDatabaseManager, cls).__new__(cls)
+            cls._instance = object.__new__(cls)
             cls._instance._initialized = False
         return cls._instance
         
@@ -82,11 +83,24 @@ class PostgresDatabaseManager(BaseDatabaseManager):
         # Safely encode password for URL
         password_str = f":{quote_plus(self.password)}@" if self.password else "@"
         
+        bt.logging.debug(f"PostgreSQL password received in manager: length={len(self.password) if self.password else 0}")
+        bt.logging.debug(f"Password string for URL: {password_str}")
+        
         connection_url = (
             f"postgresql+asyncpg://{self.user}"
             f"{password_str}"
             f"{self.host}:{self.port}/{self.dbname}"
         )
+        
+        # Check for malformed URL - this format should be user:password@host:port/dbname
+        # Fix connection URL if needed
+        if "/@" in connection_url:
+            # Password is empty, URL has format user@host:port/dbname
+            fixed_url = connection_url.replace("/@", "@")
+            bt.logging.warning(f"Fixed malformed connection URL (empty password). Using: postgresql+asyncpg://{self.user}@{self.host}:{self.port}/{self.dbname}")
+            connection_url = fixed_url
+        
+        bt.logging.debug(f"Connection URL (password hidden): postgresql+asyncpg://{self.user}:****@{self.host}:{self.port}/{self.dbname}")
         
         self.engine = create_async_engine(
             connection_url,
@@ -108,6 +122,8 @@ class PostgresDatabaseManager(BaseDatabaseManager):
         """Ensure the PostgreSQL database exists, create it if not."""
         try:
             # Connect to default 'postgres' database to check if our database exists
+            bt.logging.debug(f"Connecting to PostgreSQL with: host={self.host}, port={self.port}, user={self.user}, password_length={len(self.password) if self.password else 0}")
+            
             conn = await asyncpg.connect(
                 host=self.host,
                 port=self.port,
@@ -115,6 +131,7 @@ class PostgresDatabaseManager(BaseDatabaseManager):
                 password=self.password,
                 database="postgres"
             )
+            bt.logging.debug("PostgreSQL connection successful")
             
             # Check if database exists
             exists = await conn.fetchval(
@@ -135,7 +152,25 @@ class PostgresDatabaseManager(BaseDatabaseManager):
             
         except Exception as e:
             bt.logging.error(f"Error ensuring database exists: {e}")
+            bt.logging.error(f"Connection details: user={self.user}, host={self.host}, port={self.port}, dbname=postgres")
             bt.logging.error(traceback.format_exc())
+            
+            # Try with hardcoded password as emergency fallback
+            if "password authentication failed" in str(e):
+                bt.logging.warning("Attempting emergency connection with hardcoded password")
+                try:
+                    conn = await asyncpg.connect(
+                        host=self.host,
+                        port=self.port,
+                        user=self.user,
+                        password="postgres",
+                        database="postgres"
+                    )
+                    bt.logging.warning("Emergency connection succeeded - please fix your configuration")
+                    await conn.close()
+                except Exception as fallback_error:
+                    bt.logging.error(f"Emergency connection also failed: {fallback_error}")
+            
             return False
             
     @asynccontextmanager
@@ -358,8 +393,55 @@ class PostgresDatabaseManager(BaseDatabaseManager):
         """
         if params is None:
             return None
+        
+        # If params is a dictionary, convert types as needed
+        if isinstance(params, dict):
+            converted_params = {}
+            for key, value in params.items():
+                # Convert specific numeric parameters that need to be strings
+                if key == 'miner_uid' and isinstance(value, int):
+                    converted_params[key] = str(value)
+                elif isinstance(value, int) and key.endswith('_uid'):
+                    converted_params[key] = str(value)
+                # Handle array values
+                elif isinstance(value, (list, tuple)):
+                    # For external_id arrays, convert strings to integers
+                    if key == 'game_ids' or key == 'external_id':
+                        converted_params[key] = [int(x) for x in value]
+                    else:
+                        converted_params[key] = value
+                else:
+                    converted_params[key] = value
+            return converted_params
+        
+        # If params is a tuple/list, convert items as needed
+        elif isinstance(params, (list, tuple)):
+            # If it's a list of dictionaries or tuples, convert each item
+            if params and isinstance(params[0], (dict, tuple, list)):
+                # Special handling for array parameters
+                if len(params) == 1 and isinstance(params[0], (list, tuple)):
+                    # Convert string array elements to integers for ANY queries
+                    try:
+                        return ([int(x) for x in params[0]],)
+                    except (ValueError, TypeError):
+                        # If conversion fails, return original values
+                        return params
+                return [self._convert_params(item) for item in params]
             
-        # For PostgreSQL, params can be passed directly
+            # Single list/tuple of values - convert to tuple
+            converted_params = []
+            for value in params:
+                if isinstance(value, (list, tuple)):
+                    # Try to convert array elements to integers
+                    try:
+                        converted_params.append([int(x) for x in value])
+                    except (ValueError, TypeError):
+                        converted_params.append(value)
+                else:
+                    converted_params.append(value)
+            return tuple(converted_params)  # Always return as tuple for SQLAlchemy
+        
+        # Return unchanged for other cases
         return params
         
     async def execute_query(self, query, params=None):
@@ -367,14 +449,14 @@ class PostgresDatabaseManager(BaseDatabaseManager):
         Execute a query with parameters.
         Converts SQLite-style queries to PostgreSQL format.
         """
-        # Convert SQLite paramstyle to PostgreSQL
-        query = query.replace('?', '%s')
+        # Convert query syntax to PostgreSQL format
+        postgres_query = self._convert_query_syntax(query)
         
         async with self.get_session() as session:
             try:
-                result = await session.execute(text(query), self._convert_params(params))
+                result = await session.execute(text(postgres_query), self._convert_params(params))
                 
-                if query.strip().upper().startswith("SELECT"):
+                if postgres_query.strip().upper().startswith("SELECT"):
                     # For SELECT queries, fetch all rows
                     rows = result.fetchall()
                     # Convert to dict-like objects for compatibility with existing code
@@ -384,54 +466,122 @@ class PostgresDatabaseManager(BaseDatabaseManager):
                     return result.rowcount
                     
             except Exception as e:
-                bt.logging.error(f"Error executing query: {query}")
+                bt.logging.error(f"Error executing query: {postgres_query}")
                 bt.logging.error(f"Parameters: {params}")
                 bt.logging.error(f"Error: {str(e)}")
                 raise
                 
     async def fetch_all(self, query, params=None):
-        """Fetch all rows from a query"""
-        # Convert SQLite paramstyle to PostgreSQL
-        query = query.replace('?', '%s')
+        """
+        Fetch all rows from the database.
         
-        async with self.get_session() as session:
-            try:
-                result = await session.execute(text(query), self._convert_params(params))
-                rows = result.fetchall()
-                return [dict(zip(row.keys(), row)) for row in rows]
-            except Exception as e:
-                bt.logging.error(f"Error fetching all rows: {e}")
-                raise
+        Args:
+            query: The SQL query to execute
+            params: Optional query parameters
+        """
+        try:
+            async with self.get_session() as session:
+                # Convert query syntax and parameters if needed
+                postgres_query = self._convert_query_syntax(query)
+                
+                # Handle parameters
+                if params is not None:
+                    if isinstance(params, (list, tuple)):
+                        # If it's a single-element tuple/list containing a list of IDs
+                        if len(params) == 1 and isinstance(params[0], (list, tuple)):
+                            # Convert string IDs to integers for ANY queries
+                            try:
+                                postgres_params = ([int(x) for x in params[0]],)
+                            except (ValueError, TypeError):
+                                bt.logging.warning("Failed to convert array elements to integers, using original values")
+                                postgres_params = params
+                        else:
+                            postgres_params = tuple(
+                                int(p) if isinstance(p, str) and p.isdigit() else p 
+                                for p in params
+                            )
+                    elif isinstance(params, dict):
+                        postgres_params = {}
+                        for k, v in params.items():
+                            if isinstance(v, (list, tuple)):
+                                try:
+                                    postgres_params[k] = [int(x) if isinstance(x, str) and x.isdigit() else x for x in v]
+                                except (ValueError, TypeError):
+                                    postgres_params[k] = v
+                            elif isinstance(v, str) and v.isdigit():
+                                postgres_params[k] = int(v)
+                            else:
+                                postgres_params[k] = v
+                    else:
+                        postgres_params = int(params) if isinstance(params, str) and params.isdigit() else params
+                else:
+                    postgres_params = None
+
+                try:
+                    # Execute query with parameters
+                    result = await session.execute(text(postgres_query), postgres_params)
+                    rows = result.all()
+                    if not rows:
+                        return []
+                    return [dict(zip(result.keys(), row)) for row in rows]
+                except Exception as e:
+                    if "current transaction is aborted" in str(e):
+                        await session.rollback()
+                        result = await session.execute(text(postgres_query), postgres_params)
+                        rows = result.all()
+                        if not rows:
+                            return []
+                        return [dict(zip(result.keys(), row)) for row in rows]
+                    raise
+        except Exception as e:
+            bt.logging.error(f"Error fetching all rows: {str(e)}")
+            raise
                 
     async def fetch_one(self, query, params=None):
-        """Fetch one row from a query"""
-        # Convert SQLite paramstyle to PostgreSQL
-        query = query.replace('?', '%s')
+        """
+        Fetch a single row from the database.
         
-        async with self.get_session() as session:
-            try:
-                result = await session.execute(text(query), self._convert_params(params))
-                row = result.fetchone()
-                if row:
-                    return dict(zip(row.keys(), row))
-                return None
-            except Exception as e:
-                bt.logging.error(f"Error fetching one row: {e}")
-                raise
+        Args:
+            query: The SQL query to execute
+            params: Optional query parameters
+        """
+        try:
+            async with self.get_session() as session:
+                # Convert query syntax and parameters if needed
+                postgres_query = self._convert_query_syntax(query)
+                postgres_params = self._convert_params(params) if params else None
+                
+                # Handle list parameters correctly
+                if isinstance(postgres_params, list):
+                    if postgres_params and isinstance(postgres_params[0], (dict, tuple)):
+                        postgres_params = postgres_params[0]
+                    else:
+                        postgres_params = tuple(postgres_params)
+                
+                # Execute query with parameters
+                result = await session.execute(text(postgres_query), postgres_params)
+                row = result.first()
+                if row is None:
+                    return None
+                # Get column names from result.keys()
+                return dict(zip(result.keys(), row))
+        except Exception as e:
+            bt.logging.error(f"Error fetching one row: {str(e)}")
+            raise
                 
     async def executemany(self, query, params_list, column_names=None, max_retries=5, retry_delay=1):
         """Execute many queries in a batch operation"""
         if not params_list:
             return 0
             
-        # Convert SQLite paramstyle to PostgreSQL
-        query = query.replace('?', '%s')
+        # Convert query syntax to PostgreSQL format
+        postgres_query = self._convert_query_syntax(query)
         
         for attempt in range(max_retries):
             try:
                 async with self.get_session() as session:
                     result = await session.execute(
-                        text(query),
+                        text(postgres_query),
                         [self._convert_params(params) for params in params_list]
                     )
                     await session.commit()
@@ -670,66 +820,158 @@ class PostgresDatabaseManager(BaseDatabaseManager):
         Update miner weights in the database.
         
         Args:
-            weight_updates: List of (miner_uid, weight) tuples
+            weight_updates: List of (weight, miner_uid) tuples
             max_retries: Maximum number of retry attempts
             retry_delay: Delay between retry attempts in seconds
         """
         if not weight_updates:
             return
             
-        # PostgreSQL upsert query
+        # PostgreSQL update query using miner_stats table
         query = """
-        INSERT INTO miner_weights (miner_uid, weight, updated_at)
-        VALUES (%s, %s, NOW())
-        ON CONFLICT (miner_uid) 
-        DO UPDATE SET weight = EXCLUDED.weight, updated_at = NOW()
+        UPDATE miner_stats 
+        SET most_recent_weight = :weight
+        WHERE miner_uid = :miner_uid
         """
         
-        # Convert weights to list of parameter tuples
-        params_list = [(str(uid), float(weight)) for uid, weight in weight_updates]
+        # Convert weights to list of parameter dictionaries with proper types
+        params_list = [
+            {
+                "miner_uid": int(miner_uid),  # Ensure miner_uid is integer
+                "weight": float(weight)  # Ensure weight is float
+            } 
+            for weight, miner_uid in weight_updates
+        ]
         
-        for attempt in range(max_retries):
-            try:
-                await self.executemany(query, params_list)
-                bt.logging.info(f"Updated weights for {len(weight_updates)} miners")
-                return
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    bt.logging.warning(f"Error updating weights, retrying: {e}")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    bt.logging.error(f"Failed to update weights after {max_retries} attempts: {e}")
-                    raise
+        try:
+            async with self.get_long_running_session() as session:
+                for params in params_list:
+                    await session.execute(text(query), params)
+                await session.commit()
+                bt.logging.debug(f"Updated weights for {len(params_list)} miners")
+        except Exception as e:
+            bt.logging.error(f"Error updating miner weights: {e}")
+            raise
                     
     async def initialize(self, force=False):
-        """
-        Initialize the PostgreSQL database.
-        
-        Args:
-            force: If True, force reinitialization even if already initialized
-        """
-        if self._initialized and not force:
-            return
-            
+        """Initialize the database with required tables."""
         try:
-            bt.logging.info("Initializing PostgreSQL database")
-            
-            # Ensure database exists
-            if not await self.ensure_database_exists():
-                raise RuntimeError("Failed to ensure database exists")
-                
-            # Initialize engine
-            await self._initialize_engine()
-            
-            # Initialize database schema
-            await initialize_database(self, is_postgres=True)
-            
-            self._initialized = True
-            bt.logging.info("PostgreSQL database initialized successfully")
-            
+            async with self.get_session() as session:
+                async with session.begin():
+                    # Create tables if they don't exist
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS db_version (
+                            version INTEGER PRIMARY KEY
+                        )
+                    """))
+
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS entropy_game_pools (
+                            game_id INTEGER,
+                            outcome INTEGER,
+                            pool_size REAL,
+                            PRIMARY KEY (game_id, outcome)
+                        )
+                    """))
+
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS entropy_predictions (
+                            prediction_id TEXT PRIMARY KEY,
+                            game_id INTEGER,
+                            outcome INTEGER,
+                            miner_uid INTEGER,
+                            odds REAL,
+                            wager REAL,
+                            prediction_date TEXT,
+                            entropy_contribution REAL,
+                            FOREIGN KEY (game_id, outcome) REFERENCES entropy_game_pools(game_id, outcome)
+                        )
+                    """))
+
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS entropy_miner_scores (
+                            miner_uid INTEGER,
+                            day INTEGER,
+                            contribution REAL,
+                            PRIMARY KEY (miner_uid, day)
+                        )
+                    """))
+
+                    await session.execute(text("""
+                        CREATE TABLE IF NOT EXISTS entropy_system_state (
+                            id INTEGER PRIMARY KEY CHECK (id = 1),
+                            current_day INTEGER,
+                            num_miners INTEGER,
+                            max_days INTEGER,
+                            last_processed_date TIMESTAMP
+                        )
+                    """))
+
+                    # Create cleanup functions and triggers - each in a separate statement
+                    # 1. Create delete_old_predictions function
+                    await session.execute(text("""
+                        CREATE OR REPLACE FUNCTION delete_old_predictions() RETURNS TRIGGER AS $$
+                        BEGIN
+                            DELETE FROM entropy_predictions
+                            WHERE prediction_date < NOW() - INTERVAL '45 days';
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql
+                    """))
+
+                    # 2. Drop old trigger if exists - separate statement
+                    await session.execute(text("""
+                        DROP TRIGGER IF EXISTS delete_old_predictions_trigger ON entropy_predictions
+                    """))
+
+                    # 3. Create new trigger - separate statement
+                    await session.execute(text("""
+                        CREATE TRIGGER delete_old_predictions_trigger
+                        AFTER INSERT ON entropy_predictions
+                        EXECUTE FUNCTION delete_old_predictions()
+                    """))
+
+                    # 4. Create delete_old_game_pools function
+                    await session.execute(text("""
+                        CREATE OR REPLACE FUNCTION delete_old_game_pools() RETURNS TRIGGER AS $$
+                        BEGIN
+                            DELETE FROM entropy_game_pools
+                            WHERE game_id IN (
+                                SELECT DISTINCT game_id FROM entropy_predictions
+                                WHERE prediction_date < NOW() - INTERVAL '45 days'
+                            );
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql
+                    """))
+
+                    # 5. Drop old game pools trigger if exists - separate statement
+                    await session.execute(text("""
+                        DROP TRIGGER IF EXISTS delete_old_game_pools_trigger ON entropy_game_pools
+                    """))
+
+                    # 6. Create new game pools trigger - separate statement
+                    await session.execute(text("""
+                        CREATE TRIGGER delete_old_game_pools_trigger
+                        AFTER INSERT ON entropy_game_pools
+                        EXECUTE FUNCTION delete_old_game_pools()
+                    """))
+
+                    # Insert initial version if not exists
+                    await session.execute(text("""
+                        INSERT INTO db_version (version) VALUES (1)
+                        ON CONFLICT (version) DO NOTHING
+                    """))
+
+                    await session.commit()
+
+                bt.logging.info("Database initialization completed successfully")
+                return True
+
         except Exception as e:
-            bt.logging.error(f"Error initializing PostgreSQL database: {e}")
-            bt.logging.error(traceback.format_exc())
+            bt.logging.error(f"Error during database initialization: {str(e)}")
+            if session and session.in_transaction():
+                await session.rollback()
             raise
             
     @asynccontextmanager
@@ -754,4 +996,62 @@ class PostgresDatabaseManager(BaseDatabaseManager):
             
     async def _test_connection(self):
         """Test the database connection"""
-        return await self.ensure_connection() 
+        return await self.ensure_connection()
+
+    def _convert_query_syntax(self, query):
+        """
+        Convert SQLite query syntax to PostgreSQL compatible syntax.
+        
+        Args:
+            query: SQLite query string or SQLAlchemy TextClause
+            
+        Returns:
+            PostgreSQL compatible query string
+        """
+        # Handle SQLAlchemy TextClause objects
+        if hasattr(query, 'text'):
+            query = query.text
+            
+        # Convert SQLite paramstyle to PostgreSQL
+        query = query.replace('?', '%s')
+        
+        # Convert SQLite functions
+        query = query.replace("datetime('now')", "CURRENT_TIMESTAMP")
+        
+        # Convert INSERT OR REPLACE to INSERT ... ON CONFLICT
+        if "INSERT OR REPLACE INTO" in query:
+            # Extract table name and columns
+            match = re.match(r"INSERT OR REPLACE INTO (\w+)\s*\((.*?)\)", query)
+            if match:
+                table_name = match.group(1)
+                columns = match.group(2)
+                
+                # Replace with ON CONFLICT syntax
+                query = query.replace(
+                    "INSERT OR REPLACE INTO",
+                    f"INSERT INTO"
+                )
+                
+                # For entropy_system_state table, we know the primary key is 'id'
+                if table_name == "entropy_system_state":
+                    query += " ON CONFLICT (id) DO UPDATE SET "
+                else:
+                    # For other tables, try to identify primary key columns
+                    pk_cols = []
+                    for col in columns.split(','):
+                        col = col.strip()
+                        if col.endswith('_id') or col == 'id' or col == 'prediction_id' or col == 'game_id':
+                            pk_cols.append(col)
+                    
+                    if not pk_cols:
+                        # If no obvious primary key columns found, use all columns
+                        pk_cols = [col.strip() for col in columns.split(',')]
+                    
+                    query += f" ON CONFLICT ({', '.join(pk_cols)}) DO UPDATE SET "
+                
+                # Add column updates
+                cols = [c.strip() for c in columns.split(',')]
+                updates = [f"{c} = EXCLUDED.{c}" for c in cols]
+                query += ", ".join(updates)
+        
+        return query 

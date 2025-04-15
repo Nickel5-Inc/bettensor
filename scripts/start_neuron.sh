@@ -76,17 +76,29 @@ prompt_for_input "Enter network (local/test/finney)" "finney" "NETWORK"
 case $NETWORK in
     test)
         DEFAULT_NEURON_ARGS="$DEFAULT_NEURON_ARGS --subtensor.network test --netuid 181"
+        if [ -z "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+            SUBTENSOR_CHAIN_ENDPOINT="wss://test.finney.opentensor.ai:443"
+        fi
         ;;
     finney)
         DEFAULT_NEURON_ARGS="$DEFAULT_NEURON_ARGS --subtensor.network finney --netuid 30"
+        if [ -z "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+            SUBTENSOR_CHAIN_ENDPOINT="wss://entrypoint-finney.opentensor.ai:443"
+        fi
         ;;
     local)
         DEFAULT_NEURON_ARGS="$DEFAULT_NEURON_ARGS --subtensor.network local --netuid 1"
+        if [ -z "$SUBTENSOR_CHAIN_ENDPOINT" ]; then
+            SUBTENSOR_CHAIN_ENDPOINT="ws://127.0.0.1:9944"
+        fi
         ;;
     *)
         DEFAULT_NEURON_ARGS="$DEFAULT_NEURON_ARGS --subtensor.network $NETWORK"
         ;;
 esac
+
+# Add chain_endpoint
+DEFAULT_NEURON_ARGS="$DEFAULT_NEURON_ARGS --subtensor.chain_endpoint $SUBTENSOR_CHAIN_ENDPOINT"
 
 # Prompt for wallet name and hotkey if not provided
 prompt_for_input "Enter wallet name" "default" "WALLET_NAME"
@@ -128,7 +140,7 @@ if [ "$NEURON_TYPE" = "miner" ]; then
 else
     VALIDATOR_COUNT=$(pm2 list | grep -c "validator")
     NEURON_NAME="validator$VALIDATOR_COUNT"
-    NEURON_ARGS="$DEFAULT_NEURON_ARGS $USE_BT_API"
+    NEURON_ARGS="$DEFAULT_NEURON_ARGS"
 fi
 
 echo "Starting $NEURON_TYPE with arguments: $NEURON_ARGS"

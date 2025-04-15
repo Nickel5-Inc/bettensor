@@ -1,0 +1,11 @@
+{
+    "type": "postgres",
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password": "", 
+    "dbname": "bettensor_validator",
+    "path": "./bettensor/validator/state/validator.db",
+    "migration_in_progress": false,
+    "migration_completed": false
+} 

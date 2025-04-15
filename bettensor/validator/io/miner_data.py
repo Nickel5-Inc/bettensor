@@ -14,10 +14,10 @@ from pydantic import ValidationError
 from sqlalchemy import text
 import torch
 from bettensor.protocol import GameData, TeamGame, TeamGamePrediction
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 import time
 
-from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
+from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
 
 
 """
@@ -276,7 +276,25 @@ class MinerDataMixin:
                                 predicted_outcome, predicted_odds, team_a, team_b,
                                 wager, team_a_odds, team_b_odds, tie_odds,
                                 outcome, model_name, confidence_score
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (:prediction_id, :game_id, :miner_uid, :prediction_date,
+                                    :predicted_outcome, :predicted_odds, :team_a, :team_b,
+                                    :wager, :team_a_odds, :team_b_odds, :tie_odds,
+                                    :outcome, :model_name, :confidence_score)
+                            ON CONFLICT (prediction_id) DO UPDATE SET
+                                game_id = EXCLUDED.game_id,
+                                miner_uid = EXCLUDED.miner_uid,
+                                prediction_date = EXCLUDED.prediction_date,
+                                predicted_outcome = EXCLUDED.predicted_outcome,
+                                predicted_odds = EXCLUDED.predicted_odds,
+                                team_a = EXCLUDED.team_a,
+                                team_b = EXCLUDED.team_b,
+                                wager = EXCLUDED.wager,
+                                team_a_odds = EXCLUDED.team_a_odds,
+                                team_b_odds = EXCLUDED.team_b_odds,
+                                tie_odds = EXCLUDED.tie_odds,
+                                outcome = EXCLUDED.outcome,
+                                model_name = EXCLUDED.model_name,
+                                confidence_score = EXCLUDED.confidence_score
                             """,
                             valid_predictions
                         )

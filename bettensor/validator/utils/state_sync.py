@@ -16,14 +16,13 @@ import sqlite3
 from azure.storage.blob.aio import BlobServiceClient
 from azure.core.exceptions import AzureError
 from dotenv import load_dotenv
-import stat  # Make sure to import stat module
 import asyncio
 import async_timeout
 import aiofiles
 import hashlib
 import azure.core
 import configparser
-from bettensor.validator.utils.database.database_factory import DatabaseFactory
+from bettensor.validator.database.database_factory import DatabaseFactory
 
 class StateSync:
     def __init__(self, 
@@ -358,47 +357,53 @@ class StateSync:
         # Create state directory if it doesn't exist
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
+        success = False  # Track if we got at least one critical file
+        
         try:
-            # Download state files
-            state_files = [
-                {"local_path": self.state_dir / "state.pt", "blob_name": "state.pt"},
-                {"local_path": db_backup, "blob_name": db_backup_blob},
-                {"local_path": self.state_dir / "metagraph.bin", "blob_name": "metagraph.bin"}
-            ]
-
-            for state_file in state_files:
-                local_path = state_file["local_path"]
-                blob_name = state_file["blob_name"]
-                
-                try:
-                    await self._download_state_file(local_path, blob_name)
-                except Exception as e:
-                    bt.logging.warning(f"Failed to download {blob_name}: {e}")
-                    # Continue with other files
-
-            # Restore database from backup
-            if db_backup.exists():
-                if db_type == "postgres":
-                    success = await self._restore_postgres_database(db_backup)
-                else:
-                    success = await self._restore_sqlite_database(db_backup)
-                    
-                if not success:
-                    bt.logging.error("Failed to restore database from backup")
-                    return False
+            # Try to download state.pt first - this is critical
+            state_file = self.state_dir / "state.pt"
+            if await self._download_state_file(state_file, "state.pt"):
+                success = True
+                bt.logging.info("Successfully downloaded state.pt")
             else:
-                bt.logging.error("Database backup not found")
+                bt.logging.error("Failed to download critical file state.pt")
                 return False
 
-            # Validate that we downloaded and restored successfully
-            success = await self._validate_state_files()
-            if not success:
-                bt.logging.error("State validation failed")
+            # Try to download database backup - handle missing file gracefully
+            try:
+                if await self._download_state_file(db_backup, db_backup_blob):
+                    bt.logging.info(f"Successfully downloaded {db_backup_blob}")
+                    
+                    # Only try to restore database if we got the backup
+                    if db_type == "postgres":
+                        success = await self._restore_postgres_database(db_backup)
+                    else:
+                        success = await self._restore_sqlite_database(db_backup)
+                        
+                    if not success:
+                        bt.logging.error("Failed to restore database from backup")
+                        # Continue anyway - we might be able to operate with existing database
+                else:
+                    bt.logging.warning(f"Database backup {db_backup_blob} not found - continuing with existing database")
+            except Exception as e:
+                bt.logging.warning(f"Error handling database backup: {e}")
+                # Continue execution - don't let database issues stop us
+
+            # Try to download metagraph.bin - not critical
+            metagraph_file = self.state_dir / "metagraph.bin"
+            if await self._download_state_file(metagraph_file, "metagraph.bin"):
+                bt.logging.info("Successfully downloaded metagraph.bin")
+            else:
+                bt.logging.warning("metagraph.bin not found - continuing without it")
+
+            # Validate state files
+            if success:
+                bt.logging.info("State pull completed successfully")
+                return True
+            else:
+                bt.logging.error("Failed to pull critical state files")
                 return False
-            
-            bt.logging.info("State pulled and restored successfully")
-            return True
-            
+
         except Exception as e:
             bt.logging.error(f"Error during state pull: {e}")
             bt.logging.error(traceback.format_exc())
@@ -583,17 +588,21 @@ class StateSync:
             bool: True if successful, False otherwise
         """
         try:
-            # Check if file exists in Azure
-            blob_properties = await self.blob_client.get_blob_properties(blob=blob_name)
-            if not blob_properties:
+            # Get blob client for this specific blob
+            blob_client = self.container.get_blob_client(blob_name)
+            
+            # Check if blob exists
+            try:
+                await blob_client.get_blob_properties()
+            except Exception as e:
                 bt.logging.warning(f"Blob {blob_name} not found in Azure")
                 return False
                 
             # Download blob
-            with open(local_path, "wb") as download_file:
-                download_stream = await self.blob_client.download_blob(blob_name)
+            async with aiofiles.open(local_path, "wb") as download_file:
+                download_stream = await blob_client.download_blob()
                 data = await download_stream.readall()
-                download_file.write(data)
+                await download_file.write(data)
                 
             bt.logging.info(f"Downloaded {blob_name} to {local_path}")
             return True
@@ -648,7 +657,7 @@ class StateSync:
         try:
             # Check node config
             if os.environ.get("VALIDATOR_PULL_STATE", "True").lower() == "true":
-                bt.logging.info("Node config requires state pull")
+                bt.logging.debug("Node config allows state pull")
             else:
                 bt.logging.info("Node config does not require state pull")
                 return False
@@ -663,36 +672,6 @@ class StateSync:
                     bt.logging.debug(f"Not enough blocks since last pull ({blocks_since_pull}/{min_blocks_between_pulls})")
                     return False
 
-            # Validate remote metadata structure
-            required_fields = ["last_update", "files"]
-            
-            # Handle legacy format conversion first
-            if not all(field in remote_metadata for field in required_fields):
-                bt.logging.info("Using legacy metadata format")
-                legacy_mapping = {
-                    "last_update": "last_update",
-                    "files": "files_uploaded"
-                }
-                
-                # Map legacy fields to new fields
-                mapped_metadata = {}
-                for new_field, legacy_field in legacy_mapping.items():
-                    if legacy_field in remote_metadata:
-                        if new_field == "files":
-                            # Convert legacy files list to new format
-                            mapped_metadata[new_field] = {}
-                            for file in remote_metadata[legacy_field]:
-                                if (self.state_dir / file).exists():
-                                    mapped_metadata[new_field][file] = self._get_file_metadata(self.state_dir / file)
-                        else:
-                            mapped_metadata[new_field] = remote_metadata[legacy_field]
-                
-                if all(field in mapped_metadata for field in required_fields):
-                    remote_metadata = mapped_metadata
-                else:
-                    bt.logging.warning("Local metadata missing required fields")
-                    return True
-
             # Load local metadata
             if not self.metadata_file.exists():
                 bt.logging.info("No local metadata file - should pull state")
@@ -706,66 +685,62 @@ class StateSync:
                 bt.logging.warning("Invalid or missing local metadata file")
                 return True
                 
-            # Validate local metadata structure
+            # Validate metadata structure
+            required_fields = ["last_update", "files"]
+            if not all(field in remote_metadata for field in required_fields):
+                bt.logging.warning("Remote metadata missing required fields")
+                return False
             if not all(field in local_metadata for field in required_fields):
                 bt.logging.warning("Local metadata missing required fields")
                 return True
             
             try:
+                # Ensure both timestamps are timezone-aware
                 remote_update = datetime.fromisoformat(remote_metadata["last_update"])
                 local_update = datetime.fromisoformat(local_metadata["last_update"])
-            except (ValueError, TypeError):
-                bt.logging.warning("Invalid timestamp format in metadata")
-                return True
-            
-            # If remote is older than local, don't pull
-            if remote_update < local_update:
-                bt.logging.debug("Remote state is older than local state")
+                
+                if remote_update.tzinfo is None:
+                    remote_update = remote_update.replace(tzinfo=timezone.utc)
+                if local_update.tzinfo is None:
+                    local_update = local_update.replace(tzinfo=timezone.utc)
+                    
+                # If remote is older than local, don't pull
+                if remote_update < local_update:
+                    bt.logging.debug("Remote state is older than local state")
+                    return False
+                    
+                # If remote is more than 1 hour newer than local, check critical files
+                if (remote_update - local_update) > timedelta(hours=1):
+                    bt.logging.info("Remote state is significantly newer")
+                    
+                    # Check if we already have state.pt with matching hash
+                    remote_files = remote_metadata.get("files", {})
+                    local_files = local_metadata.get("files", {})
+                    
+                    if "state.pt" in remote_files and "state.pt" in local_files:
+                        remote_hash = remote_files["state.pt"].get("hash")
+                        local_hash = local_files["state.pt"].get("hash")
+                        
+                        if remote_hash and local_hash and remote_hash == local_hash:
+                            bt.logging.info("Local state.pt matches remote hash - skipping pull")
+                            return False
+                    
+                    # If PostgreSQL backup is missing in remote, don't keep pulling
+                    if "postgres_backup.dump" not in remote_files:
+                        bt.logging.warning("Remote PostgreSQL backup missing - skipping pull")
+                        # Update local metadata to match remote timestamp to prevent future pulls
+                        local_metadata["last_update"] = remote_metadata["last_update"]
+                        async with aiofiles.open(self.metadata_file, 'w') as f:
+                            await f.write(json.dumps(local_metadata, indent=2))
+                        return False
+                    
+                    return True
+                    
                 return False
                 
-            # If remote is more than 20 minutes newer than local, pull
-            if (remote_update - local_update) > timedelta(minutes=20):
-                bt.logging.info("Remote state is significantly newer")
-                return True
-            
-            # Compare files
-            remote_files = remote_metadata.get("files", {})
-            local_files = local_metadata.get("files", {})
-            
-            # Handle legacy format
-            if isinstance(remote_files, list):
-                temp_files = {}
-                for file in remote_files:
-                    if (self.state_dir / file).exists():
-                        temp_files[file] = self._get_file_metadata(self.state_dir / file)
-                remote_files = temp_files
-            
-            for file in self.state_files:
-                if file not in remote_files or file not in local_files:
-                    bt.logging.debug(f"File {file} missing from metadata")
-                    continue
-                
-                remote_data = remote_files[file]
-                local_data = local_files[file]
-                
-                # Skip if missing hash data
-                if not isinstance(remote_data, dict) or not isinstance(local_data, dict):
-                    continue
-                    
-                remote_hash = remote_data.get("hash") or remote_data.get("fuzzy_hash")
-                local_hash = local_data.get("hash") or local_data.get("fuzzy_hash")
-                
-                if not remote_hash or not local_hash:
-                    continue
-                
-                # Compare using fuzzy hashing
-                similarity = self._compare_fuzzy_hashes(remote_hash, local_hash)
-                
-                if similarity < 80:
-                    bt.logging.info(f"File {file} has low similarity: {similarity}%")
-                    return True
-            
-            return False
+            except (ValueError, TypeError) as e:
+                bt.logging.warning(f"Invalid timestamp format in metadata: {e}")
+                return False
             
         except Exception as e:
             bt.logging.error(f"Error checking state status: {e}")

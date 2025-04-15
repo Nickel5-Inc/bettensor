@@ -16,7 +16,6 @@ import async_timeout
 import copy
 import random
 
-from bettensor.validator.utils.database.database_manager import DatabaseManager
 
 
 class EntropySystem:
@@ -594,18 +593,44 @@ class EntropySystem:
                     from sqlalchemy import text
                     
                     # Save system state (always save this as it's small)
-                    await session.execute(
-                        text("""
-                            INSERT OR REPLACE INTO entropy_system_state 
-                            (id, current_day, num_miners, max_days, last_processed_date)
-                            VALUES (1, :current_day, :num_miners, :max_days, datetime('now'))
-                        """),
-                        {
-                            "current_day": self.current_day,
-                            "num_miners": self.num_miners,
-                            "max_days": self.max_days
-                        }
-                    )
+                    is_postgres = hasattr(self.db_manager, 'is_postgresql') and self.db_manager.is_postgresql()
+                    
+                    if is_postgres:
+                        await session.execute(
+                            text("""
+                                INSERT INTO entropy_system_state 
+                                (id, current_day, num_miners, max_days, last_processed_date)
+                                VALUES (1, :current_day::INTEGER, :num_miners::INTEGER, :max_days::INTEGER, CURRENT_TIMESTAMP)
+                                ON CONFLICT (id) DO UPDATE SET
+                                    current_day = EXCLUDED.current_day,
+                                    num_miners = EXCLUDED.num_miners,
+                                    max_days = EXCLUDED.max_days,
+                                    last_processed_date = CURRENT_TIMESTAMP
+                            """),
+                            {
+                                "current_day": self.current_day,
+                                "num_miners": self.num_miners,
+                                "max_days": self.max_days
+                            }
+                        )
+                    else:
+                        await session.execute(
+                            text("""
+                                INSERT INTO entropy_system_state 
+                                (id, current_day, num_miners, max_days, last_processed_date)
+                                VALUES (1, :current_day, :num_miners, :max_days, CURRENT_TIMESTAMP)
+                                ON CONFLICT (id) DO UPDATE SET
+                                    current_day = EXCLUDED.current_day,
+                                    num_miners = EXCLUDED.num_miners,
+                                    max_days = EXCLUDED.max_days,
+                                    last_processed_date = EXCLUDED.last_processed_date
+                            """),
+                            {
+                                "current_day": self.current_day,
+                                "num_miners": self.num_miners,
+                                "max_days": self.max_days
+                            }
+                        )
                     
                     # Prepare all batch updates first
                     updates = {
@@ -626,8 +651,56 @@ class EntropySystem:
                     if total_updates > 0:
                         bt.logging.info(f"Preparing to save {total_updates} updates")
                     
-                    # Collect updates (existing code)
-                    ...
+                    # Collect updates for game pools
+                    for game_id, outcome in self._changes_since_save['updated_pools']:
+                        pool = self.game_pools[game_id][outcome]
+                        updates['pools'].append({
+                            'game_id': game_id,
+                            'outcome': outcome,
+                            'entropy_score': float(pool['entropy_score'])
+                        })
+                    
+                    # Collect updates for predictions
+                    for game_id, outcome, prediction_id in self._changes_since_save['new_predictions']:
+                        for pred in self.game_pools[game_id][outcome]['predictions']:
+                            if pred['prediction_id'] == prediction_id:
+                                # Serialize datetime to string if needed
+                                pred_date = pred['prediction_date']
+                                if isinstance(pred_date, datetime):
+                                    pred_date = pred_date.isoformat()
+                                    
+                                updates['predictions'].append({
+                                    'prediction_id': prediction_id,
+                                    'game_id': int(game_id), 
+                                    'outcome': int(outcome),
+                                    'miner_uid': str(pred['miner_uid']),  # Convert to string for PostgreSQL
+                                    'odds': float(pred['odds']),
+                                    'wager': float(pred['wager']),
+                                    'prediction_date': pred_date,
+                                    'entropy_contribution': float(pred['entropy_contribution'])
+                                })
+                                break
+                    
+                    # Collect updates for miner scores
+                    for day, miner_uid in self._changes_since_save['updated_miner_scores']:
+                        if day in self.miner_predictions and miner_uid in self.miner_predictions[day]:
+                            updates['scores'].append({
+                                'miner_uid': int(miner_uid),
+                                'day': int(day),
+                                'contribution': float(self.miner_predictions[day][miner_uid])
+                            })
+                    
+                    # Collect updates for closed games
+                    for game_id in self._changes_since_save['new_closed_games']:
+                        close_time = self.game_close_times.get(game_id)
+                        if close_time:
+                            # Serialize datetime to string if needed
+                            if isinstance(close_time, datetime):
+                                close_time = close_time.isoformat()
+                            updates['closed_games'].append({
+                                'game_id': game_id,
+                                'close_time': close_time
+                            })
                     
                     # Execute all batch updates with smaller batch sizes and progress logging
                     batch_size = 25
@@ -644,35 +717,83 @@ class EntropySystem:
                             
                             try:
                                 if update_type == 'pools':
-                                    await session.execute(
-                                        text("""INSERT OR REPLACE INTO entropy_game_pools 
-                                               (game_id, outcome, entropy_score) 
-                                               VALUES (:game_id, :outcome, :entropy_score)"""),
-                                        batch
-                                    )
+                                    if is_postgres:
+                                        await session.execute(
+                                            text("""INSERT INTO entropy_game_pools 
+                                                   (game_id, outcome, entropy_score) 
+                                                   VALUES (:game_id::INTEGER, :outcome::INTEGER, :entropy_score::FLOAT)
+                                                   ON CONFLICT (game_id, outcome) DO UPDATE SET
+                                                   entropy_score = EXCLUDED.entropy_score"""),
+                                            batch
+                                        )
+                                    else:
+                                        await session.execute(
+                                            text("""INSERT OR REPLACE INTO entropy_game_pools 
+                                                   (game_id, outcome, entropy_score) 
+                                                   VALUES (:game_id, :outcome, :entropy_score)"""),
+                                            batch
+                                        )
                                 elif update_type == 'predictions':
-                                    await session.execute(
-                                        text("""INSERT OR REPLACE INTO entropy_predictions 
-                                               (prediction_id, game_id, outcome, miner_uid, odds, 
-                                                wager, prediction_date, entropy_contribution)
-                                               VALUES (:prediction_id, :game_id, :outcome, :miner_uid, 
-                                                      :odds, :wager, :prediction_date, :entropy_contribution)"""),
-                                        batch
-                                    )
+                                    if is_postgres:
+                                        await session.execute(
+                                            text("""INSERT INTO entropy_predictions 
+                                                   (prediction_id, game_id, outcome, miner_uid, odds, 
+                                                    wager, prediction_date, entropy_contribution)
+                                                   VALUES (:prediction_id, :game_id::INTEGER, :outcome::INTEGER, :miner_uid::INTEGER, 
+                                                          :odds::FLOAT, :wager::FLOAT, :prediction_date, :entropy_contribution::FLOAT)
+                                                   ON CONFLICT (prediction_id) DO UPDATE SET
+                                                   game_id = EXCLUDED.game_id,
+                                                   outcome = EXCLUDED.outcome,
+                                                   miner_uid = EXCLUDED.miner_uid,
+                                                   odds = EXCLUDED.odds,
+                                                   wager = EXCLUDED.wager,
+                                                   prediction_date = EXCLUDED.prediction_date,
+                                                   entropy_contribution = EXCLUDED.entropy_contribution"""),
+                                            batch
+                                        )
+                                    else:
+                                        await session.execute(
+                                            text("""INSERT OR REPLACE INTO entropy_predictions 
+                                                   (prediction_id, game_id, outcome, miner_uid, odds, 
+                                                    wager, prediction_date, entropy_contribution)
+                                                   VALUES (:prediction_id, :game_id, :outcome, :miner_uid, 
+                                                          :odds, :wager, :prediction_date, :entropy_contribution)"""),
+                                            batch
+                                        )
                                 elif update_type == 'scores':
-                                    await session.execute(
-                                        text("""INSERT OR REPLACE INTO entropy_miner_scores
-                                               (miner_uid, day, contribution) 
-                                               VALUES (:miner_uid, :day, :contribution)"""),
-                                        batch
-                                    )
+                                    if is_postgres:
+                                        await session.execute(
+                                            text("""INSERT INTO entropy_miner_scores
+                                                   (miner_uid, day, contribution) 
+                                                   VALUES (:miner_uid::INTEGER, :day::INTEGER, :contribution::FLOAT)
+                                                   ON CONFLICT (miner_uid, day) DO UPDATE SET
+                                                   contribution = EXCLUDED.contribution"""),
+                                            batch
+                                        )
+                                    else:
+                                        await session.execute(
+                                            text("""INSERT OR REPLACE INTO entropy_miner_scores
+                                                   (miner_uid, day, contribution) 
+                                                   VALUES (:miner_uid, :day, :contribution)"""),
+                                            batch
+                                        )
                                 elif update_type == 'closed_games':
-                                    await session.execute(
-                                        text("""INSERT OR REPLACE INTO entropy_closed_games
-                                               (game_id, close_time) 
-                                               VALUES (:game_id, :close_time)"""),
-                                        batch
-                                    )
+                                    if is_postgres:
+                                        await session.execute(
+                                            text("""INSERT INTO entropy_closed_games
+                                                   (game_id, close_time) 
+                                                   VALUES (:game_id::INTEGER, :close_time)
+                                                   ON CONFLICT (game_id) DO UPDATE SET
+                                                   close_time = EXCLUDED.close_time"""),
+                                            batch
+                                        )
+                                    else:
+                                        await session.execute(
+                                            text("""INSERT OR REPLACE INTO entropy_closed_games
+                                                   (game_id, close_time) 
+                                                   VALUES (:game_id, :close_time)"""),
+                                            batch
+                                        )
                                 
                                 # Commit after each batch
                                 await session.commit()
@@ -790,16 +911,35 @@ class EntropySystem:
         """Load entropy system state from database."""
         try:
             async with self.db_manager.get_long_running_session() as session:
+                # Determine if we're using PostgreSQL or SQLite
+                is_postgres = hasattr(self.db_manager, 'dbname')
+                
                 # Load system state - first check what columns we actually have
-                schema_query = """
-                    SELECT sql FROM sqlite_master 
-                    WHERE type='table' AND name='entropy_system_state'
-                """
-                result = await session.execute(text(schema_query))
-                schema_row = result.first()
-                if schema_row:
-                    schema_row = dict(zip(result.keys(), schema_row))
-                    bt.logging.debug(f"Entropy system state schema: {schema_row['sql']}")
+                if is_postgres:
+                    # PostgreSQL equivalent query
+                    schema_query = """
+                        SELECT column_name 
+                        FROM information_schema.columns
+                        WHERE table_name = 'entropy_system_state'
+                    """
+                else:
+                    # SQLite original query
+                    schema_query = """
+                        SELECT sql FROM sqlite_master 
+                        WHERE type='table' AND name='entropy_system_state'
+                    """
+                    
+                try:
+                    result = await session.execute(text(schema_query))
+                    schema_row = result.first()
+                    if schema_row:
+                        schema_row = dict(zip(result.keys(), schema_row))
+                        if is_postgres:
+                            bt.logging.debug(f"Entropy system state columns available: {schema_row}")
+                        else:
+                            bt.logging.debug(f"Entropy system state schema: {schema_row['sql']}")
+                except Exception as schema_error:
+                    bt.logging.warning(f"Error checking schema, continuing anyway: {schema_error}")
 
                 # Load system state with only the columns we know exist
                 state_query = """
@@ -807,10 +947,15 @@ class EntropySystem:
                     FROM entropy_system_state 
                     WHERE id = 1
                 """
-                result = await session.execute(text(state_query))
-                row = result.first()
-                if not row:
-                    bt.logging.info("No entropy system state found in database")
+                
+                try:
+                    result = await session.execute(text(state_query))
+                    row = result.first()
+                    if not row:
+                        bt.logging.info("No entropy system state found in database")
+                        return False
+                except Exception as table_error:
+                    bt.logging.error(f"Error querying entropy_system_state table: {table_error}")
                     return False
 
                 # Convert row to dict

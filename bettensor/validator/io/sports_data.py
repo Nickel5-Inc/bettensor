@@ -11,7 +11,7 @@ from .sports_config import sports_config
 from datetime import datetime, timedelta, timezone
 from ..scoring.entropy_system import EntropySystem
 from .bettensor_api_client import BettensorAPIClient
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 import traceback
 import asyncio
 import async_timeout
@@ -79,7 +79,7 @@ class SportsData:
                 bt.logging.info(f"Processing {len(date_games)} games for date {date}")
                 
                 # Process database updates for this date
-                date_ids = await self._process_date_games(date_games)
+                date_ids = await self._process_date_games(date, date_games)
                 if date_ids:
                     inserted_ids.extend(date_ids)
                     entropy_updates_needed.extend([g for g in date_games if g.get("externalId") in date_ids])
@@ -114,11 +114,17 @@ class SportsData:
         games_by_date = {}
         for game in games:
             try:
-                if not isinstance(game, dict) or 'date' not in game:
+                if not isinstance(game, dict):
                     bt.logging.warning(f"Skipping invalid game: {game}")
                     continue
+                
+                # Get date from either 'date' or 'event_start_date' field
+                date_str = game.get('date') or game.get('event_start_date')
+                if not date_str:
+                    bt.logging.warning(f"Skipping game without date: {game}")
+                    continue
                     
-                date = datetime.fromisoformat(game['date'].replace('Z', '+00:00')).date().isoformat()
+                date = datetime.fromisoformat(date_str.replace('Z', '+00:00')).date().isoformat()
                 games_by_date.setdefault(date, []).append(game)
             except Exception as e:
                 bt.logging.error(f"Error processing game: {e}, Game data: {game}")
@@ -127,95 +133,117 @@ class SportsData:
         bt.logging.info(f"Grouped {sum(len(games) for games in games_by_date.values())} valid games into {len(games_by_date)} dates")
         return games_by_date
 
-    async def _process_date_games(self, date_games):
-        """Process all games for a specific date with chunking and retries"""
-        inserted_ids = []
-        
+    async def _process_date_games(self, date, games):
+        """Process games for a specific date."""
         try:
-            # Get current game states from database
-            external_ids = [g.get("externalId") for g in date_games if isinstance(g, dict)]
-            if not external_ids:
-                return []
-
-            # Use proper SQLAlchemy parameter binding for IN clause
-            placeholders = ','.join([':id_' + str(i) for i in range(len(external_ids))])
-            query = f"""
+            bt.logging.info(f"Processing {len(games)} games for date {date}")
+            
+            # First check which games already exist
+            external_ids = [str(game['externalId']) for game in games]
+            query = """
                 SELECT external_id, team_a, team_b, sport, league, event_start_date,
                        active, outcome, team_a_odds, team_b_odds, tie_odds, can_tie
                 FROM game_data
-                WHERE external_id IN ({placeholders})
+                WHERE external_id = ANY(:external_ids)
             """
-            
-            # Create parameters dict with numbered placeholders
-            params = {f'id_{i}': external_id for i, external_id in enumerate(external_ids)}
-            
+            params = {"external_ids": external_ids}
             existing_games = await self.db_manager.fetch_all(query, params)
             
-            # Create mapping of existing games using column names
-            existing_game_map = {}
-            if existing_games:
-                for row in existing_games:
-                    existing_game_map[row['external_id']] = {
-                        'team_a': row['team_a'],
-                        'team_b': row['team_b'],
-                        'sport': row['sport'],
-                        'league': row['league'],
-                        'event_start_date': row['event_start_date'],
-                        'active': row['active'],
-                        'outcome': row['outcome'],
-                        'team_a_odds': row['team_a_odds'],
-                        'team_b_odds': row['team_b_odds'],
-                        'tie_odds': row['tie_odds'],
-                        'can_tie': row['can_tie']
-                    }
+            # Create a map of existing games by external_id for quick lookup
+            existing_game_map = {str(game['external_id']): game for game in existing_games}
             
-            # Filter games that need updates
-            games_needing_update = []
-            for game in date_games:
+            # Process each game
+            inserted_ids = []
+            for game in games:
                 try:
-                    external_id = game.get("externalId")
-                    if not external_id:
-                        continue
-                        
-                    if external_id not in existing_game_map:
-                        # New game
-                        games_needing_update.append(game)
-                        continue
-                        
-                    existing = existing_game_map[external_id]
-                    current_outcome = self._process_game_outcome(game)
+                    external_id = str(game['externalId'])
                     
-                    # Check if any field has changed
-                    if (existing['outcome'] != current_outcome or
-                        existing['team_a'] != str(game.get("teamA", "")) or
-                        existing['team_b'] != str(game.get("teamB", "")) or
-                        existing['sport'] != str(game.get("sport", "")) or
-                        existing['league'] != str(game.get("league", "")) or
-                        existing['event_start_date'] != game.get("date", "") or
-                        existing['active'] != (1 if current_outcome == 3 or (datetime.now(timezone.utc) - datetime.fromisoformat(game.get("date", "").replace('Z', '+00:00'))) <= timedelta(hours=4) else 0) or
-                        abs(float(game.get("teamAOdds", 0)) - float(existing['team_a_odds'])) > 0.001 or
-                        abs(float(game.get("teamBOdds", 0)) - float(existing['team_b_odds'])) > 0.001 or
-                        abs(float(game.get("drawOdds", 0)) - float(existing['tie_odds'])) > 0.001 or
-                        existing['can_tie'] != (1 if game.get("canDraw", False) else 0)):
-                        games_needing_update.append(game)
-                except (ValueError, TypeError, IndexError) as e:
-                    bt.logging.error(f"Error processing game comparison for {game.get('externalId')}: {str(e)}")
+                    # Skip if game already exists and is not active
+                    if external_id in existing_game_map and not existing_game_map[external_id]['active']:
+                        continue
+                    
+                    # Convert odds to float values
+                    team_a_odds = float(game.get('teamAOdds', 0))
+                    team_b_odds = float(game.get('teamBOdds', 0))
+                    tie_odds = float(game.get('tieOdds', 0)) if game.get('tieOdds') is not None else None
+                    
+                    # Convert outcome to integer
+                    outcome_str = game.get('outcome', 'Unfinished')
+                    outcome = (
+                        0 if outcome_str == 'TeamAWin' else
+                        1 if outcome_str == 'TeamBWin' else
+                        2 if outcome_str == 'Draw' else
+                        3  # Default to Unfinished
+                    )
+                    
+                    # Get event start date, trying both keys
+                    event_start_date_str = game.get('eventStartDate')
+                    if not event_start_date_str:
+                        event_start_date_str = game.get('event_start_date') # Fallback key
+                    
+                    if not event_start_date_str:
+                        bt.logging.warning(f"Skipping game {external_id}: Missing 'eventStartDate' or 'event_start_date' key")
+                        continue
+
+                    # Ensure the date is parsed correctly (assuming ISO format)
+                    try:
+                        event_start_date = datetime.fromisoformat(event_start_date_str.replace("Z", "+00:00"))
+                    except ValueError:
+                        bt.logging.warning(f"Skipping game {external_id}: Invalid date format '{event_start_date_str}'")
+                        continue
+
+                    # Prepare game data
+                    game_data = {
+                        'external_id': external_id,
+                        'team_a': game.get('teamA'), # Use .get() for safety
+                        'team_b': game.get('teamB'),
+                        'team_a_odds': team_a_odds,
+                        'team_b_odds': team_b_odds,
+                        'tie_odds': tie_odds,
+                        'can_tie': bool(game.get('canTie', False)),
+                        'event_start_date': event_start_date.isoformat(), # Store as ISO string
+                        'create_date': datetime.now(timezone.utc).isoformat(),
+                        'last_update_date': datetime.now(timezone.utc).isoformat(),
+                        'sport': game.get('sport'),
+                        'league': game.get('league'),
+                        'outcome': outcome,
+                        'active': 1
+                    }
+                    
+                    # Insert or update the game
+                    query = """
+                        INSERT INTO game_data (
+                            external_id, team_a, team_b, team_a_odds, team_b_odds,
+                            tie_odds, can_tie, event_start_date, create_date,
+                            last_update_date, sport, league, outcome, active
+                        ) VALUES (
+                            :external_id, :team_a, :team_b, :team_a_odds, :team_b_odds,
+                            :tie_odds, :can_tie, :event_start_date, :create_date,
+                            :last_update_date, :sport, :league, :outcome, :active
+                        )
+                        ON CONFLICT (external_id) DO UPDATE SET
+                            team_a_odds = EXCLUDED.team_a_odds,
+                            team_b_odds = EXCLUDED.team_b_odds,
+                            tie_odds = EXCLUDED.tie_odds,
+                            event_start_date = EXCLUDED.event_start_date,
+                            active = EXCLUDED.active,
+                            outcome = EXCLUDED.outcome,
+                            last_update_date = EXCLUDED.last_update_date
+                    """
+                    
+                    await self.db_manager.execute(query, game_data)
+                    inserted_ids.append(external_id)
+                    
+                except Exception as e:
+                    bt.logging.error(f"Error processing game {external_id}: {str(e)}")
                     continue
             
-            bt.logging.info(f"Found {len(games_needing_update)} games needing updates out of {len(date_games)} total")
+            return inserted_ids
             
-            # Process games that need updates in chunks
-            for i in range(0, len(games_needing_update), self.CHUNK_SIZE):
-                chunk = games_needing_update[i:i + self.CHUNK_SIZE]
-                chunk_ids = await self._process_game_chunk_with_retries(chunk)
-                if chunk_ids:
-                    inserted_ids.extend(chunk_ids)
-                    
         except Exception as e:
-            bt.logging.error(f"Error checking for game updates: {str(e)}")
+            bt.logging.error(f"Error in _process_date_games: {str(e)}")
             bt.logging.error(traceback.format_exc())
-            
-        return inserted_ids
+            return []
 
     async def _process_game_chunk_with_retries(self, chunk):
         """Process a single chunk of games with retries"""
@@ -320,63 +348,36 @@ class SportsData:
             raise
 
     def _prepare_game_params(self, game):
-        """Prepare parameters for game insertion/update"""
+        """Prepare parameters for game insertion or update."""
         try:
-            external_id = str(game.get("externalId"))
-            
-            # Extract required fields with defaults
-            team_a = str(game.get("teamA", ""))
-            team_b = str(game.get("teamB", ""))
-            sport = str(game.get("sport", ""))
-            league = str(game.get("league", ""))
-            
-            # Handle dates
-            create_date = datetime.now(timezone.utc).isoformat()
-            last_update_date = datetime.now(timezone.utc).isoformat()
-            
-            event_start_date = game.get("date", "")
+            # Handle eventStartDate - check both camelCase and snake_case versions
+            event_start_date = game.get('eventStartDate') or game.get('event_start_date')
             if not event_start_date:
+                bt.logging.error(f"Missing eventStartDate in game data: {game}")
                 return None
-                
-            event_start_time = datetime.fromisoformat(
-                event_start_date.replace('Z', '+00:00')
-            ).replace(tzinfo=timezone.utc)
-
-            # Handle outcome
-            outcome = self._process_game_outcome(game)
-            
-            # Set active status
-            active = 1
-            if outcome != 3 and (datetime.now(timezone.utc) - event_start_time) > timedelta(hours=4):
-                active = 0
-
-            # Extract odds
-            team_a_odds = float(game.get("teamAOdds", 0))
-            team_b_odds = float(game.get("teamBOdds", 0))
-            tie_odds = float(game.get("drawOdds", 0))
-            
-            can_tie = 1 if game.get("canDraw", False) else 0
 
             return {
-                "game_id": str(uuid.uuid4()),
-                "team_a": team_a,
-                "team_b": team_b,
-                "sport": sport,
-                "league": league,
-                "external_id": external_id,
-                "create_date": create_date,
-                "last_update_date": last_update_date,
-                "event_start_date": event_start_time.isoformat(),
-                "active": active,
-                "outcome": outcome,
-                "team_a_odds": team_a_odds,
-                "team_b_odds": team_b_odds,
-                "tie_odds": tie_odds,
-                "can_tie": can_tie,
+                'game_id': str(uuid.uuid4()),
+                'external_id': str(game['externalId']),
+                'team_a': game['teamA'],
+                'team_b': game['teamB'],
+                'team_a_odds': float(game.get('teamAOdds', 0.0)),
+                'team_b_odds': float(game.get('teamBOdds', 0.0)),
+                'tie_odds': float(game.get('tieOdds', 0.0)),
+                'can_tie': bool(game.get('canTie', False)),
+                'event_start_date': event_start_date,
+                'create_date': datetime.now(timezone.utc).isoformat(),
+                'last_update_date': datetime.now(timezone.utc).isoformat(),
+                'sport': game['sport'],
+                'league': game['league'],
+                'outcome': int(game.get('outcome', 3)),
+                'active': int(game.get('active', 1))
             }
-            
+        except KeyError as e:
+            bt.logging.error(f"Missing required field in game data: {e}")
+            return None
         except Exception as e:
-            bt.logging.error(f"Error preparing game parameters: {str(e)}")
+            bt.logging.error(f"Error preparing game parameters: {e}")
             return None
 
     def _process_game_outcome(self, game):

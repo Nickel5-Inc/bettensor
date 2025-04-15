@@ -52,7 +52,17 @@ class BaseNeuron:
         """Initialize the neuron."""
         base_config = copy.deepcopy(config or self.config())
         self.config = self.config()
+        
+        # Preserve chain_endpoint from base_config if it exists
+        chain_endpoint = getattr(base_config.subtensor, 'chain_endpoint', None)
+        
+        # Merge configs
         self.config.merge(base_config)
+        
+        # Ensure chain_endpoint is preserved after merge
+        if chain_endpoint is not None:
+            self.config.subtensor.chain_endpoint = chain_endpoint
+            
         self.check_config(self.config)
 
         # Set up logging with the provided configuration

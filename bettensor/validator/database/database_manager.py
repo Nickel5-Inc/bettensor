@@ -10,7 +10,7 @@ import traceback
 
 import sqlalchemy
 from sqlalchemy import inspect
-from bettensor.validator.utils.database.database_init import initialize_database
+from .database_init import initialize_database
 import async_timeout
 import uuid
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -425,11 +425,11 @@ class DatabaseManager:
                 return {}
             if isinstance(params[0], (tuple, dict)):
                 return params
-            # This conversion could cause issues with hotkey/coldkey values
-            return [{"param": p} for p in params]
+            # Convert list to named parameters for PostgreSQL compatibility
+            return [{f"param_{i}": p} for i, p in enumerate(params)]
         elif isinstance(params, tuple):
-            # This conversion could replace column names with p0, p1, etc.
-            return {f"p{i}": val for i, val in enumerate(params)}
+            # Convert tuple to named parameters for PostgreSQL compatibility
+            return {f"param_{i}": val for i, val in enumerate(params)}
         elif isinstance(params, dict):
             return params
         else:
@@ -441,15 +441,14 @@ class DatabaseManager:
             if params is None:
                 params = {}
             elif isinstance(params, list):
-                # Convert list of values to list of dictionaries
+                # Convert list of values to list of dictionaries with named parameters
                 if params and not isinstance(params[0], (tuple, dict)):
-                    params = [{"param": p} for p in params]
-                    query = query.replace("?", ":param")
+                    params = [{f"param_{i}": p} for i, p in enumerate(params)]
+                    query = re.sub(r'\?', lambda m: f":param_{next(itertools.count())}", query)
             elif isinstance(params, (list, tuple)):
-                # Convert single tuple to dict
-                counter = itertools.count()
-                params = {f"p{i}": val for i, val in enumerate(params)}
-                query = re.sub(r'\?', lambda m: f":p{next(counter)}", query)
+                # Convert single tuple to dict with named parameters
+                params = {f"param_{i}": val for i, val in enumerate(params)}
+                query = re.sub(r'\?', lambda m: f":param_{next(itertools.count())}", query)
             
             cursor = await session.execute(text(query), params)
             await session.commit()

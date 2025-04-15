@@ -179,6 +179,11 @@ data/*
 
 !data/.gitkeep
 
+# Config files with sensitive data
+config/database.cfg
+# But include example config
+!config/database.cfg.example
+
 current_miner_uid.txt
 token_store.json
 bettensor_backup*

@@ -22,18 +22,18 @@ from typing import Dict, Tuple
 from datetime import datetime, timedelta, timezone
 from bettensor.base.neuron import BaseNeuron
 from bettensor.protocol import TeamGamePrediction
-from bettensor.validator.utils.io.website_handler import WebsiteHandler
-from bettensor.validator.utils.scoring.scoring import ScoringSystem
-from .utils.scoring.entropy_system import EntropySystem
-from bettensor.validator.utils.io.sports_data import SportsData
-from bettensor.validator.utils.scoring.weights_functions import WeightSetter
-from bettensor.validator.utils.database.database_manager import DatabaseManager as SQLiteDatabaseManager
-from bettensor.validator.utils.database.database_factory import DatabaseFactory
-from bettensor.validator.utils.io.miner_data import MinerDataMixin
-from bettensor.validator.utils.io.bettensor_api_client import BettensorAPIClient
-from bettensor.validator.utils.scoring.min_stake import MinStakeService
-from bettensor.validator.utils.io.base_api_client import BaseAPIClient
-from bettensor.validator.utils.scoring.watchdog import Watchdog
+from bettensor.validator.io.website_handler import WebsiteHandler
+from bettensor.validator.scoring.scoring import ScoringSystem
+from bettensor.validator.scoring.entropy_system import EntropySystem
+from bettensor.validator.io.sports_data import SportsData
+from bettensor.validator.scoring.weights_functions import WeightSetter
+from bettensor.validator.database.database_manager import DatabaseManager as SQLiteDatabaseManager
+from bettensor.validator.database.database_factory import DatabaseFactory
+from bettensor.validator.io.miner_data import MinerDataMixin
+from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
+from bettensor.validator.scoring.min_stake import MinStakeService
+from bettensor.validator.io.base_api_client import BaseAPIClient
+from bettensor.validator.utils.watchdog import Watchdog
 from bettensor import __spec_version__
 from types import SimpleNamespace
 
@@ -121,7 +121,31 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         bt.logging.add_args(parser)
         bt.axon.add_args(parser)
         cls.add_args(parser)
-        return bt.config(parser)
+        
+        # Parse args first to ensure command line arguments take precedence
+        args = parser.parse_args()
+        
+        # Get config and ensure command line args override defaults
+        config = bt.config(parser)
+        
+        # Handle chain_endpoint based on network
+        if hasattr(args, 'subtensor.chain_endpoint') and getattr(args, 'subtensor.chain_endpoint') is not None:
+            # If chain_endpoint is explicitly set, use it and override network-specific defaults
+            chain_endpoint = getattr(args, 'subtensor.chain_endpoint')
+            config.subtensor.chain_endpoint = chain_endpoint
+            bt.logging.info(f"Using explicitly set chain_endpoint: {chain_endpoint}")
+            
+            # If using local endpoint, force network to local
+            if chain_endpoint == "0.0.0.0:9944" or chain_endpoint == "127.0.0.1:9944":
+                config.subtensor.network = "local"
+                bt.logging.info("Setting network to 'local' due to local chain_endpoint")
+        
+        # Log config only once here
+        bt.logging.info(f"Subtensor config: {config.subtensor}")
+        bt.logging.info(f"Chain endpoint from config: {config.subtensor.chain_endpoint}")
+        bt.logging.debug(f"Full config for debugging: {config}")
+        
+        return config
 
     def __init__(self, config=None):
         """Initialize the validator."""
@@ -167,7 +191,8 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
     @classmethod
     async def create(cls):
         """Create a new validator instance."""
-        self = cls(config=cls.config())
+        config = cls.config()  # Get config once
+        self = cls(config=config)  # Pass the same config instance
         await self.initialize_neuron()
         return self
 
@@ -201,7 +226,9 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         retry_delay = 10
         for attempt in range(max_retries):
             try:
+                bt.logging.info(f"Attempting to initialize subtensor with chain_endpoint: {self.config.subtensor.chain_endpoint}")
                 self.subtensor = bt.subtensor(config=self.config)
+                bt.logging.info(f"Successfully created subtensor with chain_endpoint: {self.subtensor.chain_endpoint}")
                 bt.logging.info(f"Connected to {self.config.subtensor.network} network")
                 return self.subtensor
             except Exception as e:
@@ -245,16 +272,25 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
     ) -> Tuple[bt.wallet, bt.subtensor, bt.dendrite, bt.metagraph]:
         """sets up the bittensor objects"""
         try:
+            bt.logging.info(f"Setting up bittensor objects with config: {config}")
+            bt.logging.info(f"Chain endpoint before wallet creation: {config.subtensor.chain_endpoint}")
             wallet = bt.wallet(config=config)
+            
+            bt.logging.info(f"Chain endpoint before subtensor creation: {config.subtensor.chain_endpoint}")
             subtensor = bt.subtensor(config=config)
+            bt.logging.info(f"Created subtensor with chain_endpoint: {subtensor.chain_endpoint}")
+            
             dendrite = bt.dendrite(wallet=wallet)
             metagraph = subtensor.metagraph(config.netuid)
+            
+            # Log final chain endpoint for debugging
+            bt.logging.info(f"Final chain endpoint: {subtensor.chain_endpoint}")
+            
         except AttributeError as e:
             bt.logging.error(f"unable to setup bittensor objects: {e}")
             raise AttributeError from e
 
         self.hotkeys = copy.deepcopy(metagraph.hotkeys)
-
         return wallet, subtensor, dendrite, metagraph
 
     def serve_axon(self):
@@ -267,9 +303,8 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
     async def initialize_neuron(self):
         bt.logging(config=self.config, logging_dir=self.config.full_path)
-        bt.logging.info(
-            f"Initializing validator for subnet: {self.config.netuid} on network: {self.config.subtensor.chain_endpoint} with config: {self.config}"
-        )
+        # Remove duplicate config logging here since we already logged it in config()
+        bt.logging.info(f"Initializing validator for subnet: {self.config.netuid} on network: {self.config.subtensor.chain_endpoint}")
 
         # Setup the bittensor objects
         self.wallet, self.subtensor, self.dendrite, self.metagraph = self.setup_bittensor_objects(

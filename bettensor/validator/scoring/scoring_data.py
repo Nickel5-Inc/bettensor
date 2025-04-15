@@ -12,7 +12,7 @@ import async_timeout
 import pytz
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 from typing import List, Tuple, Dict
 from collections import defaultdict
 import random
@@ -121,6 +121,7 @@ class ScoringData:
             formatted_start = target_date.replace(hour=0, minute=0, second=0).isoformat()
             formatted_end = target_date.replace(hour=23, minute=59, second=59).isoformat()
             
+            # Modified query to handle outcome as integer
             query = """
                 SELECT 
                     external_id,
@@ -128,12 +129,23 @@ class ScoringData:
                     team_a_odds,
                     team_b_odds,
                     tie_odds,
-                    outcome
+                    CASE 
+                        WHEN outcome IS NULL THEN 3
+                        WHEN outcome::text ~ '^[0-9]+$' THEN outcome::integer
+                        WHEN outcome = 'Unfinished' THEN 3
+                        WHEN outcome = 'TeamA' THEN 0
+                        WHEN outcome = 'TeamB' THEN 1
+                        WHEN outcome = 'Draw' THEN 2
+                        WHEN outcome = 'Cancelled' THEN 4
+                        ELSE 3
+                    END as outcome
                 FROM game_data
                 WHERE event_start_date BETWEEN :start_date AND :end_date
                 AND outcome IS NOT NULL
-                AND outcome != 'Unfinished'
-                AND outcome != 3
+                AND (
+                    (outcome::text ~ '^[0-9]+$' AND outcome::integer != 3)
+                    OR (outcome::text !~ '^[0-9]+$' AND outcome != 'Unfinished')
+                )
                 ORDER BY event_start_date ASC
             """
             
@@ -146,30 +158,32 @@ class ScoringData:
             
             if not games:
                 bt.logging.warning(f"No closed games found for date {date_str}")
-                return np.array([])
+                return []
             
             # Process the games to combine odds into the expected format
             processed_games = []
             for game in games:
-                processed_game = {
-                    'external_id': game['external_id'],
-                    'event_start_date': game['event_start_date'],
-                    'closing_line_odds': [
-                        game['team_a_odds'],
-                        game['team_b_odds'],
-                        game['tie_odds'] if game['tie_odds'] is not None else float('inf')
-                    ],
-                    'outcome': game['outcome']
-                }
-                processed_games.append(processed_game)
+                # Only include games with valid numeric outcomes
+                if game['outcome'] is not None:
+                    processed_game = {
+                        'external_id': game['external_id'],
+                        'event_start_date': game['event_start_date'],
+                        'closing_line_odds': [
+                            game['team_a_odds'],
+                            game['team_b_odds'],
+                            game['tie_odds'] if game['tie_odds'] is not None else float('inf')
+                        ],
+                        'outcome': game['outcome']
+                    }
+                    processed_games.append(processed_game)
             
             bt.logging.info(f"Found {len(processed_games)} closed games for date {date_str}")
-            return np.array(processed_games)
+            return processed_games
             
         except Exception as e:
             bt.logging.error(f"Error fetching closed game data: {e}")
             bt.logging.error(traceback.format_exc())
-            return np.array([])
+            return []
 
     async def _fetch_predictions(self, game_ids):
         """Fetch predictions for given game IDs"""
@@ -272,8 +286,8 @@ class ScoringData:
                 async with async_timeout.timeout(60):  # 60 second timeout
                     async with self.db_manager.get_long_running_session() as session:
                         # First ensure all miners have a basic entry
-                        insert_base_query = text("""
-                        INSERT OR IGNORE INTO miner_stats (
+                        insert_query = text("""
+                        INSERT INTO miner_stats (
                             miner_uid, miner_hotkey, miner_coldkey, miner_status,
                             miner_rank, miner_cash, miner_current_incentive, miner_current_tier,
                             miner_current_scoring_window, miner_current_composite_score,
@@ -286,6 +300,7 @@ class ScoringData:
                             :miner_uid, :hotkey, :coldkey, :status,
                             0, 0.0, 0.0, 1, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 0.0, NULL
                         )
+                        ON CONFLICT (miner_uid) DO NOTHING
                         """)
                         
                         # Prepare base values as dictionaries with named parameters
@@ -307,12 +322,7 @@ class ScoringData:
                                 bt.logging.debug(f"Processing batch {i//batch_size + 1} of {(len(base_values) + batch_size - 1)//batch_size}")
                                 
                                 try:
-                                    await session.execute(insert_base_query, batch)
-                                    await session.commit()
-                                    
-                                    # Also insert into backup table
-                                    backup_query = text(insert_base_query.text.replace('miner_stats', 'miner_stats_backup'))
-                                    await session.execute(backup_query, batch)
+                                    await session.execute(insert_query, batch)
                                     await session.commit()
                                 except Exception as e:
                                     bt.logging.error(f"Error processing batch: {e}")
@@ -322,7 +332,7 @@ class ScoringData:
                         update_lifetime_query = text("""
                         WITH prediction_stats AS (
                             SELECT 
-                                miner_uid,
+                                CAST(miner_uid AS INTEGER) as miner_uid,
                                 COUNT(*) as total_predictions,
                                 SUM(CASE WHEN payout > 0 THEN 1 ELSE 0 END) as wins,
                                 SUM(CASE WHEN payout = 0 THEN 1 ELSE 0 END) as losses,
@@ -353,33 +363,6 @@ class ScoringData:
                         await session.commit()
                         bt.logging.debug("Updated lifetime statistics for miners.")
 
-                        # Clean up and sync backup table
-                        cleanup_query = text("""
-                        DELETE FROM miner_stats 
-                        WHERE miner_uid >= 256 
-                        OR miner_uid IN (
-                            SELECT miner_uid 
-                            FROM miner_stats 
-                            GROUP BY miner_uid 
-                            HAVING COUNT(*) > 1
-                        );
-                        """)
-                        await session.execute(cleanup_query)
-                        await session.commit()
-                        
-                        # Same cleanup for backup table
-                        cleanup_backup_query = text(cleanup_query.text.replace('miner_stats', 'miner_stats_backup'))
-                        await session.execute(cleanup_backup_query)
-                        await session.commit()
-                        
-                        # Sync backup table with main table
-                        sync_query = text("""
-                        INSERT OR REPLACE INTO miner_stats_backup
-                        SELECT * FROM miner_stats;
-                        """)
-                        await session.execute(sync_query)
-                        await session.commit()
-                        
                         bt.logging.info("Successfully initialized miner stats")
                         return
                         

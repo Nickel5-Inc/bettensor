@@ -20,16 +20,16 @@ from websocket._exceptions import WebSocketConnectionClosedException
 from bettensor.protocol import GameData, Metadata
 from bettensor.validator.bettensor_validator import BettensorValidator
 from bettensor.validator.utils.ensure_dependencies import ensure_dependencies
-from bettensor.validator.utils.io.sports_data import SportsData
-from bettensor.validator.utils.scoring.watchdog import Watchdog
-from bettensor.validator.utils.io.auto_updater import check_and_install_dependencies, perform_update
+from bettensor.validator.io.sports_data import SportsData
+from bettensor.validator.utils.watchdog import Watchdog
+from bettensor.validator.io.auto_updater import check_and_install_dependencies, perform_update
 import threading
 from functools import partial
 from typing import Optional, Any
 import async_timeout
 from bettensor.validator.utils.state_sync import StateSync
 import math
-from bettensor.validator.utils.database.database_manager import DatabaseManager
+from bettensor.validator.database.database_manager import DatabaseManager
 import json
 import numpy as np
 import signal

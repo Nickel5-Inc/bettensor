@@ -12,15 +12,15 @@ from argparse import ArgumentParser
 
 import bittensor as bt
 from bettensor.validator.bettensor_validator import BettensorValidator
-from bettensor.validator.utils.io.sports_data import SportsData
-from bettensor.validator.utils.io.external_api_client import ExternalAPIClient
+from bettensor.validator.io.sports_data import SportsData
+from bettensor.validator.io.external_api_client import ExternalAPIClient
 from bettensor.validator.utils.database.database_manager import DatabaseManager
 from bettensor.validator.utils.scoring.entropy_system import EntropySystem
 
 
 class TestValidator(unittest.TestCase):
     @patch(
-        "bettensor.validator.utils.io.external_api_client.ExternalAPIClient",
+        "bettensor.validator.io.external_api_client.ExternalAPIClient",
         autospec=True,
     )
     def setUp(self, MockExternalAPIClient):
