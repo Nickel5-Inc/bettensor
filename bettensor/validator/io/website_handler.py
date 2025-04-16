@@ -4,7 +4,6 @@ import json
 from datetime import datetime
 import bittensor as bt
 from argparse import ArgumentParser
-from bettensor.validator.database.database_manager import DatabaseManager
 from dateutil import parser
 import pytz
 

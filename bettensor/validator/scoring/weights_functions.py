@@ -72,36 +72,70 @@ class WeightSetter:
             # Log start of weight setting process
             bt.logging.info("Starting weight setting process...")
             
-            # Ensure weights and uids are the same length
-            if len(weights) != len(self.metagraph.uids):
-                bt.logging.error(f"Weights and UIDs are not the same length: {len(weights)} != {len(self.metagraph.uids)}")
-                bt.logging.error(f"Weights: {len(weights)}")
-                bt.logging.error(f"UIDs: {len(self.metagraph.uids)}")
-                # Trim weights to the length of UIDs
-                weights = weights[:len(self.metagraph.uids)]
+            # --- Explicitly sync metagraph right before setting weights --- 
+            bt.logging.info("Syncing metagraph within set_weights for latest state...")
+            try:
+                self.metagraph.sync(subtensor=self.subtensor)
+                bt.logging.info("Metagraph synced successfully within set_weights.")
+            except Exception as sync_err:
+                bt.logging.error(f"Failed to sync metagraph within set_weights: {sync_err}. Proceeding with potentially stale metagraph.")
+            # --- End explicit sync --- 
             
+            # Get the number of UIDs in the *potentially newly synced* metagraph
+            num_metagraph_uids = len(self.metagraph.uids)
+            metagraph_uids_tensor = self.metagraph.uids # Keep as tensor for direct use later
 
+            # Ensure weights vector is sized correctly relative to the *current* metagraph UIDs
+            if len(weights) > num_metagraph_uids:
+                bt.logging.info(f"Weights vector length ({len(weights)}) is longer than current metagraph UIDs length ({num_metagraph_uids}). Trimming weights.")
+                weights_to_set = weights[:num_metagraph_uids]
+            elif len(weights) < num_metagraph_uids:
+                bt.logging.info(f"Weights vector length ({len(weights)}) is shorter than current metagraph UIDs length ({num_metagraph_uids}). Padding weights with zeros.")
+                pad_len = num_metagraph_uids - len(weights)
+                weights_to_set = torch.cat([weights, torch.zeros(pad_len, dtype=torch.float32)])
+            else:
+                bt.logging.info(f"Weights vector length ({len(weights)}) matches current metagraph UIDs length ({num_metagraph_uids}). Using as is.")
+                weights_to_set = weights # Lengths match
+            
+            # Initialize subtensor connection (consider reusing validator's connection if possible)
             weights_subtensor = bt.subtensor(network=self.neuron_config.network)
-            
-            #ensure subtensor is connected
             if weights_subtensor is None:
-                bt.logging.error("Subtensor is not connected, attempting to reconnect...")
-                weights_subtensor = bt.subtensor(network=self.neuron_config.network)
+                bt.logging.error("Subtensor connection failed.")
+                return False
 
+            # Get min_allowed_weights from subtensor
+            try:
+                min_allowed_weights = weights_subtensor.min_allowed_weights(netuid=self.neuron_config.netuid)
+                bt.logging.info(f"Subtensor reports min_allowed_weights for netuid {self.neuron_config.netuid}: {min_allowed_weights}")
+            except Exception as e:
+                 bt.logging.error(f"Could not retrieve min_allowed_weights for netuid {self.neuron_config.netuid}: {e}. Skipping weight set.")
+                 return False # Cannot proceed without knowing the minimum
+
+            # Check if the number of UIDs in our metagraph is sufficient AFTER syncing
+            if num_metagraph_uids < min_allowed_weights:
+                bt.logging.error(f"Number of UIDs in metagraph ({num_metagraph_uids}) is less than min_allowed_weights ({min_allowed_weights}) for netuid {self.neuron_config.netuid}. Cannot set weights.")
+                return False # Do not attempt to set weights
+            
             # ensure params are set and valid 
-            if self.neuron_config.netuid is None or self.wallet is None or self.metagraph.uids is None or weights is None:
+            # Check weights_to_set specifically
+            if self.neuron_config.netuid is None or self.wallet is None or metagraph_uids_tensor is None or weights_to_set is None:
                 bt.logging.error("Invalid parameters for subtensor.set_weights()")
                 bt.logging.error(f"Neuron config netuid: {self.neuron_config.netuid}")
                 bt.logging.error(f"Wallet: {self.wallet}")
-                bt.logging.error(f"Metagraph uids: {self.metagraph.uids}")
-                bt.logging.error(f"Weights: {weights}")
+                bt.logging.error(f"Metagraph uids: {metagraph_uids_tensor}")
+                bt.logging.error(f"Weights to set: {weights_to_set}")
                 bt.logging.error(f"Version key: {__spec_version__}")
                 return False
             
+            # Check length consistency one last time before calling
+            if len(metagraph_uids_tensor) != len(weights_to_set):
+                 bt.logging.error(f"Final length mismatch before set_weights call: UIDs={len(metagraph_uids_tensor)}, Weights={len(weights_to_set)}")
+                 return False
+                 
             bt.logging.info(f"Setting weights for netuid: {self.neuron_config.netuid}")
             bt.logging.info(f"Wallet: {self.wallet}")
-            bt.logging.info(f"Uids: {self.metagraph.uids}")
-            bt.logging.info(f"Weights: {weights}")
+            bt.logging.info(f"Uids being sent ({len(metagraph_uids_tensor)}): {metagraph_uids_tensor}")
+            bt.logging.info(f"Weights being sent ({len(weights_to_set)}): {weights_to_set}")
             bt.logging.info(f"Version key: {__spec_version__}")
             bt.logging.info(f"Subtensor: {weights_subtensor}")
 
@@ -111,8 +145,8 @@ class WeightSetter:
             result = weights_subtensor.set_weights(
                 netuid=self.neuron_config.netuid, 
                 wallet=self.wallet, 
-                uids=self.metagraph.uids, 
-                weights=weights, 
+                uids=metagraph_uids_tensor, # Use potentially newly synced metagraph UIDs
+                weights=weights_to_set, # Use correctly sized weights based on synced metagraph
                 version_key=__spec_version__, 
                 wait_for_inclusion=True, 
             )

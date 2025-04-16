@@ -49,15 +49,20 @@ class BaseNeuron:
         return config(cls)
 
     def __init__(self, config=None):
-        """Initialize the neuron."""
-        base_config = copy.deepcopy(config or self.config())
-        self.config = self.config()
+        """Initializes the BaseNeuron with the given configuration.
+
+        Args:
+            config (bittensor.Config, optional): Configuration object. 
+                                                Defaults to the default configuration.
+        """
+        # Use passed config if available, otherwise load default via classmethod
+        self.config = config or self.__class__.config()
         
         # Preserve chain_endpoint from base_config if it exists
-        chain_endpoint = getattr(base_config.subtensor, 'chain_endpoint', None)
+        chain_endpoint = getattr(self.config.subtensor, 'chain_endpoint', None)
         
         # Merge configs
-        self.config.merge(base_config)
+        self.config.merge(self.config)
         
         # Ensure chain_endpoint is preserved after merge
         if chain_endpoint is not None:

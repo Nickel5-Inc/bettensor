@@ -27,8 +27,8 @@ from bettensor.validator.scoring.scoring import ScoringSystem
 from bettensor.validator.scoring.entropy_system import EntropySystem
 from bettensor.validator.io.sports_data import SportsData
 from bettensor.validator.scoring.weights_functions import WeightSetter
-from bettensor.validator.database.database_manager import DatabaseManager as SQLiteDatabaseManager
-from bettensor.validator.database.database_factory import DatabaseFactory
+from bettensor.validator.database.postgres_database_manager import PostgresDatabaseManager
+from bettensor.validator.database.database_config import load_database_config
 from bettensor.validator.io.miner_data import MinerDataMixin
 from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
 from bettensor.validator.scoring.min_stake import MinStakeService
@@ -36,6 +36,7 @@ from bettensor.validator.io.base_api_client import BaseAPIClient
 from bettensor.validator.utils.watchdog import Watchdog
 from bettensor import __spec_version__
 from types import SimpleNamespace
+from bettensor.validator.utils.postgres_setup import check_postgres_installed, check_postgres_service, configure_postgres_db
 
 DEFAULT_DB_PATH = "./bettensor/validator/state/validator.db"
 
@@ -149,11 +150,26 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
 
     def __init__(self, config=None):
         """Initialize the validator."""
-        super().__init__(config)
+        # Use provided config or load default
+        self.config = config or BettensorValidator.config()
+        super().__init__(self.config) # Pass config to parent
         
         # Initialize neuron_config with alpha from config
-        self.neuron_config = SimpleNamespace(alpha=getattr(config, 'alpha', 0.9))
+        self.neuron_config = SimpleNamespace(alpha=getattr(self.config, 'alpha', 0.9))
         
+        # --- Instantiate Database Manager --- 
+        db_config_dict = load_database_config() 
+        self.db_config = db_config_dict # Store the config dict
+        self.db_manager = PostgresDatabaseManager(
+            host=db_config_dict.get('host', 'localhost'),
+            port=db_config_dict.get('port', 5432),
+            user=db_config_dict.get('user', 'postgres'),
+            password=db_config_dict.get('password') or 'postgres', # Default password if needed
+            dbname=db_config_dict.get('dbname', 'bettensor_validator'),
+        )
+        bt.logging.info(f"DB Manager initialized in Validator __init__ with type: {db_config_dict.get('type')}")
+        # --- End DB Manager Instantiation --- 
+
         # Initialize validator-specific attributes
         self.timeout = 20
         self.wallet = None
@@ -162,11 +178,10 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.scores = None
         self.hotkeys = None
         self.subtensor = None
-        #self.min_stake_service = None
         self.axon_port = getattr(self.config, "axon.port", None)
         self.base_path = "./bettensor/validator/"
-        self.max_targets = None
-        self.target_group = None
+        self.max_targets = getattr(self.config, 'max_targets', 256)
+        self.target_group = 0
         self.blacklisted_miner_hotkeys = None
         self.load_validator_state = None
         self.data_entry = None
@@ -179,10 +194,21 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.determine_max_workers())
         self.subnet_version = str(__spec_version__)  # Convert to string
 
+        # --- Initialize Intervals and Last Block Trackers ---
+        self.query_axons_interval = 40
+        self.send_data_to_website_interval = 15
+        self.scoring_interval = 60
+        self.set_weights_interval = 300
+        self.state_sync_interval = 200
+
+        self.last_updated_block = 0 # Will be updated after first sync or state load
         self.last_queried_block = 0
         self.last_sent_data_to_website = 0
         self.last_scoring_block = 0
         self.last_set_weights_block = 0
+        self.last_state_sync = 0
+        # --- End Intervals Initialization ---
+        
         self.operation_lock = asyncio.Lock()
         self.watchdog = None
 
@@ -312,7 +338,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         )
 
         bt.logging.info(
-            f"Bittensor objects initialized:\nmetagraph: {self.metagraph}\nsubtensor: {self.subtensor}\nwallet: {self.wallet}"
+            f"Bittensor objects initialized:\\nmetagraph: {self.metagraph}\\nsubtensor: {self.subtensor}\\nwallet: {self.wallet}"
         )
 
         # Validate that the validator has registered to the metagraph correctly
@@ -328,139 +354,12 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
         if self.metagraph is not None:
             self.scores = torch.zeros(len(self.metagraph.uids), dtype=torch.float32)
 
-        # Handle load_state configuration
-        load_state_str = getattr(self.config, 'load_state', 'True')
-        self.load_validator_state = load_state_str.lower() != "false" if isinstance(load_state_str, str) else True
-
-        if self.load_validator_state:
-            await self.load_state()
-        else:
-            self.init_default_scores()
-
         self.max_targets = getattr(self.config, 'max_targets', 256)
         self.target_group = 0
 
-        # Determine database configuration
-        db_config = self._get_database_config()
-
-        # Initialize the database manager using the factory
-        self.db_manager = await DatabaseFactory.create_database_manager(db_config)
-
-        # Initialize MinerDataMixin with required parameters
-        MinerDataMixin.__init__(self, self.db_manager, self.metagraph, set(self.metagraph.uids))
-
-        # Read force_rebuild_scores from setup.cfg
-        config_parser = configparser.ConfigParser()
-        try:
-            config_parser.read('setup.cfg')
-            force_rebuild = config_parser.getboolean('metadata', 'force_rebuild_scores', fallback=False)
-            bt.logging.info(f"Force rebuild scores setting: {force_rebuild}")
-        except configparser.Error as e:
-            bt.logging.error(f"Error reading force_rebuild_scores from setup.cfg: {e}")
-            force_rebuild = False
-
-        # Create a MinerDataMixin instance for the scoring system
-        scoring_miner_data = MinerDataMixin(self.db_manager, self.metagraph, set(self.metagraph.uids))
-
-        # Initialize the MinStakeService
-        self.min_stake_service = MinStakeService(self.subtensor)
-
-        # Initialize the scoring system with force_rebuild setting and miner_data
-        self.scoring_system = ScoringSystem(
-            self.db_manager,
-            num_miners=256,
-            max_days=45,
-            current_date=datetime.now(timezone.utc),
-            force_rebuild=force_rebuild,
-            min_stake_service=self.min_stake_service
-        )
-        # Set the validator and miner_data attributes
-        self.scoring_system.set_validator(self)
-        self.scoring_system.miner_data = scoring_miner_data
-        await self.scoring_system.initialize()
-
-        # After initialization, set force_rebuild_scores back to False to prevent future automatic rebuilds
-        if force_rebuild:
-            try:
-                config_parser.set('metadata', 'force_rebuild_scores', 'False')
-                with open('setup.cfg', 'w') as f:
-                    config_parser.write(f)
-                bt.logging.info("Reset force_rebuild_scores to False after initialization")
-            except Exception as e:
-                bt.logging.error(f"Error resetting force_rebuild_scores in setup.cfg: {e}")
-
-        # Setup Validator Components
-        self.api_client = BettensorAPIClient(self.db_manager)
-
-        self.sports_data = SportsData(
-            db_manager=self.db_manager,
-            api_client=self.api_client,
-            entropy_system=self.scoring_system.entropy_system,
-        )
-
-        self.weight_setter = WeightSetter(
-            metagraph=self.metagraph,
-            wallet=self.wallet,
-            subtensor=self.subtensor,
-            neuron_config=self.config,
-            db_path=self.db_path,
-        )
-
-        self.website_handler = WebsiteHandler(self)
-
-        self.is_initialized = True
+        # Keep this flag
+        self.is_initialized = True 
         return True
-
-    def _get_database_config(self):
-        """
-        Get database configuration from setup.cfg and command line arguments.
-        
-        Returns:
-            dict: Database configuration dictionary
-        """
-        # Read database configuration from setup.cfg
-        config_parser = configparser.ConfigParser()
-        try:
-            config_parser.read('setup.cfg')
-            
-            # Check for database section
-            if 'database' in config_parser:
-                db_section = config_parser['database']
-                default_db_type = db_section.get('default_type', 'sqlite')
-            else:
-                # Check metadata section for backward compatibility
-                default_db_type = config_parser.get('metadata', 'database_type', fallback='sqlite')
-                
-            bt.logging.info(f"Default database type from setup.cfg: {default_db_type}")
-            
-        except configparser.Error as e:
-            bt.logging.error(f"Error reading database configuration from setup.cfg: {e}")
-            default_db_type = 'sqlite'
-            
-        # Initialize database configuration
-        db_config = {}
-        
-        # Get database type (first from command line, then from setup.cfg)
-        db_type = getattr(self.config, 'db_type', None) or default_db_type
-        db_config['type'] = db_type.lower()
-        
-        # Get database-specific configuration
-        if db_config['type'] == 'postgres':
-            db_config.update({
-                'host': getattr(self.config, 'postgres_host', 'localhost'),
-                'port': getattr(self.config, 'postgres_port', 5432),
-                'user': getattr(self.config, 'postgres_user', 'postgres'),
-                'password': getattr(self.config, 'postgres_password', ''),
-                'dbname': getattr(self.config, 'postgres_dbname', 'bettensor_validator')
-            })
-            bt.logging.info(f"Using PostgreSQL database: {db_config['dbname']} on {db_config['host']}:{db_config['port']}")
-        else:
-            db_config.update({
-                'path': getattr(self.config, 'db', DEFAULT_DB_PATH)
-            })
-            bt.logging.info(f"Using SQLite database: {db_config['path']}")
-            
-        return db_config
 
     def _parse_args(self, parser):
         """Parses the command line arguments"""

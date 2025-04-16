@@ -10,6 +10,7 @@ import subprocess
 import json
 import hashlib
 import re
+from typing import List, Dict
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -19,10 +20,9 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote_plus
 import asyncpg
 
-from bettensor.validator.database.base_database_manager import BaseDatabaseManager
-from bettensor.validator.database.database_init import initialize_database
+from bettensor.validator.database.schema import metadata
 
-class PostgresDatabaseManager(BaseDatabaseManager):
+class PostgresDatabaseManager:
     """
     PostgreSQL implementation of the database manager.
     Handles connections, query execution, and database operations for PostgreSQL.
@@ -58,9 +58,6 @@ class PostgresDatabaseManager(BaseDatabaseManager):
         self.dbname = dbname
         self.pool_size = pool_size
         self.max_overflow = max_overflow
-        
-        # For compatibility with SQLite manager
-        super().__init__(database_path or f"postgresql://{host}:{port}/{dbname}")
         
         if not self._initialized:
             self._transactions = {}
@@ -381,9 +378,6 @@ class PostgresDatabaseManager(BaseDatabaseManager):
                 if session in self._active_sessions:
                     self._active_sessions.remove(session)
                     
-                if session.in_transaction():
-                    await session.rollback()
-                    
                 await session.close()
                 
     def _convert_params(self, params):
@@ -510,6 +504,9 @@ class PostgresDatabaseManager(BaseDatabaseManager):
                                     postgres_params[k] = v
                             elif isinstance(v, str) and v.isdigit():
                                 postgres_params[k] = int(v)
+                            # Explicitly handle booleans to prevent conversion to int
+                            elif isinstance(v, bool):
+                                postgres_params[k] = v 
                             else:
                                 postgres_params[k] = v
                     else:
@@ -569,30 +566,33 @@ class PostgresDatabaseManager(BaseDatabaseManager):
             bt.logging.error(f"Error fetching one row: {str(e)}")
             raise
                 
-    async def executemany(self, query, params_list, column_names=None, max_retries=5, retry_delay=1):
-        """Execute many queries in a batch operation"""
-        if not params_list:
-            return 0
+    async def executemany(self, query: str, params: List[tuple | Dict], column_names: List[str] | None = None):
+        """Execute a query with multiple parameter sets."""
+        if not self.engine:
+            await self._initialize_engine()
             
-        # Convert query syntax to PostgreSQL format
         postgres_query = self._convert_query_syntax(query)
-        
-        for attempt in range(max_retries):
-            try:
-                async with self.get_session() as session:
-                    result = await session.execute(
-                        text(postgres_query),
-                        [self._convert_params(params) for params in params_list]
-                    )
-                    await session.commit()
-                    return result.rowcount
-            except SQLAlchemyError as e:
-                if attempt < max_retries - 1:
-                    bt.logging.warning(f"Database error, retrying ({attempt+1}/{max_retries}): {e}")
-                    await asyncio.sleep(retry_delay)
-                else:
-                    bt.logging.error(f"Error in executemany after {max_retries} attempts: {e}")
-                    raise
+        bt.logging.trace(f"Executing many with query: {postgres_query}")
+        # bt.logging.trace(f"Executing many with params (first 5): {params[:5]}") # Be careful logging sensitive data
+
+        try:
+            async with self.get_session() as session:
+                # Pass the original params list directly to session.execute
+                # SQLAlchemy handles list of tuples or list of dicts for executemany
+                result = await session.execute(text(postgres_query), params)
+                # No explicit commit needed here if session uses autocommit or manages transaction externally
+                return result
+        except Exception as e:
+            bt.logging.error(f"Error executing query: \n{query}")
+            # Log parameters safely (avoid logging sensitive info)
+            if params:
+                 log_params = params[0] if isinstance(params[0], dict) else {f'arg_{i}': v for i, v in enumerate(params[0])}
+                 bt.logging.error(f"Sample Parameters: {log_params}") 
+            else:
+                 bt.logging.error("Parameters: []")
+            bt.logging.error(f"Error: {e}")
+            # Re-raise the specific SQLAlchemy/DBAPI error for detailed trace
+            raise e 
         
     async def begin_transaction(self):
         """Begin a database transaction"""
@@ -854,124 +854,155 @@ class PostgresDatabaseManager(BaseDatabaseManager):
             raise
                     
     async def initialize(self, force=False):
-        """Initialize the database with required tables."""
+        """Initialize the database with required tables using SQLAlchemy metadata."""
+        # Reset shutdown flag if forcing re-initialization
+        if force:
+            self._shutting_down = False
+        
         try:
+            # Ensure the database and engine exist before creating tables
+            if not await self.ensure_database_exists():
+                raise Exception("Failed to ensure database exists")
+            await self._initialize_engine() 
+            
+            # Create tables using metadata
+            bt.logging.info("Initializing database tables...")
+            try:
+                async with self.engine.begin() as conn:
+                    # NOTE: Drop logic now handled by MigrationManager based on setup.cfg
+                    # Use run_sync for the synchronous metadata.create_all method
+                    bt.logging.info("Creating tables if they don't exist (or recreating if forced by MigrationManager)...")
+                    await conn.run_sync(metadata.create_all)
+                bt.logging.info("Table creation/check completed.")
+            except Exception as e:
+                bt.logging.error(f"Error creating tables from metadata: {e}")
+                bt.logging.error(traceback.format_exc())
+                raise
+                
+            # Execute functions, triggers, and initial data within a session
             async with self.get_session() as session:
-                async with session.begin():
-                    # Create tables if they don't exist
-                    await session.execute(text("""
-                        CREATE TABLE IF NOT EXISTS db_version (
-                            version INTEGER PRIMARY KEY
-                        )
-                    """))
-
-                    await session.execute(text("""
-                        CREATE TABLE IF NOT EXISTS entropy_game_pools (
-                            game_id INTEGER,
-                            outcome INTEGER,
-                            pool_size REAL,
-                            PRIMARY KEY (game_id, outcome)
-                        )
-                    """))
-
-                    await session.execute(text("""
-                        CREATE TABLE IF NOT EXISTS entropy_predictions (
-                            prediction_id TEXT PRIMARY KEY,
-                            game_id INTEGER,
-                            outcome INTEGER,
-                            miner_uid INTEGER,
-                            odds REAL,
-                            wager REAL,
-                            prediction_date TEXT,
-                            entropy_contribution REAL,
-                            FOREIGN KEY (game_id, outcome) REFERENCES entropy_game_pools(game_id, outcome)
-                        )
-                    """))
-
-                    await session.execute(text("""
-                        CREATE TABLE IF NOT EXISTS entropy_miner_scores (
-                            miner_uid INTEGER,
-                            day INTEGER,
-                            contribution REAL,
-                            PRIMARY KEY (miner_uid, day)
-                        )
-                    """))
-
-                    await session.execute(text("""
-                        CREATE TABLE IF NOT EXISTS entropy_system_state (
-                            id INTEGER PRIMARY KEY CHECK (id = 1),
-                            current_day INTEGER,
-                            num_miners INTEGER,
-                            max_days INTEGER,
-                            last_processed_date TIMESTAMP
-                        )
-                    """))
-
+                async with session.begin(): # Use session.begin() for transaction context
+                    bt.logging.info("Creating functions and triggers...")
+                    # --- REMOVED ALL CREATE TABLE STATEMENTS --- 
+                    
+                    # --- REMOVED ALTER TABLE statement ---
+                    
                     # Create cleanup functions and triggers - each in a separate statement
-                    # 1. Create delete_old_predictions function
+                    # Ensure these are idempotent (CREATE OR REPLACE, DROP IF EXISTS)
+                    # 1. Create delete_old_predictions function (Assuming this relates to entropy_predictions)
                     await session.execute(text("""
-                        CREATE OR REPLACE FUNCTION delete_old_predictions() RETURNS TRIGGER AS $$
+                        CREATE OR REPLACE FUNCTION delete_old_entropy_predictions() RETURNS TRIGGER AS $$
                         BEGIN
                             DELETE FROM entropy_predictions
-                            WHERE prediction_date < NOW() - INTERVAL '45 days';
+                            WHERE prediction_date < (NOW() - INTERVAL '45 days');
                             RETURN NEW;
                         END;
-                        $$ LANGUAGE plpgsql
+                        $$ LANGUAGE plpgsql;
                     """))
 
                     # 2. Drop old trigger if exists - separate statement
                     await session.execute(text("""
-                        DROP TRIGGER IF EXISTS delete_old_predictions_trigger ON entropy_predictions
+                        DROP TRIGGER IF EXISTS delete_old_entropy_predictions_trigger ON entropy_predictions;
                     """))
 
                     # 3. Create new trigger - separate statement
                     await session.execute(text("""
-                        CREATE TRIGGER delete_old_predictions_trigger
+                        CREATE TRIGGER delete_old_entropy_predictions_trigger
                         AFTER INSERT ON entropy_predictions
-                        EXECUTE FUNCTION delete_old_predictions()
+                        FOR EACH ROW EXECUTE FUNCTION delete_old_entropy_predictions();
                     """))
-
-                    # 4. Create delete_old_game_pools function
+                    
+                    # --- Adding other triggers from old SQLite schema --- 
+                    # Adjusting for PostgreSQL syntax and potential table name differences
+                    
+                    # Trigger for predictions table (if needed, similar to entropy_predictions)
                     await session.execute(text("""
-                        CREATE OR REPLACE FUNCTION delete_old_game_pools() RETURNS TRIGGER AS $$
+                        CREATE OR REPLACE FUNCTION delete_old_predictions() RETURNS TRIGGER AS $$
                         BEGIN
-                            DELETE FROM entropy_game_pools
-                            WHERE game_id IN (
-                                SELECT DISTINCT game_id FROM entropy_predictions
-                                WHERE prediction_date < NOW() - INTERVAL '45 days'
-                            );
+                            DELETE FROM predictions
+                            WHERE prediction_date < (NOW() - INTERVAL '50 days');
                             RETURN NEW;
                         END;
-                        $$ LANGUAGE plpgsql
+                        $$ LANGUAGE plpgsql;
+                    """))
+                    await session.execute(text("DROP TRIGGER IF EXISTS delete_old_predictions_trigger ON predictions;"))
+                    await session.execute(text("""
+                        CREATE TRIGGER delete_old_predictions_trigger
+                        AFTER INSERT ON predictions
+                        FOR EACH ROW EXECUTE FUNCTION delete_old_predictions();
+                    """))
+                    
+                    # Trigger for game_data table
+                    await session.execute(text("""
+                        CREATE OR REPLACE FUNCTION delete_old_game_data() RETURNS TRIGGER AS $$
+                        BEGIN
+                            DELETE FROM game_data
+                            WHERE event_start_date < (NOW() - INTERVAL '50 days');
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                    """))
+                    await session.execute(text("DROP TRIGGER IF EXISTS delete_old_game_data_trigger ON game_data;"))
+                    await session.execute(text("""
+                        CREATE TRIGGER delete_old_game_data_trigger
+                        AFTER INSERT ON game_data
+                        FOR EACH ROW EXECUTE FUNCTION delete_old_game_data();
+                    """))
+                    
+                    # Trigger for score_state table
+                    await session.execute(text("""
+                        CREATE OR REPLACE FUNCTION delete_old_score_state() RETURNS TRIGGER AS $$
+                        BEGIN
+                            DELETE FROM score_state
+                            WHERE last_update_date < (NOW() - INTERVAL '7 days');
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                    """))
+                    await session.execute(text("DROP TRIGGER IF EXISTS delete_old_score_state_trigger ON score_state;"))
+                    await session.execute(text("""
+                        CREATE TRIGGER delete_old_score_state_trigger
+                        AFTER INSERT ON score_state
+                        FOR EACH ROW EXECUTE FUNCTION delete_old_score_state();
                     """))
 
-                    # 5. Drop old game pools trigger if exists - separate statement
+                    # Trigger for entropy_closed_games table 
                     await session.execute(text("""
-                        DROP TRIGGER IF EXISTS delete_old_game_pools_trigger ON entropy_game_pools
+                        CREATE OR REPLACE FUNCTION cleanup_old_entropy_closed_games() RETURNS TRIGGER AS $$
+                        BEGIN
+                            DELETE FROM entropy_closed_games
+                            WHERE close_time < (NOW() - INTERVAL '45 days');
+                            RETURN NEW;
+                        END;
+                        $$ LANGUAGE plpgsql;
                     """))
-
-                    # 6. Create new game pools trigger - separate statement
+                    await session.execute(text("DROP TRIGGER IF EXISTS cleanup_old_entropy_closed_games_trigger ON entropy_closed_games;"))
                     await session.execute(text("""
-                        CREATE TRIGGER delete_old_game_pools_trigger
-                        AFTER INSERT ON entropy_game_pools
-                        EXECUTE FUNCTION delete_old_game_pools()
+                        CREATE TRIGGER cleanup_old_entropy_closed_games_trigger
+                        AFTER INSERT ON entropy_closed_games
+                        FOR EACH ROW EXECUTE FUNCTION cleanup_old_entropy_closed_games();
                     """))
+                    
+                    # --- Removed cleanup for entropy_game_pools as it was complex and potentially incorrect ---
+                    # Revisit if specific cleanup logic for this table is needed.
 
                     # Insert initial version if not exists
+                    bt.logging.info("Ensuring database version is set...")
                     await session.execute(text("""
                         INSERT INTO db_version (version) VALUES (1)
-                        ON CONFLICT (version) DO NOTHING
+                        ON CONFLICT (version) DO NOTHING;
                     """))
+                    
+                    # Commit transaction handled by async with session.begin()
+                    bt.logging.info("Functions, triggers, and version check completed.")
 
-                    await session.commit()
-
-                bt.logging.info("Database initialization completed successfully")
+                bt.logging.info("Database initialization sequence completed successfully")
                 return True
 
         except Exception as e:
             bt.logging.error(f"Error during database initialization: {str(e)}")
-            if session and session.in_transaction():
-                await session.rollback()
+            bt.logging.error(traceback.format_exc()) # Log full traceback for initialization errors
+            # Rollback is handled by asynccontextmanager if session was active
             raise
             
     @asynccontextmanager

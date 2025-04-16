@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import bittensor as bt
 import json
 import os
-from ..database.database_manager import DatabaseManager
+from ..database.postgres_database_manager import PostgresDatabaseManager
 from .base_api_client import BaseAPIClient
 import aiohttp
 from sqlalchemy import text
@@ -13,7 +13,7 @@ import traceback
 
 
 class BettensorAPIClient(BaseAPIClient):
-    def __init__(self, db_manager: DatabaseManager):
+    def __init__(self, db_manager: PostgresDatabaseManager):
         super().__init__()
 
         self.base_url = "https://dev-bettensor-api.azurewebsites.net/"
@@ -177,7 +177,7 @@ class BettensorAPIClient(BaseAPIClient):
             bt.logging.error(f"Error details: {traceback.format_exc()}")
             return None
 
-    async def fetch_and_store_missing_game(self, game_id: str, db_manager: DatabaseManager) -> bool:
+    async def fetch_and_store_missing_game(self, game_id: str, db_manager: PostgresDatabaseManager) -> bool:
         """
         Fetch a missing game from the API and store it in the database.
         Returns True if game was successfully fetched and stored.

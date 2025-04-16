@@ -28,15 +28,18 @@ import async_timeout
 import random
 import copy
 import scipy.special
+from pathlib import Path
+import pandas as pd
+import pytz
 
-from bettensor.validator.database.database_manager import DatabaseManager
 from .scoring_data import ScoringData
 from .entropy_system import EntropySystem
+from bettensor.validator.database.postgres_database_manager import PostgresDatabaseManager
 
 class ScoringSystem:
     def __init__(
         self,
-        db_manager: DatabaseManager,
+        db_manager: PostgresDatabaseManager,
         num_miners: int = 256,
         max_days: int = 45,
         current_date: Optional[datetime] = None,
@@ -44,54 +47,39 @@ class ScoringSystem:
         min_stake_service = None,
     ):
         """
-        Initialize the ScoringSystem.
+        Initializes the scoring system.
         
         Args:
-            db_manager: Database manager instance for executing queries
-            num_miners (int): Number of miners in the system
-            max_days (int, optional): Maximum number of days to track. Defaults to 45.
-            current_date (datetime, optional): Current date to use. Defaults to None (uses current UTC date).
-            force_rebuild (bool, optional): Whether to force a rebuild of historical scores. Defaults to False.
-            min_stake_service (optional): Service for checking minimum stake requirements. Defaults to None.
+            db_manager: Instance of DatabaseManager for database access.
+            num_miners: Total number of miners in the subnet.
+            max_days: Number of days to store historical data.
+            current_date: Optional datetime object for the current date.
+            force_rebuild: Flag to force rebuilding of historical scores.
+            min_stake_service: Instance of MinStakeService.
         """
-        # Common attributes
         self.db_manager = db_manager
         self.num_miners = num_miners
         self.max_days = max_days
-        self.force_rebuild = force_rebuild
-        self.validator = None
-        self.miner_data = None
-        self.min_stake_service = min_stake_service  # Ensure this is set
-        
-        # Set current date
-        if current_date is None:
-            current_date = datetime.now(timezone.utc)
-        self.current_date = current_date.replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-        )
-        self.current_day = self.current_date.timetuple().tm_yday % self.max_days
+        self.current_date = self._ensure_datetime(current_date or datetime.now(timezone.utc))
+        self.min_stake_service = min_stake_service
+        self.force_rebuild = force_rebuild # Store force_rebuild flag
 
         # Initialize arrays
+        self.tiers = np.ones((num_miners, max_days), dtype=np.int8) # Track tier per miner per day
         self.clv_scores = np.zeros((num_miners, max_days), dtype=np.float32)
         self.roi_scores = np.zeros((num_miners, max_days), dtype=np.float32)
         self.sortino_scores = np.zeros((num_miners, max_days), dtype=np.float32)
         self.entropy_scores = np.zeros((num_miners, max_days), dtype=np.float32)
         self.composite_scores = np.zeros((num_miners, max_days, 6), dtype=np.float32)  # 6 = daily + 5 tiers
         self.amount_wagered = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.tiers = np.ones((num_miners, max_days), dtype=np.int32)
-
-        # Scoring weights
-        self.clv_weight = 0.3
-        self.roi_weight = 0.3
-        self.sortino_weight = 0.3
-        self.entropy_weight = 0.1
-        self.entropy_window = self.max_days
-
-        # Additional attributes from both init methods
-        self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager)
+        
+        # Common attributes
+        self.validator = None
+        self.miner_data = None
         self.incentives = []
         self.last_update_date = None
         self.scoring_data = None
+        self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager) # ADD THIS LINE
         
         self.num_tiers = 7  # 5 tiers + 2 for invalid UIDs (0) and empty network slots (-1)
         self.valid_uids = set()
@@ -163,6 +151,13 @@ class ScoringSystem:
         """Set the validator instance and initialize ScoringData."""
         self.validator = validator
         self.scoring_data = ScoringData(self)
+        # Populate hotkey_map using the validator's metagraph
+        if hasattr(validator, 'metagraph') and validator.metagraph is not None:
+             self.hotkey_map = {i: hotkey for i, hotkey in enumerate(validator.metagraph.hotkeys)}
+             bt.logging.info(f"Hotkey map populated with {len(self.hotkey_map)} entries.")
+        else:
+             self.hotkey_map = {}
+             bt.logging.warning("Could not populate hotkey map: Validator metagraph not available.")
         
     async def populate_amount_wagered(self):
         """Populate the amount_wagered array from raw prediction data."""
@@ -176,7 +171,7 @@ class ScoringSystem:
                 self.current_date = self.current_date.replace(tzinfo=timezone.utc)
             
             # Get predictions for the last max_days days
-            cutoff_date = (self.current_date - timedelta(days=self.max_days)).isoformat()
+            cutoff_date_dt = self.current_date - timedelta(days=self.max_days) # Keep as datetime object
             query = """
                 SELECT 
                     miner_uid,
@@ -197,7 +192,7 @@ class ScoringSystem:
             # Get prediction data
             params = {
                 "miner_uid": str(self.num_miners),  # Convert to string for PostgreSQL
-                "start_date": cutoff_date
+                "start_date": cutoff_date_dt # Pass the datetime object
             }
             results = await self.db_manager.fetch_all(query, params)
             bt.logging.info(f"Found {len(results)} days of prediction data")
@@ -1208,11 +1203,11 @@ class ScoringSystem:
                     # Convert data to proper format
                     params = {
                         'current_day': self.current_day,
-                        'current_date': self.current_date.isoformat() if self.current_date else None,
-                        'reference_date': self.reference_date.isoformat(),
+                        'current_date': self.current_date, # Pass datetime object directly
+                        'reference_date': self.reference_date, # Pass datetime object directly
                         'invalid_uids': json.dumps(list(int(uid) for uid in self.invalid_uids)),
                         'valid_uids': json.dumps(list(int(uid) for uid in self.valid_uids)),
-                        'last_update_date': self.last_update_date.isoformat() if self.last_update_date else None,
+                        'last_update_date': self.last_update_date, # Pass date object directly
                         'amount_wagered': json.dumps(self.amount_wagered.tolist()),
                         'tiers': json.dumps(self.tiers.tolist())
                     }
@@ -1396,50 +1391,77 @@ class ScoringSystem:
             raise
 
     async def save_scores(self):
-        score_records = []
-        column_names = ['miner_uid', 'day_id', 'score_type', 'clv_score', 'roi_score', 
+        score_records_dicts = [] # Change to list of dictionaries
+        # Define column names explicitly for dictionary keys
+        column_names = ['miner_uid', 'miner_hotkey', 'day_id', 'score_type', 'clv_score', 'roi_score', 
                        'entropy_score', 'composite_score', 'sortino_score']
         
+        hotkey_available = hasattr(self, 'hotkey_map') and self.hotkey_map
+        if not hotkey_available:
+             bt.logging.warning("Hotkey map not found in ScoringSystem. Cannot save hotkeys in scores table.")
+             # Remove hotkey column if map not available
+             column_names.remove('miner_hotkey') 
+
         for miner in range(self.num_miners):
-            # Daily scores
-            score_records.append((
-                miner,
-                self.current_day,
-                'daily',
-                float(self.clv_scores[miner, self.current_day]),
-                float(self.roi_scores[miner, self.current_day]),
-                float(self.entropy_scores[miner, self.current_day]),
-                float(self.composite_scores[miner, self.current_day, 0]),
-                float(self.sortino_scores[miner, self.current_day])
-            ))
+            hotkey = self.hotkey_map.get(miner) if hotkey_available else None
+
+            # Daily scores - Create dictionary
+            daily_record_dict = {
+                'miner_uid': miner,
+                'day_id': self.current_day,
+                'score_type': 'daily',
+                'clv_score': float(self.clv_scores[miner, self.current_day]),
+                'roi_score': float(self.roi_scores[miner, self.current_day]),
+                'entropy_score': float(self.entropy_scores[miner, self.current_day]),
+                'composite_score': float(self.composite_scores[miner, self.current_day, 0]),
+                'sortino_score': float(self.sortino_scores[miner, self.current_day])
+            }
+            if hotkey_available:
+                daily_record_dict['miner_hotkey'] = hotkey # Add hotkey if available
+            score_records_dicts.append(daily_record_dict)
             
-            # Tier-specific scores
+            # Tier-specific scores - Create dictionary
             for tier_idx in range(1, self.composite_scores.shape[2]):
                 if tier_idx in self.tier_mapping:
-                    score_records.append((
-                        miner,
-                        self.current_day,
-                        self.tier_mapping[tier_idx],
-                        None,  # clv_score
-                        None,  # roi_score
-                        None,  # entropy_score
-                        float(self.composite_scores[miner, self.current_day, tier_idx]),
-                        None   # sortino_score
-                    ))
+                    tier_record_dict = {
+                        'miner_uid': miner,
+                        'day_id': self.current_day,
+                        'score_type': self.tier_mapping[tier_idx],
+                        'clv_score': None,  # clv_score
+                        'roi_score': None,  # roi_score
+                        'entropy_score': None,  # entropy_score
+                        'composite_score': float(self.composite_scores[miner, self.current_day, tier_idx]),
+                        'sortino_score': None   # sortino_score
+                    }
+                    if hotkey_available:
+                         tier_record_dict['miner_hotkey'] = hotkey # Add hotkey if available
+                    score_records_dicts.append(tier_record_dict)
 
-        # Use executemany with column names
+        # Build the query string dynamically based on whether hotkey is available
+        insert_columns_str = f"({', '.join(column_names)})"
+        value_placeholders_str = f"({', '.join([f':{col}' for col in column_names])})"
+        # Determine conflict target based on actual columns being inserted
+        conflict_target_cols = ['miner_uid', 'day_id', 'score_type']
+        if hotkey_available:
+             conflict_target_cols.append('miner_hotkey')
+        conflict_target_str = f"({', '.join(conflict_target_cols)})"
+
+        # Correct f-string formatting
+        insert_query = f"""INSERT INTO scores 
+           {insert_columns_str}
+           VALUES {value_placeholders_str}
+           ON CONFLICT {conflict_target_str} DO UPDATE SET 
+           clv_score=excluded.clv_score,
+           roi_score=excluded.roi_score,
+           entropy_score=excluded.entropy_score,
+           composite_score=excluded.composite_score,
+           sortino_score=excluded.sortino_score"""
+
+        # Use executemany with list of dictionaries
         await self.db_manager.executemany(
-            """INSERT INTO scores 
-               (miner_uid, day_id, score_type, clv_score, roi_score, entropy_score, composite_score, sortino_score)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(miner_uid, day_id, score_type) DO UPDATE SET
-               clv_score=excluded.clv_score,
-               roi_score=excluded.roi_score,
-               entropy_score=excluded.entropy_score,
-               composite_score=excluded.composite_score,
-               sortino_score=excluded.sortino_score""",
-            score_records,
-            column_names=column_names
+            insert_query,
+            score_records_dicts,
+            column_names=None # Not needed when passing list of dicts
         )
 
     async def load_scores(self, skip_rebuild=False):
@@ -1486,15 +1508,17 @@ class ScoringSystem:
                     FROM predictions p
                     JOIN game_data g ON p.game_id = g.external_id
                     WHERE 
-                        p.prediction_date >= ? 
-                        AND p.prediction_date <= ?
+                        -- p.prediction_date >= ? 
+                        -- AND p.prediction_date <= ?
+                        p.prediction_date >= :start_date 
+                        AND p.prediction_date <= :end_date
                         AND g.outcome IS NOT NULL
-                        AND g.outcome != 'Unfinished'
+                        AND g.outcome != 3
                 """
-                params = (
-                    (self.current_date - timedelta(days=self.max_days)).isoformat(),
-                    self.current_date.isoformat()
-                )
+                params = {
+                    "start_date": (self.current_date - timedelta(days=45)), # Pass datetime object directly
+                    "end_date": self.current_date # Pass datetime object directly
+                }
                 
                 pred_result = await self.db_manager.fetch_one(check_predictions_query, params)
                 
@@ -1530,13 +1554,14 @@ class ScoringSystem:
                 oldest_result = await self.db_manager.fetch_one(
                     oldest_prediction_query, 
                     {
-                        "start_date": (self.current_date - timedelta(days=45)).isoformat(),
-                        "end_date": self.current_date.isoformat()
+                        "start_date": (self.current_date - timedelta(days=45)), # Pass datetime object directly
+                        "end_date": self.current_date # Pass datetime object directly
                     }
                 )
                 
                 if oldest_result and oldest_result['oldest_date']:
-                    oldest_date = datetime.fromisoformat(oldest_result['oldest_date']).date()
+                    # oldest_result['oldest_date'] is already a datetime object from asyncpg
+                    oldest_date = oldest_result['oldest_date'].date() # Just get the date part
                     days_since_oldest = (self.current_date.date() - oldest_date).days
                     oldest_day_index = (current_day_index - min(days_since_oldest, self.max_days - 1)) % self.max_days
                 else:
@@ -1585,7 +1610,8 @@ class ScoringSystem:
                     )
                     
                     # Only rebuild if less than 60% of entries are valid
-                    completeness_ratio = result['valid_entries'] / expected_entries if expected_entries > 0 else 0
+                    valid_entries_count = result['valid_entries'] if result['valid_entries'] is not None else 0
+                    completeness_ratio = valid_entries_count / expected_entries if expected_entries > 0 else 0
                     if completeness_ratio < 0.6 or self.force_rebuild:  # Less than 60% complete or force rebuild
                         bt.logging.warning(f"Score completeness ratio ({completeness_ratio:.1%}) below 60% or force rebuild enabled, initiating rebuild...")
                         await self.rebuild_historical_scores()
@@ -1631,6 +1657,7 @@ class ScoringSystem:
                         tier_index = list(self.tier_mapping.values()).index(score_type)
                         if 1 <= tier_index < self.composite_scores.shape[2]:
                             self.composite_scores[miner_uid, day_id, tier_index] = score["composite_score"] or 0.0
+            
             
             bt.logging.info(f"Populated {populated_count} score entries from database")
                 
@@ -2079,72 +2106,14 @@ class ScoringSystem:
                 process_date = current_date
                 bt.logging.info(f"Processing date: {process_date.date()}")
                 
-                # First get all predictions for the day
-                predictions_query = """
-                    SELECT p.*
-                    FROM predictions p
-                    WHERE DATE(p.prediction_date) = :process_date
-                    ORDER BY p.prediction_date ASC
-                """
-                
-                day_predictions = await self.db_manager.fetch_all(
-                    predictions_query, 
-                    {"process_date": process_date.date()}  # Pass the actual date object
-                )
-                
-                if not day_predictions:
-                    bt.logging.info(f"No predictions found for {process_date.date()}")
-                    current_date += timedelta(days=1)
-                    continue
-                
-                # Get unique game IDs from predictions
-                game_ids = list(set(str(p["game_id"]) for p in day_predictions))
-                
-                # Convert game_ids to integers if they are numeric
-                numeric_game_ids = []
-                for game_id in game_ids:
-                    try:
-                        numeric_game_ids.append(int(game_id))
-                    except (ValueError, TypeError):
-                        bt.logging.warning(f"Non-numeric game ID found: {game_id}")
-                        continue
-                
-                if not numeric_game_ids:
-                    bt.logging.warning("No valid numeric game IDs found")
-                    current_date += timedelta(days=1)
-                    continue
-                
-                # Then get the games data
-                games_query = """
-                    SELECT g.*
-                    FROM game_data g
-                    WHERE g.external_id = ANY(:game_ids)
-                    AND g.outcome IS NOT NULL
-                    AND (
-                        CASE 
-                            WHEN CAST(g.outcome AS TEXT) ~ '^[0-9]+$' THEN -- Cast outcome to TEXT for regex match
-                                CAST(g.outcome AS INTEGER) != 3
-                            ELSE 
-                                CAST(g.outcome AS TEXT) != 'Unfinished' -- Also cast here for consistency
-                        END
-                    )
-                    ORDER BY g.event_start_date ASC
-                """
-                
-                params = {"game_ids": numeric_game_ids}
-                day_games = await self.db_manager.fetch_all(games_query, params)
+                # Get date string for the day
+                date_str = process_date.strftime('%Y-%m-%d')
+                # Fetch predictions and games are now done *inside* process_day_predictions
 
-                bt.logging.info(
-                    f"Found for {process_date.date()}: {len(day_games)} games with outcomes, "
-                    f"{len(day_predictions)} predictions"
-                )
-
-                if not day_games:
-                    current_date += timedelta(days=1)
-                    continue
-                
-                # Process the predictions and games
-                await self.process_day_predictions(day_predictions, day_games)
+                # --- Corrected Call --- 
+                # Process the predictions and games for the day using the date string
+                await self.process_day_predictions(date_str) 
+                # --- End Correction ---
                 
                 current_date += timedelta(days=1)
                 
@@ -2382,32 +2351,97 @@ class ScoringSystem:
         date_str = date.strftime("%Y-%m-%d")
         bt.logging.trace(f"=== Completed scoring run for date: {date_str} ===")
 
-    async def process_day_predictions(self, day_predictions, day_games):
+    async def process_day_predictions(self, date_str):
         """Process predictions and games for a specific day during historical rebuild."""
         try:
-            # Format game data for validation
-            game_data = {}
-            for game in day_games:
-                game_id = game['external_id']
-                game_data[game_id] = {
-                    'external_id': game_id,
-                    'team_a': game['team_a'],
-                    'team_b': game['team_b'],
-                    'team_a_odds': game['team_a_odds'],
-                    'team_b_odds': game['team_b_odds'],
-                    'tie_odds': game['tie_odds'],
-                    'event_start_date': game['event_start_date'],
-                    'outcome': game['outcome']
+            # Convert date_str to datetime objects for start/end of day
+            try:
+                start_of_day_dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            except ValueError:
+                 # Try parsing with timezone if already included
+                 start_of_day_dt = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+            start_of_next_day_dt = start_of_day_dt + timedelta(days=1)
+
+            # Fetch predictions for the specific day first
+            predictions_query = """
+                SELECT p.*
+                FROM predictions p
+                WHERE p.prediction_date >= :start_of_day
+                AND p.prediction_date < :start_of_next_day
+                ORDER BY p.prediction_date ASC
+            """
+            day_predictions = await self.db_manager.fetch_all(
+                predictions_query, 
+                {
+                    "start_of_day": start_of_day_dt, # Use datetime objects
+                    "start_of_next_day": start_of_next_day_dt
                 }
+            )
+
+            if not day_predictions:
+                 bt.logging.info(f"No predictions found for {date_str}")
+                 return np.zeros(self.num_miners), np.array([]), np.zeros(self.num_miners) # Return empty values
+            
+            # Extract unique game IDs from predictions
+            game_ids = list(set(str(p["game_id"]) for p in day_predictions)) # Ensure IDs are strings
+            # Convert game_ids to integers if they are numeric
+            numeric_game_ids = []
+            for game_id in game_ids:
+                try:
+                    numeric_game_ids.append(int(game_id))
+                except (ValueError, TypeError):
+                    bt.logging.warning(f"Non-numeric game ID found during extraction: {game_id}")
+                    continue
+            
+            if not numeric_game_ids:
+                bt.logging.warning(f"No valid numeric game IDs extracted from predictions for {date_str}")
+                return np.zeros(self.num_miners), np.array([]), np.zeros(self.num_miners) # Return empty values
+
+            # Now fetch game data using the extracted numeric_game_ids
+            games_query = """
+                SELECT g.*
+                FROM game_data g
+                WHERE g.external_id = ANY(:game_ids) -- Use the extracted IDs
+                AND g.outcome IS NOT NULL
+                AND (
+                    CASE 
+                        WHEN CAST(g.outcome AS TEXT) ~ '^[0-9]+$' THEN -- Cast outcome to TEXT for regex match
+                            CAST(g.outcome AS INTEGER) != 3
+                        ELSE 
+                            CAST(g.outcome AS TEXT) != 'Unfinished' -- Also cast here for consistency
+                    END
+                )
+                ORDER BY g.event_start_date ASC
+            """
+            # Pass the extracted game_ids to the query parameters
+            day_games = await self.db_manager.fetch_all(games_query, {"game_ids": numeric_game_ids})
+            
+            # --- Debug Logging remains --- 
+            bt.logging.debug(f"Fetched day_games for {date_str}: type={type(day_games)}, len={len(day_games) if isinstance(day_games, list) else 'N/A'}")
+            if isinstance(day_games, list) and len(day_games) > 0:
+                bt.logging.debug(f"First element of day_games: type={type(day_games[0])}, value={str(day_games[0])[:200]}...")
+            elif not isinstance(day_games, list):
+                 bt.logging.warning(f"day_games is not a list! Value: {day_games}")
+            # --- End Debug Logging ---
+
+            if not day_games:
+                bt.logging.warning(f"No finished games found for the predicted game IDs on {date_str}")
+                return np.zeros(self.num_miners), np.array([]), np.zeros(self.num_miners) # Return empty values
             
             # Validate historical predictions
-            valid_predictions, validation_stats = await self.miner_data.validate_historical_predictions(
-                day_predictions, game_data
-            )
-            
+            try:
+                valid_predictions, validation_stats = await self.miner_data.validate_historical_predictions(
+                    day_predictions,
+                    day_games 
+                )
+            except Exception as e:
+                bt.logging.error(f"Error validating historical predictions: {e}")
+                bt.logging.error(traceback.format_exc())
+                return np.zeros(self.num_miners), np.array([]), np.zeros(self.num_miners)
+
             if not valid_predictions:
                 bt.logging.warning(f"No valid predictions found after validation")
-                return
+                return np.zeros(self.num_miners), np.array([]), np.zeros(self.num_miners)
             
             # Format arrays for score calculation using only valid predictions
             pred_array = np.array([

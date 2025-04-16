@@ -11,7 +11,7 @@ from .sports_config import sports_config
 from datetime import datetime, timedelta, timezone
 from ..scoring.entropy_system import EntropySystem
 from .bettensor_api_client import BettensorAPIClient
-from bettensor.validator.database.database_manager import DatabaseManager
+from ..database.postgres_database_manager import PostgresDatabaseManager
 import traceback
 import asyncio
 import async_timeout
@@ -33,7 +33,7 @@ class SportsData:
     
     def __init__(
         self,
-        db_manager: DatabaseManager,
+        db_manager: PostgresDatabaseManager,
         entropy_system: EntropySystem,
         api_client,
     ):
@@ -87,6 +87,21 @@ class SportsData:
             # Process entropy updates in small batches with independent timeouts
             if entropy_updates_needed:
                 await self._process_entropy_updates_in_batches(entropy_updates_needed)
+            
+            # --- Save Entropy System State ONCE --- 
+            if entropy_updates_needed:
+                 bt.logging.info("Attempting to save final entropy system state...")
+                 try:
+                     async with async_timeout.timeout(180): # Give ample time for the final save
+                          if await self.entropy_system.save_state():
+                               bt.logging.info("Successfully saved final entropy system state.")
+                          else:
+                               bt.logging.error("Failed to save final entropy system state.")
+                 except asyncio.TimeoutError:
+                      bt.logging.error("Timeout saving final entropy system state.")
+                 except Exception as e:
+                      bt.logging.error(f"Error saving final entropy system state: {e}")
+            # --- End Final Save ---
             
             # Update last processed time only if we had successful updates
             if inserted_ids:
@@ -176,13 +191,22 @@ class SportsData:
                         3  # Default to Unfinished
                     )
                     
-                    # Get event start date, trying both keys
+                    # Get event start date, trying multiple common keys
                     event_start_date_str = game.get('eventStartDate')
                     if not event_start_date_str:
-                        event_start_date_str = game.get('event_start_date') # Fallback key
-                    
+                        event_start_date_str = game.get('event_start_date')
                     if not event_start_date_str:
-                        bt.logging.warning(f"Skipping game {external_id}: Missing 'eventStartDate' or 'event_start_date' key")
+                        event_start_date_str = game.get('eventDate')
+                    if not event_start_date_str:
+                         event_start_date_str = game.get('startDate')
+                    if not event_start_date_str:
+                         event_start_date_str = game.get('start_date')
+                    if not event_start_date_str:
+                         event_start_date_str = game.get('date') # Try 'date' as well
+
+                    if not event_start_date_str:
+                        # Log the entire game dictionary for debugging
+                        bt.logging.warning(f"Skipping game {external_id}: Missing expected start date key. Raw game data: {game}")
                         continue
 
                     # Ensure the date is parsed correctly (assuming ISO format)
@@ -192,32 +216,19 @@ class SportsData:
                         bt.logging.warning(f"Skipping game {external_id}: Invalid date format '{event_start_date_str}'")
                         continue
 
-                    # Prepare game data
-                    game_data = {
-                        'external_id': external_id,
-                        'team_a': game.get('teamA'), # Use .get() for safety
-                        'team_b': game.get('teamB'),
-                        'team_a_odds': team_a_odds,
-                        'team_b_odds': team_b_odds,
-                        'tie_odds': tie_odds,
-                        'can_tie': bool(game.get('canTie', False)),
-                        'event_start_date': event_start_date.isoformat(), # Store as ISO string
-                        'create_date': datetime.now(timezone.utc).isoformat(),
-                        'last_update_date': datetime.now(timezone.utc).isoformat(),
-                        'sport': game.get('sport'),
-                        'league': game.get('league'),
-                        'outcome': outcome,
-                        'active': 1
-                    }
+                    # Use _prepare_game_params to get the correct dictionary with game_id
+                    game_data_params = self._prepare_game_params(game)
+                    if not game_data_params:
+                        continue # Skip if preparation failed
                     
-                    # Insert or update the game
+                    # Insert or update the game - Ensure query includes game_id
                     query = """
                         INSERT INTO game_data (
-                            external_id, team_a, team_b, team_a_odds, team_b_odds,
+                            game_id, external_id, team_a, team_b, team_a_odds, team_b_odds,
                             tie_odds, can_tie, event_start_date, create_date,
                             last_update_date, sport, league, outcome, active
                         ) VALUES (
-                            :external_id, :team_a, :team_b, :team_a_odds, :team_b_odds,
+                            :game_id, :external_id, :team_a, :team_b, :team_a_odds, :team_b_odds,
                             :tie_odds, :can_tie, :event_start_date, :create_date,
                             :last_update_date, :sport, :league, :outcome, :active
                         )
@@ -231,7 +242,7 @@ class SportsData:
                             last_update_date = EXCLUDED.last_update_date
                     """
                     
-                    await self.db_manager.execute(query, game_data)
+                    await self.db_manager.execute_query(query, game_data_params)
                     inserted_ids.append(external_id)
                     
                 except Exception as e:
@@ -286,20 +297,21 @@ class SportsData:
                 bt.logging.error(f"Error updating entropy system for batch {i//self.ENTROPY_BATCH_SIZE + 1}: {str(e)}")
                 continue
             
-            # Then try to save state with retries
-            retries = 0
-            while retries < self.MAX_RETRIES:
-                try:
-                    # Use a separate long-running session for entropy state save
-                    async with self.db_manager.get_long_running_session() as session:
-                        await self.entropy_system.save_state()
-                        bt.logging.debug(f"Saved entropy state for batch {i//self.ENTROPY_BATCH_SIZE + 1}")
-                        break
-                except Exception as e:
-                    bt.logging.error(f"Error saving entropy state (attempt {retries + 1}): {str(e)}")
-                    retries += 1
-                    if retries == self.MAX_RETRIES:
-                        bt.logging.error("Failed to save entropy state after max retries")
+            # REMOVED state saving from within this loop
+            # # Then try to save state with retries
+            # retries = 0
+            # while retries < self.MAX_RETRIES:
+            #     try:
+            #         # Use a separate long-running session for entropy state save
+            #         async with self.db_manager.get_long_running_session() as session:
+            #             await self.entropy_system.save_state()
+            #             bt.logging.debug(f"Saved entropy state for batch {i//self.ENTROPY_BATCH_SIZE + 1}")
+            #             break
+            #     except Exception as e:
+            #         bt.logging.error(f"Error saving entropy state (attempt {retries + 1}): {str(e)}")
+            #         retries += 1
+            #         if retries == self.MAX_RETRIES:
+            #             bt.logging.error("Failed to save entropy state after max retries")
 
     async def insert_or_update_games(self, games, session):
         """Insert or update games in the database using the provided session"""
@@ -350,28 +362,52 @@ class SportsData:
     def _prepare_game_params(self, game):
         """Prepare parameters for game insertion or update."""
         try:
-            # Handle eventStartDate - check both camelCase and snake_case versions
-            event_start_date = game.get('eventStartDate') or game.get('event_start_date')
-            if not event_start_date:
-                bt.logging.error(f"Missing eventStartDate in game data: {game}")
+            # Handle eventStartDate - check camelCase, snake_case, and 'date' keys
+            event_start_date_str = game.get('eventStartDate') or game.get('event_start_date') or game.get('date')
+            if not event_start_date_str:
+                bt.logging.error(f"Missing expected start date key in game data: {game}")
                 return None
+                
+            # Ensure the date is parsed correctly (assuming ISO format)
+            try:
+                event_start_date = datetime.fromisoformat(event_start_date_str.replace("Z", "+00:00"))
+            except ValueError:
+                bt.logging.warning(f"Skipping game {game.get('externalId')}: Invalid date format '{event_start_date_str}'")
+                return None
+
+            # Convert odds to float values safely
+            team_a_odds = float(game.get('teamAOdds', 0.0) or 0.0)
+            team_b_odds = float(game.get('teamBOdds', 0.0) or 0.0)
+            # Handle potential None or 0 for tieOdds before converting
+            tie_odds_raw = game.get('tieOdds')
+            tie_odds = float(tie_odds_raw) if tie_odds_raw is not None else None
+
+            # Convert outcome to integer
+            outcome_str = game.get('outcome')
+            outcome = (
+                0 if outcome_str == 'TeamAWin' else
+                1 if outcome_str == 'TeamBWin' else
+                2 if outcome_str == 'Draw' else
+                4 if outcome_str == 'Cancelled' else # Handle Cancelled
+                3  # Default to Unfinished/None
+            )
 
             return {
                 'game_id': str(uuid.uuid4()),
-                'external_id': str(game['externalId']),
-                'team_a': game['teamA'],
-                'team_b': game['teamB'],
-                'team_a_odds': float(game.get('teamAOdds', 0.0)),
-                'team_b_odds': float(game.get('teamBOdds', 0.0)),
-                'tie_odds': float(game.get('tieOdds', 0.0)),
+                'external_id': int(game['externalId']), # Ensure external_id is int
+                'team_a': game.get('teamA'),
+                'team_b': game.get('teamB'),
+                'team_a_odds': team_a_odds,
+                'team_b_odds': team_b_odds,
+                'tie_odds': tie_odds,
                 'can_tie': bool(game.get('canTie', False)),
-                'event_start_date': event_start_date,
-                'create_date': datetime.now(timezone.utc).isoformat(),
-                'last_update_date': datetime.now(timezone.utc).isoformat(),
-                'sport': game['sport'],
-                'league': game['league'],
-                'outcome': int(game.get('outcome', 3)),
-                'active': int(game.get('active', 1))
+                'event_start_date': event_start_date, # Pass datetime object
+                'create_date': datetime.now(timezone.utc), # Pass datetime object
+                'last_update_date': datetime.now(timezone.utc), # Pass datetime object
+                'sport': game.get('sport'),
+                'league': game.get('league'),
+                'outcome': outcome,
+                'active': True # Use boolean True
             }
         except KeyError as e:
             bt.logging.error(f"Missing required field in game data: {e}")

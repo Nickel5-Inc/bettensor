@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy import text
 import torch
 from bettensor.protocol import GameData, TeamGame, TeamGamePrediction
-from bettensor.validator.database.database_manager import DatabaseManager
+from ..database.postgres_database_manager import PostgresDatabaseManager
 import time
 
 from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
@@ -31,7 +31,7 @@ class MinerDataMixin:
     EPSILON = 5.0  # For historical validation, allowing larger differences
     NEW_SUBMISSION_EPSILON = 0.01  # For new submissions, requiring closer matches
 
-    def __init__(self, db_manager, metagraph, processed_uids):
+    def __init__(self, db_manager: PostgresDatabaseManager, metagraph, processed_uids):
         self.db_manager = db_manager
         self.metagraph = metagraph
         self.processed_uids = processed_uids
@@ -651,8 +651,8 @@ class MinerDataMixin:
             """
             
             params = {
-                "start_date": start_date.isoformat(),
-                "end_date": end_date.isoformat()
+                "start_date": start_date,
+                "end_date": end_date
             }
             
             rows = await self.db_manager.fetch_all(query, params)
@@ -748,14 +748,17 @@ class MinerDataMixin:
                 if current_time >= datetime.fromisoformat(game['event_start_date']).replace(tzinfo=timezone.utc):
                     return False, "Game has already started", 'game_started', -1
 
-            # Validate team names match game data
-            submitted_team_a = prediction_data.get('team_a')
-            submitted_team_b = prediction_data.get('team_b')
-            if submitted_team_a != game['team_a'] or submitted_team_b != game['team_b']:
-                return False, "Submitted team names do not match game data", 'team_mismatch', -1
+            # --- Conditional Team Name Validation --- 
+            # Validate team names match game data ONLY for new submissions
+            if not historical_validation: 
+                submitted_team_a = prediction_data.get('team_a')
+                submitted_team_b = prediction_data.get('team_b')
+                if submitted_team_a != game['team_a'] or submitted_team_b != game['team_b']:
+                    # Keep the strict check for new predictions
+                    return False, "Submitted team names do not match game data", 'team_mismatch', -1
+            # --- End Conditional Team Name Validation ---
 
             # Validate submitted odds match game data with proper rounding
-            # Use a much smaller epsilon for new submissions, only be lenient for historical validation
             submitted_team_a_odds = float(prediction_data.get('team_a_odds'))
             submitted_team_b_odds = float(prediction_data.get('team_b_odds'))
             game_team_a_odds = float(game['team_a_odds'])
@@ -834,222 +837,166 @@ class MinerDataMixin:
 
     async def validate_historical_predictions(self, predictions, game_data):
         """Validate historical predictions and fix any issues found."""
-        try:
-            if not predictions or not game_data:
-                return [], {}
+        bt.logging.info(f"Starting historical validation of {len(predictions)} predictions")
+        valid_predictions = []
+        predictions_to_delete = []
+        daily_wager_totals = defaultdict(lambda: defaultdict(float)) # miner_uid -> date_str -> total_wager
+        existing_prediction_ids = set()
 
-            bt.logging.info(f"Starting historical validation of {len(predictions)} predictions")
+        # Pre-fetch existing predictions efficiently if needed (if checking duplicates here)
+        # This might be redundant if checks are done elsewhere
+
+        # Cache game data for faster lookups
+        bt.logging.debug(f"Building game cache. Type of game_data: {type(game_data)}")
+        try:
+            # Convert to list for safety and logging
+            game_data_list = list(game_data) 
+            bt.logging.debug(f"Content of game_data (first 5 elements): {str(game_data_list[:5])[:1000]}...") # Log first 5, limit length
             
-            # Group predictions by date and miner for chronological processing
-            predictions_by_date_miner = defaultdict(lambda: defaultdict(list))
-            predictions_to_delete = []
-            valid_predictions = []
-            
-            # Get current date in UTC for comparison
-            current_date = datetime.now(timezone.utc).date()
-            
-            # First, get ALL predictions for the dates we're processing
-            all_dates = set()
-            all_miners = set()
+            self._game_cache = {}
+            for i, g in enumerate(game_data_list):
+                bt.logging.debug(f"Processing game_data item #{i}: type={type(g)}, value={str(g)[:200]}...")
+                if not isinstance(g, dict):
+                     bt.logging.error(f"CRITICAL: Item #{i} in game_data is not a dict! Skipping cache build for this item.")
+                     continue # Skip this item if it's not a dict
+                external_id = g['external_id'] 
+                self._game_cache[str(external_id)] = g
+                
+        except TypeError as te:
+             # This block might catch the error if the check above isn't sufficient
+             bt.logging.error(f"TypeError during game cache creation loop: {te}")
+             bt.logging.error(f"Problematic item 'g' at index {i}: type={type(g)}, value={g}") 
+             # Decide how to proceed: re-raise, return empty, or continue?
+             # For now, let's raise to halt execution and see the error context clearly.
+             raise te 
+        except Exception as e:
+            bt.logging.error(f"Unexpected error building game cache: {e}")
+            raise e # Re-raise other errors
+
+        # --- Existing validation logic starts here --- 
+        validation_stats = defaultdict(int)
+        try:
             for pred in predictions:
-                # Convert prediction_date to UTC date for consistent grouping
-                pred_datetime = datetime.fromisoformat(pred['prediction_date'])
+                miner_uid = pred['miner_uid']
+                prediction_id = pred['prediction_id']
+                
+                # --- Type Check for prediction_date --- 
+                raw_pred_date = pred['prediction_date']
+                if isinstance(raw_pred_date, datetime):
+                    pred_datetime = raw_pred_date
+                elif isinstance(raw_pred_date, str):
+                    try:
+                        # Ensure timezone info is handled if string format varies
+                        if raw_pred_date.endswith('Z'):
+                            pred_datetime = datetime.fromisoformat(raw_pred_date.replace('Z', '+00:00'))
+                        else:
+                            # Attempt direct parsing, may need refinement if formats vary
+                            pred_datetime = datetime.fromisoformat(raw_pred_date)
+                    except ValueError:
+                         bt.logging.warning(f"Could not parse prediction_date string '{raw_pred_date}' for prediction {prediction_id}. Skipping.")
+                         predictions_to_delete.append(prediction_id)
+                         continue
+                elif isinstance(raw_pred_date, date): # Handle date objects if they occur
+                    pred_datetime = datetime.combine(raw_pred_date, datetime.min.time(), tzinfo=timezone.utc)
+                else:
+                    # Handle None or other unexpected types
+                    bt.logging.warning(f"Unexpected type for prediction_date ({type(raw_pred_date)}) for prediction {prediction_id}. Skipping.")
+                    predictions_to_delete.append(prediction_id)
+                    continue
+                # --- End Type Check --- 
+                
+                # Ensure pred_datetime is timezone-aware (assume UTC if naive)
                 if pred_datetime.tzinfo is None:
                     pred_datetime = pred_datetime.replace(tzinfo=timezone.utc)
-                pred_date = pred_datetime.date().isoformat()
-                miner_uid = pred['miner_uid']
-                predictions_by_date_miner[pred_date][miner_uid].append(pred)
-                all_dates.add(pred_date)
-                all_miners.add(miner_uid)
-
-            # Process each date's predictions separately within a transaction
-            async with self.db_manager.transaction() as session:
-                for pred_date, miners_predictions in sorted(predictions_by_date_miner.items()):
-                    bt.logging.info(f"Processing predictions for date {pred_date}")
                     
-                    # Check if this is today's date
-                    is_current_day = datetime.fromisoformat(pred_date).date() == current_date
-                    
-                    # Process each miner's predictions
-                    for miner_uid, miner_predictions in miners_predictions.items():
-                        # Get ALL predictions for this miner and date
-                        query = """
-                            SELECT prediction_id, prediction_date, wager
-                            FROM predictions 
-                            WHERE miner_uid = :miner_uid
-                            AND DATE(prediction_date) = DATE(:pred_date)
-                            ORDER BY prediction_date ASC
-                        """
-                        params = {
-                            'miner_uid': miner_uid,
-                            'pred_date': pred_date
-                        }
-                        
-                        result = await session.execute(text(query), params)
-                        existing_predictions = result.fetchall()
-                        
-                        # Create a map of all predictions (both existing and new) by timestamp
-                        all_predictions = []
-                        
-                        # Add existing predictions
-                        for pred in existing_predictions:
-                            # Access by index: prediction_id is 0, prediction_date is 1, wager is 2
-                            all_predictions.append({
-                                'timestamp': datetime.fromisoformat(pred[1]),
-                                'wager': float(pred[2]),
-                                'is_existing': True,
-                                'prediction_id': pred[0]
-                            })
-                        
-                        # Add new predictions being validated
-                        for pred in miner_predictions:
-                            all_predictions.append({
-                                'timestamp': datetime.fromisoformat(pred['prediction_date']),
-                                'wager': float(pred['wager']),
-                                'is_existing': False,
-                                'full_pred': pred
-                            })
-                        
-                        # Sort all predictions by timestamp
-                        all_predictions.sort(key=lambda x: x['timestamp'])
-                        
-                        # Process predictions in chronological order
-                        current_total = 0.0
-                        bt.logging.info(f"Processing predictions for miner {miner_uid} on {pred_date} (starting from 0)")
-                        
-                        for pred in all_predictions:
-                            wager = pred['wager']
-                            
-                            # Check daily wager limit before processing
-                            if current_total + wager > 1000:
-                                if pred['is_existing']:
-                                    # For existing predictions that exceed the limit, mark them for deletion
-                                    predictions_to_delete.append(pred['prediction_id'])
-                                    bt.logging.warning(
-                                        f"Existing prediction {pred['prediction_id']} exceeds daily wager limit: "
-                                        f"miner={miner_uid}, date={pred_date}, "
-                                        f"current_total={current_total:.2f}, wager={wager:.2f}"
-                                    )
-                                continue
-                            
-                            if pred['is_existing']:
-                                # Update running total for valid existing predictions
-                                current_total += wager
-                                continue
-                            
-                            # This is a prediction we need to validate
-                            prediction = pred['full_pred']
-                            prediction_id = prediction['prediction_id']
-                            
-                            try:
-                                game_id = prediction['game_id']
-                                
-                                # Skip if game not found
-                                if game_id not in game_data:
-                                    continue
-                                    
-                                game = game_data[game_id]
-                                game_outcome = game.get('outcome', '3')
-                                
-                                # Convert string outcome to int if needed
-                                if isinstance(game_outcome, str):
-                                    try:
-                                        game_outcome = int(game_outcome)
-                                    except ValueError:
-                                        game_outcome = 3 if game_outcome == 'Unfinished' else -1
-                                
-                                # Handle unfinished games (outcome 3)
-                                if game_outcome == 3:
-                                    game_start = datetime.fromisoformat(game['event_start_date'])
-                                    current_time = datetime.now(timezone.utc)
-                                    
-                                    if current_time < game_start:
-                                        # Game hasn't started yet, keep prediction
-                                        pass
-                                    elif current_time - game_start > timedelta(hours=24):
-                                        # Only delete if it's been more than 24 hours since game start
-                                        bt.logging.info(f"Deleting prediction {prediction_id} for unfinished game {game_id} that started over 24 hours ago")
-                                        predictions_to_delete.append(prediction_id)
-                                        continue
-                                
-                                # For current day predictions, use stricter validation
-                                if is_current_day:
-                                    is_valid, message, validation_type, numeric_outcome = await self.validate_prediction(
-                                        miner_uid,
-                                        prediction_id,
-                                        {
-                                            'prediction_id': prediction_id,
-                                            'game_id': game_id,
-                                            'wager': wager,
-                                            'predicted_outcome': prediction['predicted_outcome'],
-                                            'team_a': prediction['team_a'],
-                                            'team_b': prediction['team_b'],
-                                            'team_a_odds': prediction['team_a_odds'],
-                                            'team_b_odds': prediction['team_b_odds'],
-                                            'tie_odds': prediction['tie_odds'],
-                                            'predicted_odds': prediction['predicted_odds'],
-                                            'current_total': current_total,
-                                        },
-                                        set(),  # Empty set since we're already handling duplicates
-                                        historical_validation=True  # Use historical validation even for current day
-                                    )
-                                    if not is_valid:
-                                        bt.logging.warning(f"Current day prediction {prediction_id} failed validation: {message}")
-                                        predictions_to_delete.append(prediction_id)
-                                        continue
-                                
-                                # Update running total since this prediction will be valid
-                                current_total += wager
-                                
-                                # Add to valid predictions
-                                valid_predictions.append(prediction)
-                                    
-                            except Exception as e:
-                                bt.logging.error(f"Error validating prediction {prediction.get('prediction_id', 'unknown')}: {str(e)}")
-                                continue
-
-                # Delete invalid predictions within the transaction
-                if predictions_to_delete:
-                    try:
-                        # Use placeholders for the IN clause
-                        placeholders = ','.join([f':id{i}' for i in range(len(predictions_to_delete))])
-                        delete_query = f"""
-                            DELETE FROM predictions 
-                            WHERE prediction_id IN ({placeholders})
-                        """
-                        
-                        # Create parameters dictionary
-                        delete_params = {f'id{i}': pid for i, pid in enumerate(predictions_to_delete)}
-                        
-                        bt.logging.info(f"Deleting {len(predictions_to_delete)} invalid predictions")
-                        await session.execute(text(delete_query), delete_params)
-                        
-                        # Verify deletions
-                        verify_query = f"""
-                            SELECT COUNT(*) as remaining 
-                            FROM predictions 
-                            WHERE prediction_id IN ({placeholders})
-                        """
-                        result = await session.execute(text(verify_query), delete_params)
-                        verify_result = result.fetchone()
-                        remaining = verify_result[0] if verify_result else 0
-                        
-                        if remaining > 0:
-                            bt.logging.warning(f"{remaining} predictions failed to delete")
-                        else:
-                            bt.logging.info("Successfully deleted all invalid predictions")
-                            
-                    except Exception as e:
-                        bt.logging.error(f"Error deleting predictions: {str(e)}")
-                        bt.logging.error(traceback.format_exc())
-                        raise
-
-            return valid_predictions, {}
+                # Get date string for daily wager tracking
+                pred_date_str = pred_datetime.strftime('%Y-%m-%d')
                 
+                # Get current total for the day for this miner
+                current_total = daily_wager_totals[miner_uid][pred_date_str]
+                
+                wager = float(pred['wager'])
+                
+                # Basic check to prevent processing duplicates within this batch
+                if prediction_id in existing_prediction_ids:
+                    validation_stats['duplicate_in_batch'] += 1
+                    continue 
+                existing_prediction_ids.add(prediction_id)
+
+                # Perform validation using historical epsilon
+                is_valid, message, validation_type, numeric_outcome = await self.validate_prediction(
+                    miner_uid,
+                    prediction_id,
+                    {
+                        'prediction_id': prediction_id,
+                        'game_id': pred['game_id'],
+                        'wager': wager,
+                        'predicted_outcome': pred['predicted_outcome'],
+                        'team_a': pred.get('team_a'), # Use .get for safety
+                        'team_b': pred.get('team_b'),
+                        'team_a_odds': pred.get('team_a_odds'),
+                        'team_b_odds': pred.get('team_b_odds'),
+                        'tie_odds': pred.get('tie_odds'),
+                        'predicted_odds': pred['predicted_odds'],
+                        'current_total': current_total, # Pass current daily total
+                        'confidence_score': pred.get('confidence_score'),
+                        'model_name': pred.get('model_name')
+                    },
+                    set(), # Pass empty set for existing_predictions check within validate_prediction
+                    historical_validation=True
+                )
+                
+                validation_stats[validation_type] += 1
+                
+                if is_valid:
+                    # Check daily limit again here, as validate_prediction might skip it for historical
+                    if current_total + wager <= 1000:
+                        valid_predictions.append(pred) # Keep original prediction dict
+                        daily_wager_totals[miner_uid][pred_date_str] += wager
+                    else:
+                        # Exceeded limit based on already validated predictions for the day
+                        bt.logging.warning(f"Historical prediction {prediction_id} would exceed daily limit for miner {miner_uid} on {pred_date_str}. Deleting.")
+                        predictions_to_delete.append(prediction_id)
+                        validation_stats['daily_limit_exceeded'] += 1
+                        validation_stats['successful'] -= 1 # Decrement successful count
+                else:
+                    bt.logging.debug(f"Historical prediction {prediction_id} failed validation: {message} ({validation_type}). Deleting.")
+                    predictions_to_delete.append(prediction_id)
+
         except Exception as e:
-            bt.logging.error(f"Error in historical validation: {str(e)}")
+            bt.logging.error(f"Error in historical validation: {e}")
             bt.logging.error(traceback.format_exc())
-            return [], {}
+
+        # Log stats
+        bt.logging.info("Historical validation stats:")
+        for reason, count in validation_stats.items():
+             bt.logging.info(f"  {reason}: {count}")
+
+        # Bulk delete invalid predictions
+        if predictions_to_delete:
+            await self._delete_predictions(predictions_to_delete)
+
+        return valid_predictions, validation_stats
+
+    async def _delete_predictions(self, prediction_ids: list):
+        """Deletes predictions with the given IDs from the database."""
+        if not prediction_ids:
+            return
+        bt.logging.info(f"Deleting {len(prediction_ids)} invalid historical predictions...")
+        # Delete in chunks to avoid overly large queries
+        chunk_size = 500 
+        deleted_count = 0
+        for i in range(0, len(prediction_ids), chunk_size):
+            chunk = prediction_ids[i:i + chunk_size]
+            try:
+                async with self.db_manager.transaction() as session:
+                     # Ensure placeholders match DB paramstyle if needed (SQLAlchemy handles named generally)
+                    query = text("DELETE FROM predictions WHERE prediction_id = ANY(:ids)")
+                    result = await session.execute(query, {"ids": chunk})
+                    deleted_count += result.rowcount
+            except Exception as e:
+                bt.logging.error(f"Error deleting prediction chunk: {e}")
+        bt.logging.info(f"Deleted {deleted_count} predictions.")
 
     async def _get_existing_predictions(self, prediction_ids: list) -> set:
         """Get a set of prediction IDs that already exist in the database."""

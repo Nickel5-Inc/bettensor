@@ -19,6 +19,7 @@ import websocket
 from websocket._exceptions import WebSocketConnectionClosedException
 from bettensor.protocol import GameData, Metadata
 from bettensor.validator.bettensor_validator import BettensorValidator
+from bettensor.validator.database.database_config import DEFAULT_SQLITE_PATH
 from bettensor.validator.utils.ensure_dependencies import ensure_dependencies
 from bettensor.validator.io.sports_data import SportsData
 from bettensor.validator.utils.watchdog import Watchdog
@@ -29,10 +30,18 @@ from typing import Optional, Any
 import async_timeout
 from bettensor.validator.utils.state_sync import StateSync
 import math
-from bettensor.validator.database.database_manager import DatabaseManager
 import json
 import numpy as np
 import signal
+# Add migration imports
+from bettensor.validator.utils.auto_update import AutoUpdate
+from bettensor.validator.migration.migration_manager import MigrationManager
+import asyncpg
+from bettensor.validator.scoring.min_stake import MinStakeService
+from bettensor.validator.scoring.scoring import ScoringSystem
+from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
+from bettensor.validator.io.website_handler import WebsiteHandler
+from bettensor.validator.scoring.weights_functions import WeightSetter
 
 # Constants for timeouts (in seconds)
 UPDATE_TIMEOUT = 300  # 5 minutes
@@ -269,7 +278,6 @@ async def run(validator: BettensorValidator):
     """Main async run loop for the validator"""
     # Load environment variables
     load_dotenv()
-    await initialize(validator)
     validator.watchdog = Watchdog(validator=validator, timeout=1200)  # 20 minutes timeout
 
     # Initialize background tasks
@@ -506,18 +514,62 @@ async def initialize(validator):
         async with async_timeout.timeout(300):  # 5 minute timeout
             if await validator.state_sync.pull_state():
                 bt.logging.info("Successfully pulled latest state")
-                # Check if this is a new validator or one that has gone out of sync
-                is_new_validator = not os.path.exists(validator.db_manager.database_path) or \
-                                 os.path.getsize(validator.db_manager.database_path) < 1024 * 1024  # Less than 1MB
-                await validator.db_manager.initialize(force=True)
+                # Initialize DB *before* checking content, ensure tables exist
+                await validator.db_manager.initialize(force=True) 
+
+                # Check if this is a new validator or one that has gone out of sync by checking prediction count
+                # OLD check using database_path
+                # is_new_validator = not os.path.exists(validator.db_manager.database_path) or \\
+                #                  os.path.getsize(validator.db_manager.database_path) < 1024 * 1024  # Less than 1MB
+                
+                # NEW check: Query a key table (e.g., predictions) to see if it's empty
+                is_new_validator = False # Default to false
+                try:
+                    # Use lower case count to match asyncpg's default return key style
+                    count_result = await validator.db_manager.fetch_one("SELECT COUNT(*) as count FROM predictions")
+                    # Check if result is None (table might exist but query failed somehow) or count is 0
+                    is_new_validator = count_result is None or count_result['count'] == 0 
+                    bt.logging.info(f"Checking if validator is new based on prediction count: {count_result}. is_new_validator={is_new_validator}")
+                except Exception as e:
+                    # Log specific error if table doesn't exist yet, otherwise generic warning
+                    if "relation \"predictions\" does not exist" in str(e).lower():
+                         bt.logging.info("Predictions table does not exist yet, assuming new validator.")
+                         is_new_validator = True
+                    else:
+                        bt.logging.warning(f"Could not check prediction count to determine if validator is new: {e}. Assuming not new.")
+                        is_new_validator = False # Default to not new if query fails unexpectedly
+
                 if is_new_validator:
-                    bt.logging.info("New validator detected, rebuilding historical scores...")
-                    await validator.scoring_system.rebuild_historical_scores()
+                    bt.logging.info("New validator detected (or empty predictions table), rebuilding historical scores...")
+                    # Ensure scoring system is available before calling rebuild
+                    if hasattr(validator, 'scoring_system') and validator.scoring_system:
+                         await validator.scoring_system.rebuild_historical_scores()
+                    else:
+                         bt.logging.warning("Scoring system not initialized, cannot rebuild historical scores yet.")
             else:
                 bt.logging.warning("Failed to pull latest state, continuing with local state")
+                # Initialize DB even if pull fails, might be first run
+                await validator.db_manager.initialize(force=True) 
     else:
         bt.logging.info("Skipping state pull due to VALIDATOR_PULL_STATE configuration")
+        # Initialize DB on first run even if state pull is skipped
+        await validator.db_manager.initialize(force=True) 
     
+    # Save state *after* potential initialization and score rebuild
+    await validator.save_state()
+
+    # --- REMOVED MIGRATION CHECK AND EXECUTION (Moved to main()) --- 
+    # migration_needed = await AutoUpdate.should_migrate_to_postgres()
+    # ... (rest of migration logic removed) ...
+    
+    # --- REMOVED SCHEMA CHECK (Handled by db_manager.initialize()) ---
+    # else:
+    #    bt.logging.info("PostgreSQL migration not required, ensuring schema is up-to-date...")
+    #    ... (schema check logic removed) ...
+
+
+    # --- Initialize Neuron --- 
+    # (Keep the rest of the initialization logic)
     validator.serve_axon()
     validator.initialize_connection()
 
@@ -569,13 +621,13 @@ async def initialize(validator):
 
 @cancellable_task
 async def log_status_with_watchdog(validator):
-        while True:
-            try:
-                await log_status(validator)
-                validator.watchdog.reset()
-            except Exception as e:
-                bt.logging.error(f"Error in status log: {str(e)}")
-            await asyncio.sleep(30)
+    while True:
+        try:
+            await log_status(validator)
+            validator.watchdog.reset()
+        except Exception as e:
+            bt.logging.error(f"Error in status log: {str(e)}")
+        await asyncio.sleep(30)
 
 
 
@@ -734,10 +786,26 @@ async def query_and_process_axons(validator):
             current_time = datetime.now(timezone.utc).isoformat()
             
             gamedata_dict = await validator.fetch_local_game_data(current_time)
-            bt.logging.info(f"Number of games: {len(gamedata_dict)}")
+            bt.logging.info(f"Number of games fetched: {len(gamedata_dict)}")
             if gamedata_dict is None:
                 bt.logging.error("No game data found")
                 return None
+
+            # --- Convert data types for Pydantic validation --- 
+            bt.logging.debug("Converting game data types for synapse validation...")
+            converted_gamedata_dict = {}
+            for game_id, game_details in gamedata_dict.items():
+                converted_details = game_details.copy()
+                for key, value in game_details.items():
+                    if isinstance(value, datetime):
+                        converted_details[key] = value.isoformat()
+                    elif key == 'tie_odds' and value is None:
+                        # Assuming the Pydantic model expects a float, default None to 0.0
+                        # If Optional[float] is allowed, this could be handled differently.
+                        converted_details[key] = 0.0 
+                converted_gamedata_dict[game_id] = converted_details
+            bt.logging.debug("Game data type conversion complete.")
+            # --- End conversion --- 
 
             synapse = GameData.create(
                 db_path=validator.db_path,
@@ -745,7 +813,7 @@ async def query_and_process_axons(validator):
                 subnet_version=validator.subnet_version,
                 neuron_uid=validator.uid,
                 synapse_type="game_data",
-                gamedata_dict=gamedata_dict,
+                gamedata_dict=converted_gamedata_dict, # Use converted dict
             )
             
             if synapse is None:
@@ -1011,41 +1079,187 @@ def cleanup_pycache():
 
 # The main function parses the configuration and runs the validator.
 async def main():
-    """Main function for running the validator."""
-    global _validator
-    cleanup_pycache()
-    
     try:
-        _validator = await BettensorValidator.create()
+        # Initialize validator
+        _validator = BettensorValidator()
+
+        # --- Setup Bittensor Objects ---
+        bt.logging.info("Setting up Bittensor objects...")
+        _validator.wallet, _validator.subtensor, _validator.dendrite, _validator.metagraph = _validator.setup_bittensor_objects(
+            _validator.config
+        )
+        bt.logging.info(
+            f"Bittensor objects initialized:\\nmetagraph: {_validator.metagraph}\\nsubtensor: {_validator.subtensor}\\nwallet: {_validator.wallet}"
+        )
+
+        # --- Validate Registration & Get UID ---
+        if not _validator.validator_validation(_validator.metagraph, _validator.wallet, _validator.subtensor):
+            raise IndexError("Unable to find validator key from metagraph")
+        _validator.uid = _validator.metagraph.hotkeys.index(_validator.wallet.hotkey.ss58_address)
+        bt.logging.info(f"Validator is running with uid: {_validator.uid}")
+        
+        # --- Serve Axon ---
+        # This needs wallet and subtensor to be initialized
+        _validator.serve_axon()
+
+        # --- Database Initialization and Migration ---
+        bt.logging.info("Initializing database manager...")
+        # Removed config argument from initialize call
+        await _validator.db_manager.initialize()
+        bt.logging.info("Database manager initialized.")
+
+        # --- Migration Handling --- 
+        # Instantiate MigrationManager (it reads setup.cfg internally for force flag)
+        migration_manager = MigrationManager(
+            sqlite_path=_validator.db_config.get('path', DEFAULT_SQLITE_PATH),
+            pg_config=_validator.db_config # pg_config comes from _validator.db_config
+        )
+        bt.logging.info("Checking and potentially running database migration (controlled by setup.cfg: force_db_reset and migration status)...")
+        migration_action_taken = False
+        try:
+            # migrate() now returns True if *any* action (forced drop or data migration) was taken
+            migration_action_taken = await migration_manager.migrate()
+            if migration_action_taken:
+                 bt.logging.info("Migration process completed (either forced drop or data transfer occurred).")
+            else:
+                 bt.logging.info("Migration process determined no action was required.")
+                 
+            # Re-initialize DB manager only if migration action was taken (tables might have been dropped/recreated)
+            if migration_action_taken:
+                bt.logging.info("Re-initializing database manager post-migration action...")
+                # Pass force=True, removed config argument
+                await _validator.db_manager.initialize(force=True) 
+                bt.logging.info("Database manager re-initialized.")
+        except Exception as e:
+            bt.logging.error(f"Database migration process failed: {e}")
+            bt.logging.error(traceback.format_exc())
+            # Decide if you want to exit or continue if migration fails
+            return # Exit if migration fails
+
+        # --- Initialize StateSync ---
+        # Needs db_manager, happens after migration and initial DB init
+        _validator.is_primary = os.environ.get("VALIDATOR_IS_PRIMARY") == "True"
+        _validator.state_sync = StateSync(
+             state_dir="./bettensor/validator/state", # Ensure correct path
+             db_manager=_validator.db_manager,
+             validator=_validator
+        )
+        bt.logging.info("StateSyncManager initialized.")
+        
+        # --- Initialize Core Components (Corrected Order) --- 
+        bt.logging.info("Initializing core validator components...")
+        
+        # 1. Instantiate components that don't depend on initialized ScoringSystem/State
+        _validator.min_stake_service = MinStakeService(_validator.subtensor)
+        _validator.scoring_system = ScoringSystem(
+            db_manager=_validator.db_manager,
+            num_miners=256, 
+            max_days=45,
+            min_stake_service=_validator.min_stake_service
+        )
+        # --- ADDED: Assign validator to scoring_system.miner_data --- 
+        _validator.scoring_system.miner_data = _validator 
+        _validator.scoring_system.set_validator(_validator) # Also call set_validator if needed
+        # --- END ADDED --- 
+        _validator.api_client = BettensorAPIClient(
+             db_manager=_validator.db_manager
+        )
+        _validator.website_handler = WebsiteHandler(_validator)
+        _validator.weight_setter = WeightSetter( 
+            metagraph=_validator.metagraph,
+            wallet=_validator.wallet,
+            subtensor=_validator.subtensor,
+            neuron_config=_validator.config,
+            db_path=_validator.db_path 
+        )
+        
+        # 2. Initialize/Load Validator State and Scores 
+        bt.logging.info("Initializing validator state and scores...")
+        load_state_str = getattr(_validator.config, 'load_state', 'True')
+        load_validator_state_flag = load_state_str.lower() != "false" if isinstance(load_state_str, str) else True
+        if load_validator_state_flag:
+             await _validator.load_state() 
+        else:
+             _validator.init_default_scores() 
+
+        # 3. Initialize scoring system internals 
+        await _validator.scoring_system.initialize()
+        bt.logging.info("ScoringSystem initialized.")
+
+        # 4. Instantiate SportsData 
+        if hasattr(_validator.scoring_system, 'entropy_system'):
+            _validator.sports_data = SportsData(
+                db_manager=_validator.db_manager,
+                entropy_system=_validator.scoring_system.entropy_system,
+                api_client=_validator.api_client
+            )
+            bt.logging.info("SportsData initialized.")
+        else:
+             # This case should ideally not happen now, but log just in case
+             bt.logging.error("CRITICAL: Entropy system not found on scoring system AFTER initialization. Cannot initialize SportsData.")
+             _validator.sports_data = None 
+             # Consider raising an exception here or exiting if SportsData is critical
+
+        bt.logging.info("Core validator components initialization complete.")
+        # --- End Core Component Initialization --- 
+        
+        # --- Run Validator Loop ---
+        bt.logging.info("Starting validator main loop...")
+        # Ensure sports_data is not None before starting loop if it's essential
+        if _validator.sports_data is None:
+             bt.logging.error("Validator cannot start without SportsData. Exiting.")
+             return # Exit if SportsData failed to initialize
+             
         await run(_validator)
+
+    except KeyboardInterrupt:
+        bt.logging.info("Keyboard interrupt detected. Exiting validator.")
+        if '_validator' in locals() and _validator:
+             await _validator.shutdown()
     except Exception as e:
-        bt.logging.error(f"Error in validator: {str(e)}")
-        if _validator:
-            await _validator.cleanup()
-        raise
+        bt.logging.error(f"Unhandled error in validator main loop: {e}")
+        bt.logging.error(traceback.format_exc())
     finally:
-        if _validator:
-            await _validator.cleanup()
+        bt.logging.info("Validator shutdown complete.")
 
 if __name__ == "__main__":
+    # Setup logging early
+    # TODO: Consider if config needs to be loaded here for logging setup
+    # bt.logging(..) 
+
+    # Cleanup cache first
+    cleanup_pycache()
+
+    # Initial dependency checks (like Python version, bittensor install etc.)
     try:
-        # Create a single event loop for both operations
+        # Create a single event loop for all async operations
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Run dependency check
+        # Run dependency check (assuming this checks basic pip installs etc.)
         loop.run_until_complete(check_and_install_dependencies())
-        
-        # Run main function using the same loop
+
+        # --- REMOVED MIGRATION CHECK CALL ---
+        # # Migration check is now handled within main() before validator creation
+        # loop.run_until_complete(check_and_migrate()) 
+
+        # Run main validator function using the same loop
         loop.run_until_complete(main())
         
+    except SystemExit as e:
+        # Catch sys.exit calls for cleaner termination message
+        bt.logging.warning(f"Validator startup aborted (exit code {e.code}).")
+        sys.exit(e.code) # Propagate exit code
     except Exception as e:
-        bt.logging.error(f"Startup error: {e}")
+        bt.logging.error(f"Fatal startup error: {e}")
         bt.logging.error(traceback.format_exc())
         sys.exit(1)
     finally:
         try:
-            # Clean up the loop
-            loop.close()
+            # Clean up the loop if it exists and is running
+            if 'loop' in locals() and loop.is_running():
+                loop.stop()
+            if 'loop' in locals() and not loop.is_closed():
+                 loop.close()
         except Exception as e:
             bt.logging.error(f"Error closing event loop: {e}")

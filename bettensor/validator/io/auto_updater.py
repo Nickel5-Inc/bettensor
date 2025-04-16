@@ -8,9 +8,129 @@ import time
 import asyncio
 import sys
 from pathlib import Path
+import shutil
 
 async def check_and_install_dependencies():
     """Check and install required dependencies before code execution"""
+    
+    # --- Check/Install PostgreSQL Client --- 
+    psql_found = False
+    try:
+        # Check if psql command is available
+        process = await asyncio.create_subprocess_shell(
+            'psql --version',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL)
+        await process.wait() 
+        if process.returncode == 0:
+            psql_found = True
+            bt.logging.debug("PostgreSQL client ('psql') found.")
+        #else: psql not found, proceed to attempt install
+            
+    except Exception as e:
+        bt.logging.warning(f"Error during initial psql check (will attempt install if possible): {e}")
+        # Don't exit, attempt installation below
+
+    if not psql_found:
+        bt.logging.warning("PostgreSQL client ('psql') not found. Attempting automated installation...")
+        
+        try:
+            is_root = os.geteuid() == 0
+            if not is_root:
+                bt.logging.error("Automated installation requires root privileges.")
+                bt.logging.error("Please run the validator as root or install 'postgresql-client' manually.")
+                # Print manual instructions before exiting
+                bt.logging.error("Manual Installation Instructions:")
+                bt.logging.error("  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y postgresql-client")
+                bt.logging.error("  Fedora/CentOS: sudo dnf install -y postgresql")
+                bt.logging.error("  macOS (Homebrew): brew install postgresql")
+                sys.exit(1)
+                
+            # Running as root, detect package manager
+            install_cmd = None
+            package_manager_name = None
+            
+            if shutil.which('apt-get'):
+                package_manager_name = 'apt-get'
+                install_cmd = 'apt-get update && apt-get install -y postgresql-client'
+            elif shutil.which('dnf'):
+                package_manager_name = 'dnf'
+                # Assuming dnf doesn't typically need an update command first for this scenario
+                install_cmd = 'dnf install -y postgresql' 
+            elif shutil.which('yum'):
+                 package_manager_name = 'yum'
+                 # Assuming yum doesn't typically need an update command first for this scenario
+                 install_cmd = 'yum install -y postgresql'
+                 
+            if install_cmd:
+                bt.logging.info(f"Detected {package_manager_name}. Running installation command: '{install_cmd}'")
+                install_process = await asyncio.create_subprocess_shell(
+                    install_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await install_process.communicate()
+                
+                if install_process.returncode == 0:
+                    bt.logging.info("Automated installation command executed successfully.")
+                    # Verify psql is now available
+                    check_process = await asyncio.create_subprocess_shell(
+                        'psql --version',
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL)
+                    await check_process.wait()
+                    if check_process.returncode == 0:
+                        bt.logging.info("Successfully installed and verified PostgreSQL client ('psql').")
+                        psql_found = True # Continue with other dependencies
+                    else:
+                        bt.logging.error("Installation command ran, but 'psql --version' still fails. Manual installation required.")
+                        # stderr from install_process might have clues
+                        if stderr:
+                            bt.logging.error(f"Installation stderr: {stderr.decode()}")
+                        # Print manual instructions again
+                        bt.logging.error("Manual Installation Instructions:")
+                        bt.logging.error("  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y postgresql-client")
+                        bt.logging.error("  Fedora/CentOS: sudo dnf install -y postgresql")
+                        bt.logging.error("  macOS (Homebrew): brew install postgresql")
+                        sys.exit(1)
+                else:
+                    bt.logging.error(f"Automated installation command failed with exit code {install_process.returncode}.")
+                    if stdout:
+                         bt.logging.error(f"Installation stdout: {stdout.decode()}")
+                    if stderr:
+                        bt.logging.error(f"Installation stderr: {stderr.decode()}")
+                    bt.logging.error("Manual installation required.")
+                    # Print manual instructions
+                    bt.logging.error("Manual Installation Instructions:")
+                    bt.logging.error("  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y postgresql-client")
+                    bt.logging.error("  Fedora/CentOS: sudo dnf install -y postgresql")
+                    bt.logging.error("  macOS (Homebrew): brew install postgresql")
+                    sys.exit(1)
+            else:
+                bt.logging.error("Could not detect a supported package manager (apt-get, dnf, yum) for automated installation.")
+                # Print manual instructions
+                bt.logging.error("Manual Installation Instructions:")
+                bt.logging.error("  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y postgresql-client")
+                bt.logging.error("  Fedora/CentOS: sudo dnf install -y postgresql")
+                bt.logging.error("  macOS (Homebrew): brew install postgresql")
+                sys.exit(1)
+
+        except Exception as install_exc:
+            bt.logging.error(f"An unexpected error occurred during the automated installation attempt: {install_exc}")
+            # Print manual instructions
+            bt.logging.error("Manual Installation Instructions:")
+            bt.logging.error("  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y postgresql-client")
+            bt.logging.error("  Fedora/CentOS: sudo dnf install -y postgresql")
+            bt.logging.error("  macOS (Homebrew): brew install postgresql")
+            sys.exit(1)
+    # --- End PostgreSQL Client Check/Install ---
+
+    # --- Original Core Dependency Checks --- 
+    # (Only proceed if psql check/install was successful or not needed)
+    if not psql_found: # Should have exited above if install failed
+         bt.logging.critical("Internal logic error: psql check failed but script did not exit.")
+         sys.exit(1) 
+         
     try:
         # Core dependencies needed for update process
         core_deps = {

@@ -588,7 +588,7 @@ class EntropySystem:
                 return False
 
             # Use a shorter timeout for the database operation
-            async with async_timeout.timeout(45):  # Increased from 20 to 45 seconds
+            async with async_timeout.timeout(120):  # Increased timeout to 120 seconds
                 async with self.db_manager.get_long_running_session() as session:
                     from sqlalchemy import text
                     

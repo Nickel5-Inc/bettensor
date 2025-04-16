@@ -4,16 +4,14 @@ import time
 import asyncio
 import traceback
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import bittensor as bt
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 import async_timeout
 import pytz
 import numpy as np
-from datetime import datetime, timedelta, timezone
-from bettensor.validator.database.database_manager import DatabaseManager
-from typing import List, Tuple, Dict
+from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 import random
 
@@ -51,8 +49,65 @@ class ScoringData:
     async def preprocess_for_scoring(self, date_str):
         bt.logging.debug(f"Preprocessing for scoring on date: {date_str}")
 
-        # Step 1: Get closed games for that day (Outcome != 3)
-        closed_games = await self._fetch_closed_game_data(date_str)
+        # Convert date_str to datetime object
+        try:
+            date_dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+        except ValueError:
+            bt.logging.error(f"Invalid date string format: {date_str}. Expected 'YYYY-MM-DD HH:MM:SS'")
+            return np.array([]), np.array([]), np.array([])
+
+        # Fetch predictions for the given date using the datetime object
+        fetch_predictions_query = """
+            SELECT prediction_id, miner_uid, game_id, predicted_outcome, predicted_odds, wager
+            FROM predictions
+            WHERE DATE(prediction_date) = DATE(:date)
+        """
+        predictions = await self.db_manager.fetch_all(fetch_predictions_query, {"date": date_dt})
+        if not predictions:
+            return np.array([]), np.array([]), np.array([])
+
+        # Fetch closed game data within the date range
+        start_date = date_dt.replace(hour=0, minute=0, second=0)
+        end_date = start_date.replace(hour=23, minute=59, second=59)
+
+        # Revised query with safer CASE and WHERE
+        fetch_closed_games_query = """
+            SELECT 
+                external_id,
+                event_start_date,
+                team_a_odds,
+                team_b_odds,
+                tie_odds,
+                CASE 
+                    WHEN outcome = 'TeamA' THEN 0
+                    WHEN outcome = 'TeamB' THEN 1
+                    WHEN outcome = 'Draw' THEN 2
+                    WHEN outcome = 'Cancelled' THEN 4 -- Assuming Cancelled maps to 4
+                    WHEN outcome = 'Unfinished' THEN 3 -- Handle Unfinished before numeric check
+                    WHEN outcome::text ~ '^[0-9]+$' THEN outcome::integer -- Cast only if numeric
+                    WHEN outcome IS NULL THEN 3
+                    ELSE 3 -- Default for unexpected values
+                END as outcome
+            FROM game_data
+            WHERE event_start_date BETWEEN :start_date AND :end_date
+            AND outcome IS NOT NULL
+            -- Filter for games with definitive outcomes (0, 1, 2, 4) based on original values
+            AND (
+                outcome IN ('TeamA', 'TeamB', 'Draw', 'Cancelled') 
+                OR 
+                (outcome::text ~ '^[0-9]+$' AND outcome::integer IN (0, 1, 2, 4))
+            )
+            ORDER BY event_start_date ASC
+        """
+
+        try:
+            closed_games = await self.db_manager.fetch_all(
+                fetch_closed_games_query, 
+                {"start_date": start_date, "end_date": end_date}
+            )
+        except Exception as e:
+            bt.logging.error(f"Error fetching closed game data: {str(e)}")
+            return np.array([]), np.array([]), np.array([])
 
         if len(closed_games) == 0:
             bt.logging.warning("No closed games found for the given date.")
@@ -60,9 +115,6 @@ class ScoringData:
 
         game_ids = [game["external_id"] for game in closed_games]
 
-        # Step 2: Get all predictions for each of those closed games
-        predictions = await self._fetch_predictions(game_ids)
- 
         # Step 3: Ensure predictions have their payout calculated and outcome updated
         bt.logging.debug("Updating predictions with payout")
         predictions = await self._update_predictions_with_payout(predictions, closed_games)

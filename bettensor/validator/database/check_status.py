@@ -17,7 +17,7 @@ sys.path.append(parent_dir)
 try:
     import bittensor as bt
     import psycopg2
-    from bettensor.validator.utils.database.database_factory import DatabaseFactory
+    from bettensor.validator.database.database_config import load_database_config
 except ImportError as e:
     print(f"Error importing required modules: {e}")
     print("Please make sure you have installed all required dependencies")
@@ -249,39 +249,6 @@ def print_database_status(sqlite_status, postgres_status, config):
     else:
         print("Status: Not Found")
 
-def get_current_config():
-    """Get current database configuration from file"""
-    config_file = Path.home() / ".bettensor" / "database.cfg"
-    config = {
-        "type": "sqlite",
-        "path": "./bettensor/validator/state/validator.db",
-        "host": "localhost",
-        "port": 5432,
-        "user": "postgres",
-        "password": "",
-        "dbname": "bettensor_validator"
-    }
-    
-    if config_file.exists():
-        parser = configparser.ConfigParser()
-        try:
-            parser.read(config_file)
-            if "Database" in parser:
-                db_section = parser["Database"]
-                config.update({
-                    "type": db_section.get("type", "sqlite"),
-                    "path": db_section.get("path", "./bettensor/validator/state/validator.db"),
-                    "host": db_section.get("host", "localhost"),
-                    "port": int(db_section.get("port", "5432")),
-                    "user": db_section.get("user", "postgres"),
-                    "password": db_section.get("password", ""),
-                    "dbname": db_section.get("dbname", "bettensor_validator")
-                })
-        except Exception as e:
-            print(f"Error reading config file: {e}")
-    
-    return config
-
 def compare_databases(sqlite_status, postgres_status):
     """Compare SQLite and PostgreSQL databases for data consistency"""
     if not sqlite_status["exists"] or not postgres_status["exists"]:
@@ -378,24 +345,24 @@ async def main():
     
     args = parser.parse_args()
     
-    # Get current configuration
-    config = get_current_config()
-    
-    # Override with command-line arguments
+    # Get current configuration using the new function
+    config_override = {}
     if args.sqlite_path:
-        config["path"] = args.sqlite_path
+        config_override["path"] = args.sqlite_path
     if args.postgres_host:
-        config["host"] = args.postgres_host
+        config_override["host"] = args.postgres_host
     if args.postgres_port:
-        config["port"] = args.postgres_port
+        config_override["port"] = args.postgres_port
     if args.postgres_user:
-        config["user"] = args.postgres_user
+        config_override["user"] = args.postgres_user
     if args.postgres_password:
-        config["password"] = args.postgres_password
+        config_override["password"] = args.postgres_password
     if args.postgres_dbname:
-        config["dbname"] = args.postgres_dbname
+        config_override["dbname"] = args.postgres_dbname
+        
+    config = load_database_config(config_override) # Load config with overrides
     
-    # Check SQLite status
+    # Check SQLite status using the path from the final config
     sqlite_status = check_sqlite_db(config["path"])
     
     # Check PostgreSQL status

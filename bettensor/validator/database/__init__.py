@@ -2,14 +2,21 @@
 Database utilities for Bettensor validator.
 """
 
-from .database_factory import DatabaseFactory
-from .database_manager import DatabaseManager
+# Removed obsolete imports
+# from .database_factory import DatabaseFactory
+# from .database_manager import DatabaseManager
+# from .base_database_manager import BaseDatabaseManager
+
 from .postgres_database_manager import PostgresDatabaseManager
-from .base_database_manager import BaseDatabaseManager
+from .schema import metadata # Expose metadata for potential direct use
+from .database_config import load_database_config, save_database_config # Expose config functions
 
 __all__ = [
-    'DatabaseFactory',
-    'DatabaseManager',
+    # 'DatabaseFactory',
+    # 'DatabaseManager',
     'PostgresDatabaseManager',
-    'BaseDatabaseManager'
+    # 'BaseDatabaseManager'
+    'metadata',
+    'load_database_config',
+    'save_database_config'
 ] 

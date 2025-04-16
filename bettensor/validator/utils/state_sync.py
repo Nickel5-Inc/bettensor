@@ -22,7 +22,8 @@ import aiofiles
 import hashlib
 import azure.core
 import configparser
-from bettensor.validator.database.database_factory import DatabaseFactory
+from bettensor.validator.database.postgres_database_manager import PostgresDatabaseManager
+from bettensor.validator.database.database_config import load_database_config
 
 class StateSync:
     def __init__(self, 
@@ -482,53 +483,31 @@ class StateSync:
         """
         try:
             # Get database connection info
-            db_config = {}
-            for env_var, config_key in [
-                ("BETTENSOR_DB_HOST", "host"),
-                ("BETTENSOR_DB_PORT", "port"),
-                ("BETTENSOR_DB_USER", "user"),
-                ("BETTENSOR_DB_PASSWORD", "password"),
-                ("BETTENSOR_DB_NAME", "dbname")
-            ]:
-                if os.environ.get(env_var):
-                    if config_key == "port":
-                        db_config[config_key] = int(os.environ.get(env_var))
-                    else:
-                        db_config[config_key] = os.environ.get(env_var)
+            config = load_database_config()
+            db_manager = PostgresDatabaseManager(
+                host=config["host"],
+                port=config["port"],
+                user=config["user"],
+                password=config["password"],
+                dbname=config["dbname"]
+            )
             
-            # If not set in environment, use defaults
-            if "host" not in db_config:
-                db_config["host"] = "localhost"
-            if "port" not in db_config:
-                db_config["port"] = 5432
-            if "user" not in db_config:
-                db_config["user"] = "postgres"
-            if "password" not in db_config:
-                db_config["password"] = ""
-            if "dbname" not in db_config:
-                db_config["dbname"] = "bettensor_validator"
-                
             # Build pg_restore command
             cmd = [
                 "pg_restore",
-                "-h", db_config["host"],
-                "-p", str(db_config["port"]),
-                "-U", db_config["user"],
-                "-d", db_config["dbname"],
+                "-h", config["host"],
+                "-p", str(config["port"]),
+                "-U", config["user"],
+                "-d", config["dbname"],
                 "-c",  # Clean (drop) database objects before recreating
                 "-v",  # Verbose output
                 str(backup_path)
             ]
             
-            # Set password environment variable for pg_restore
-            env = os.environ.copy()
-            if db_config["password"]:
-                env["PGPASSWORD"] = db_config["password"]
-                
             # Execute pg_restore
             process = await asyncio.create_subprocess_exec(
                 *cmd,
-                env=env,
+                env=os.environ.copy(),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
@@ -627,8 +606,14 @@ class StateSync:
         if db_type == "postgres":
             # For PostgreSQL, we verify by trying to connect to the database
             try:
-                db_config = {'type': 'postgres'}
-                db_manager = await DatabaseFactory.create_database_manager(db_config)
+                config = load_database_config()
+                db_manager = PostgresDatabaseManager(
+                    host=config["host"],
+                    port=config["port"],
+                    user=config["user"],
+                    password=config["password"],
+                    dbname=config["dbname"]
+                )
                 connection_ok = await db_manager.ensure_connection()
                 await db_manager.cleanup()
                 

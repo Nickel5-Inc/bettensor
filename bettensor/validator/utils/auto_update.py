@@ -8,7 +8,8 @@ import traceback
 from pathlib import Path
 import bittensor as bt
 
-from bettensor.validator.migration.auto_migrate import AutoMigration
+# from bettensor.validator.migration.auto_migrate import AutoMigration # Removed old import
+from bettensor.validator.migration.migration_manager import MigrationManager # Added new import
 
 class AutoUpdate:
     """
@@ -33,8 +34,22 @@ class AutoUpdate:
             
             # Run migration
             try:
-                migration = AutoMigration()
-                success = await migration.run()
+                # TODO: Need to get sqlite_path and pg_config properly here
+                # Placeholder logic - replace with actual config loading
+                sqlite_path = os.getenv("SQLITE_DB_PATH", "data/validator.db") 
+                pg_config = {
+                    "user": os.getenv("POSTGRES_USER", "postgres"),
+                    "password": os.getenv("POSTGRES_PASSWORD"),
+                    "host": os.getenv("POSTGRES_HOST", "localhost"),
+                    "port": os.getenv("POSTGRES_PORT", "5432"),
+                    "database": os.getenv("POSTGRES_DB", "bettensor_db"),
+                }
+                
+                # migration = AutoMigration() # OLD
+                migration = MigrationManager(sqlite_path=sqlite_path, pg_config=pg_config) # UPDATED Instantiation
+                
+                # success = await migration.run() # OLD
+                success = await migration.migrate() # UPDATED Method Call
                 
                 if success:
                     bt.logging.info("PostgreSQL migration completed successfully after update")
