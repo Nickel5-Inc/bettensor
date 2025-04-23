@@ -16,6 +16,10 @@ import torch
 from bettensor.protocol import GameData, TeamGame, TeamGamePrediction
 from ..database.postgres_database_manager import PostgresDatabaseManager
 import time
+import uuid
+import os
+import json
+from typing import List, Dict, Any, Optional, Tuple
 
 from bettensor.validator.io.bettensor_api_client import BettensorAPIClient
 
@@ -644,7 +648,8 @@ class MinerDataMixin:
                     create_date,
                     last_update_date,
                     active,
-                    can_tie
+                    can_tie,
+                    game_id
                 FROM game_data
                 WHERE event_start_date BETWEEN :start_date AND :end_date
                 ORDER BY event_start_date ASC
@@ -662,26 +667,23 @@ class MinerDataMixin:
             
             # Process the results into a dictionary
             gamedata_dict = {}
-            for row in rows:
-                game_id = str(row['external_id'])  # Convert to string
-                gamedata_dict[game_id] = {
-                    'game_id': game_id,  # Use string game_id
-                    'external_id': game_id,  # Use string external_id
-                    'event_start_date': row['event_start_date'],
-                    'team_a': row['team_a'],
-                    'team_b': row['team_b'],
-                    'team_a_odds': row['team_a_odds'],
-                    'team_b_odds': row['team_b_odds'],
-                    'tie_odds': row['tie_odds'],
-                    'outcome': str(row['outcome']),  # Convert outcome to string
-                    'sport': row['sport'],
-                    'league': row['league'],
-                    'create_date': row['create_date'],
-                    'last_update_date': row['last_update_date'],
-                    'active': row['active'],
-                    'can_tie': row['can_tie']
-                }
+            current_iso_time = datetime.now(timezone.utc).isoformat()
             
+            for row in rows:
+                # Get the external_id as the game_id for the dictionary
+                external_id = str(row['external_id'])
+                
+                # Prepare row data with the external_id as game_id for TeamGame
+                row_data = dict(row)
+                row_data['game_id'] = external_id
+                
+                # Create TeamGame object using the helper method that handles null values
+                team_game = TeamGame.create_from_row(row_data)
+                
+                # Add to dictionary with external_id as key
+                gamedata_dict[external_id] = team_game
+            
+            bt.logging.info(f"Fetched {len(gamedata_dict)} games from local database")
             return gamedata_dict
             
         except Exception as e:

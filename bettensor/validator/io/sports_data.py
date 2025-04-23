@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from typing import List
+from typing import List, Dict, Any
 import uuid
 import sqlite3
 import requests
@@ -113,6 +113,7 @@ class SportsData:
         except Exception as e:
             bt.logging.error(f"Error in game data update: {str(e)}")
             bt.logging.error(traceback.format_exc())
+            # Do not update _last_processed_time on error to allow immediate retry
             return []
 
     def _cleanup_processed_ids(self):
@@ -256,45 +257,74 @@ class SportsData:
             bt.logging.error(traceback.format_exc())
             return []
 
-    async def _process_game_chunk_with_retries(self, chunk):
-        """Process a single chunk of games with retries"""
-        retries = 0
-        while retries < self.MAX_RETRIES:
+    async def _process_game_chunk_with_retries(self, chunk: List[Dict[str, Any]], max_retries: int = 3) -> List[str]:
+        """Process a chunk of games with retries and transaction handling."""
+        for attempt in range(max_retries):
             try:
+                bt.logging.debug(f"Starting game chunk processing (attempt {attempt + 1}/{max_retries})")
+                bt.logging.debug(f"Chunk size: {len(chunk)} games")
+                
+                # Log the first game in the chunk for debugging
+                if chunk:
+                    bt.logging.debug(f"Sample game data: {chunk[0]}")
+                
                 async with async_timeout.timeout(self.TRANSACTION_TIMEOUT):
+                    bt.logging.debug(f"Transaction timeout set to {self.TRANSACTION_TIMEOUT} seconds")
                     async with self.db_manager.transaction() as session:
+                        bt.logging.debug("Transaction started")
                         chunk_ids = await self.insert_or_update_games(chunk, session)
-                        if chunk_ids:
-                            bt.logging.info(f"Successfully processed chunk of {len(chunk)} games")
-                            return chunk_ids
+                        bt.logging.debug(f"Transaction completed successfully. Processed {len(chunk_ids)} games")
+                        return chunk_ids
+                        
             except asyncio.TimeoutError:
-                bt.logging.warning(f"Timeout processing chunk (attempt {retries + 1})")
-                retries += 1
+                bt.logging.error(f"Transaction timeout on attempt {attempt + 1}")
+                if attempt == max_retries - 1:
+                    bt.logging.error("Max retries reached for transaction timeout")
+                    raise
+                await asyncio.sleep(1)
+                
+            except asyncio.CancelledError as e:
+                bt.logging.error(f"Transaction cancelled on attempt {attempt + 1}")
+                bt.logging.error(f"Cancellation context: {e.__context__}")
+                bt.logging.error(f"Cancellation traceback: {traceback.format_exc()}")
+                if attempt == max_retries - 1:
+                    bt.logging.error("Max retries reached for transaction cancellation")
+                    raise
+                await asyncio.sleep(1)
+                
             except Exception as e:
-                bt.logging.error(f"Error processing chunk: {str(e)}")
-                bt.logging.error(traceback.format_exc())
-                retries += 1
-        
-        bt.logging.error(f"Failed to process chunk after {self.MAX_RETRIES} attempts")
-        return []
+                bt.logging.error(f"Error processing game chunk on attempt {attempt + 1}: {str(e)}")
+                bt.logging.error(f"Error traceback: {traceback.format_exc()}")
+                if attempt == max_retries - 1:
+                    bt.logging.error("Max retries reached for general error")
+                    raise
+                await asyncio.sleep(1)
 
     async def _process_entropy_updates_in_batches(self, games):
-        """Process entropy updates in very small batches with independent timeouts"""
+        """Process entropy updates in very small batches, saving state once at the end."""
+        processed_count = 0
+        total_batches = (len(games) + self.ENTROPY_BATCH_SIZE - 1) // self.ENTROPY_BATCH_SIZE
+        
         for i in range(0, len(games), self.ENTROPY_BATCH_SIZE):
             batch = games[i:i + self.ENTROPY_BATCH_SIZE]
+            batch_num = i // self.ENTROPY_BATCH_SIZE + 1
             
-            # First update entropy system (memory operations)
+            # Update entropy system (memory operations)
             try:
                 game_data = self.prepare_game_data_for_entropy(batch)
+                if not game_data:
+                    continue
+                
                 for game in game_data:
                     await self.entropy_system.add_new_game(
                         game["id"], 
                         len(game["current_odds"]), 
                         game["current_odds"]
                     )
-                bt.logging.debug(f"Added batch {i//self.ENTROPY_BATCH_SIZE + 1} to entropy system")
+                processed_count += len(game_data)
+                bt.logging.debug(f"Added batch {batch_num}/{total_batches} ({len(game_data)} games) to entropy system")
             except Exception as e:
-                bt.logging.error(f"Error updating entropy system for batch {i//self.ENTROPY_BATCH_SIZE + 1}: {str(e)}")
+                bt.logging.error(f"Error updating entropy system for batch {batch_num}/{total_batches}: {str(e)}")
                 continue
             
             # REMOVED state saving from within this loop
@@ -332,7 +362,7 @@ class SportsData:
                         continue
 
                     # Process game data and execute update
-                    params = self._prepare_game_params(game)
+                    params = await self._prepare_game_params(game)
                     if not params:
                         continue
 
@@ -444,13 +474,20 @@ class SportsData:
             :team_b_odds, :tie_odds, :can_tie
         )
         ON CONFLICT(external_id) DO UPDATE SET
+            game_id = COALESCE(game_data.game_id, excluded.game_id),
+            create_date = COALESCE(game_data.create_date, excluded.create_date),
+            team_a = excluded.team_a,
+            team_b = excluded.team_b,
+            sport = excluded.sport,
+            league = excluded.league,
             team_a_odds = excluded.team_a_odds,
             team_b_odds = excluded.team_b_odds,
             tie_odds = excluded.tie_odds,
             event_start_date = excluded.event_start_date,
             active = excluded.active,
             outcome = excluded.outcome,
-            last_update_date = excluded.last_update_date
+            last_update_date = excluded.last_update_date,
+            can_tie = excluded.can_tie
         """
 
     def prepare_game_data_for_entropy(self, games):
@@ -607,6 +644,176 @@ class SportsData:
         except Exception as e:
             bt.logging.error(f"Error in ensure_predictions_have_entropy_score: {e}")
             bt.logging.error(f"Traceback:\n{traceback.format_exc()}")
+
+    async def _fix_null_game_data(self):
+        """Check for and fix any games with null create_date or game_id values."""
+        try:
+            bt.logging.info("Starting null game data fix operation")
+            
+            # Find games with null create_date or game_id
+            query = """
+                SELECT external_id, game_id, create_date, event_start_date 
+                FROM game_data
+                WHERE create_date IS NULL OR game_id IS NULL
+            """
+            
+            null_games = await self.db_manager.fetch_all(query, {})
+            if not null_games:
+                bt.logging.info("No games found with null critical fields.")
+                return
+                
+            bt.logging.info(f"Found {len(null_games)} games with null critical fields. Starting fix...")
+            
+            # Fix games using a transaction
+            try:
+                async with self.db_manager.transaction() as session:
+                    bt.logging.debug("Transaction started for null game data fix")
+                    # Fix each game
+                    current_time = datetime.now(timezone.utc).isoformat()
+                    for game in null_games:
+                        external_id = game.get('external_id')
+                        if not external_id:
+                            continue
+                            
+                        # Generate values for null fields
+                        game_id = game.get('game_id')
+                        if not game_id:
+                            game_id = str(uuid.uuid4())
+                        
+                        # Calculate create_date as event_start_date minus 1 week if null
+                        create_date = game.get('create_date')
+                        if not create_date:
+                            event_start_date = game.get('event_start_date')
+                            if event_start_date:
+                                try:
+                                    # Parse the event start date and subtract 1 week
+                                    event_dt = datetime.fromisoformat(event_start_date.replace('Z', '+00:00'))
+                                    create_dt = event_dt - timedelta(days=7)
+                                    create_date = create_dt.isoformat()
+                                except (ValueError, AttributeError):
+                                    # Fallback to current time if parsing fails
+                                    create_date = current_time
+                            else:
+                                create_date = current_time
+                        
+                        # Update the record
+                        update_query = """
+                            UPDATE game_data
+                            SET game_id = :game_id, create_date = :create_date
+                            WHERE external_id = :external_id
+                        """
+                        
+                        await session.execute(
+                            text(update_query), 
+                            {
+                                "game_id": game_id,
+                                "create_date": create_date,
+                                "external_id": external_id
+                            }
+                        )
+                        
+                        bt.logging.debug(f"Fixed game with external_id: {external_id}")
+                    
+                    bt.logging.debug("Transaction completed successfully for null game data fix")
+                    
+            except asyncio.CancelledError as e:
+                bt.logging.error("Transaction cancelled during null game data fix")
+                bt.logging.error(f"Cancellation context: {e.__context__}")
+                bt.logging.error(f"Cancellation traceback: {traceback.format_exc()}")
+                raise
+                
+            bt.logging.info(f"Successfully fixed {len(null_games)} games with null critical fields.")
+            
+        except Exception as e:
+            bt.logging.error(f"Error fixing null game data: {str(e)}")
+            bt.logging.error(traceback.format_exc())
+
+    async def _fix_null_miner_keys(self):
+        """Fix null hotkey/coldkey values in miner_stats by fetching current network state."""
+        try:
+            bt.logging.info("Starting null miner keys fix operation")
+            
+            # Find miners with null keys
+            query = """
+                SELECT miner_uid, miner_hotkey, miner_coldkey
+                FROM miner_stats
+                WHERE miner_hotkey IS NULL OR miner_coldkey IS NULL
+                AND miner_uid < 256
+            """
+            
+            null_miners = await self.db_manager.fetch_all(query, {})
+            if not null_miners:
+                bt.logging.info("No miners found with null hotkey/coldkey values.")
+                return
+                
+            bt.logging.info(f"Found {len(null_miners)} miners with null hotkey/coldkey values. Starting fix...")
+            
+            # Get current network state
+            try:
+                bt.logging.debug("Fetching current network state from subtensor")
+                # Get current network state from subtensor
+                subtensor = bt.subtensor()
+                neurons = subtensor.neurons()
+                
+                # Create mapping of UID to hotkey/coldkey
+                uid_to_keys = {}
+                for neuron in neurons:
+                    if hasattr(neuron, 'uid') and hasattr(neuron, 'hotkey') and hasattr(neuron, 'coldkey'):
+                        uid_to_keys[neuron.uid] = {
+                            'hotkey': neuron.hotkey,
+                            'coldkey': neuron.coldkey
+                        }
+                
+                bt.logging.info(f"Retrieved {len(uid_to_keys)} current network mappings")
+                
+                # Fix miners using a transaction
+                try:
+                    async with self.db_manager.transaction() as session:
+                        bt.logging.debug("Transaction started for null miner keys fix")
+                        for miner in null_miners:
+                            miner_uid = miner.get('miner_uid')
+                            if miner_uid not in uid_to_keys:
+                                bt.logging.warning(f"No current network mapping found for miner {miner_uid}")
+                                continue
+                                
+                            keys = uid_to_keys[miner_uid]
+                            
+                            # Update the record
+                            update_query = """
+                                UPDATE miner_stats
+                                SET miner_hotkey = :hotkey,
+                                    miner_coldkey = :coldkey
+                                WHERE miner_uid = :miner_uid
+                            """
+                            
+                            await session.execute(
+                                text(update_query), 
+                                {
+                                    "hotkey": keys['hotkey'],
+                                    "coldkey": keys['coldkey'],
+                                    "miner_uid": miner_uid
+                                }
+                            )
+                            
+                            bt.logging.debug(f"Fixed keys for miner {miner_uid}")
+                        
+                        bt.logging.debug("Transaction completed successfully for null miner keys fix")
+                        
+                except asyncio.CancelledError as e:
+                    bt.logging.error("Transaction cancelled during null miner keys fix")
+                    bt.logging.error(f"Cancellation context: {e.__context__}")
+                    bt.logging.error(f"Cancellation traceback: {traceback.format_exc()}")
+                    raise
+                
+                bt.logging.info(f"Successfully fixed {len(null_miners)} miners with null hotkey/coldkey values.")
+                
+            except Exception as e:
+                bt.logging.error(f"Error fetching network state: {str(e)}")
+                bt.logging.error(traceback.format_exc())
+            
+        except Exception as e:
+            bt.logging.error(f"Error fixing null miner keys: {str(e)}")
+            bt.logging.error(traceback.format_exc())
 
 
 

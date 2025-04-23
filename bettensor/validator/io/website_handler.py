@@ -100,6 +100,9 @@ class WebsiteHandler:
         network = self.validator.subtensor.network
 
         try:
+            bt.logging.info(f"Starting to send predictions. Network: {network}")
+            bt.logging.info(f"Total predictions to process: {len(predictions_by_miner_uid) if isinstance(predictions_by_miner_uid, list) else sum(len(preds) for preds in predictions_by_miner_uid.values())}")
+
             # Convert list to dictionary grouped by miner_uid
             if isinstance(predictions_by_miner_uid, list):
                 grouped_predictions = {}
@@ -112,10 +115,12 @@ class WebsiteHandler:
 
             for miner_uid, predictions in predictions_by_miner_uid.items():
                 try:
+                    bt.logging.info(f"Processing predictions for miner_uid: {miner_uid}")
                     # Fetch or update coldkey once per miner_uid
                     hotkey = self.validator.metagraph.hotkeys[miner_uid]
                     if hotkey:
                         coldkey = await self.get_or_update_coldkey(hotkey)
+                        bt.logging.debug(f"Got coldkey for miner {miner_uid}: {coldkey}")
                     else:
                         bt.logging.warning(f"Invalid miner_uid: {miner_uid}. Setting coldkey to 'dummy_coldkey'.")
                         coldkey = "dummy_coldkey"
@@ -125,6 +130,7 @@ class WebsiteHandler:
                         "SELECT * FROM miner_stats WHERE miner_uid = :miner_uid", 
                         {'miner_uid': miner_uid}
                     )
+                    bt.logging.debug(f"Got miner stats for {miner_uid}: {miner_stats}")
 
                     transformed_data = []
                     for prediction in predictions:
@@ -167,6 +173,7 @@ class WebsiteHandler:
                             }
 
                             transformed_data.append(transformed_prediction)
+                            bt.logging.debug(f"Transformed prediction {prediction.get('prediction_id')} for miner {miner_uid}")
 
                         except Exception as e:
                             bt.logging.error(f"Error processing prediction_id {prediction.get('prediction_id', 'Unknown')} for miner_uid {miner_uid}: {e}")
@@ -178,13 +185,13 @@ class WebsiteHandler:
                         continue
 
                     bt.logging.info(f"Sending {len(transformed_data)} predictions to API for miner_uid: {miner_uid}")
-                    #bt.logging.debug(f"First prediction (for debugging): {json.dumps(transformed_data[0], indent=2)}")
+                    bt.logging.debug(f"First prediction (for debugging): {json.dumps(transformed_data[0], indent=2)}")
 
                     response = requests.post(url, data=json.dumps(transformed_data), headers=headers)
+                    bt.logging.info(f"API Response status code for miner_uid {miner_uid}: {response.status_code}")
+                    bt.logging.debug(f"API Response content: {response.text}")
+
                     if response.status_code in [200, 201]:
-                       #bt.logging.info(f"Response status code for miner_uid {miner_uid}: {response.status_code}")
-                        #bt.logging.debug(f"Response content: {response.text}")
-                        
                         # Mark these specific predictions as sent using IN clause instead of ANY
                         prediction_ids = [p.get('prediction_id') for p in predictions if p.get('prediction_id') is not None]
                         if not prediction_ids:
@@ -201,6 +208,7 @@ class WebsiteHandler:
                             f"UPDATE predictions SET sent_to_site = 1 WHERE prediction_id IN ({named_placeholders})",
                             params_dict # Pass the dictionary of named parameters
                         )
+                        bt.logging.info(f"Successfully marked {len(prediction_ids)} predictions as sent for miner_uid {miner_uid}")
                     else:
                         bt.logging.error(f"Failed to send predictions for miner_uid {miner_uid}. Status code: {response.status_code}, Response: {response.text}")
 

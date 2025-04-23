@@ -134,6 +134,13 @@ class TeamGamePrediction(BaseModel):
     """
     Data class from json. Will need to be modified in the future for more complex prediction types.
     """
+    
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "protected_namespaces": (),
+        "extra": "allow"
+    }
 
     prediction_id: str = Field(..., description="UUID of the prediction")
     game_id: str = Field(..., description="Game ID - Not Unique (External ID from API)")
@@ -171,6 +178,12 @@ class TeamGame(BaseModel):
     """
     Data class from json. May need to be modified in the future for more complex prediction types
     """
+    
+    model_config = {
+        "arbitrary_types_allowed": True,
+        "validate_assignment": True,
+        "extra": "allow"
+    }
 
     game_id: str = Field(
         ...,
@@ -189,6 +202,51 @@ class TeamGame(BaseModel):
     team_b_odds: float = Field(..., description="Team B odds")
     tie_odds: float = Field(..., description="Tie odds")
     can_tie: bool = Field(..., description="Can tie")
+    
+    @classmethod
+    def create_from_row(cls, row_dict):
+        """
+        Create a TeamGame from a database row with null handling
+        """
+        current_time = datetime.now(timezone.utc).isoformat()
+        
+        # Get event_start_date for default create_date calculation
+        event_start_date = row_dict.get('event_start_date')
+        if event_start_date is None:
+            event_start_date = current_time
+            
+        # Calculate create_date as event_start_date minus 1 week if null
+        create_date = row_dict.get('create_date')
+        if create_date is None:
+            try:
+                # Parse the event start date and subtract 1 week
+                event_dt = datetime.fromisoformat(event_start_date.replace('Z', '+00:00'))
+                create_dt = event_dt - timedelta(days=7)
+                create_date = create_dt.isoformat()
+            except (ValueError, AttributeError):
+                # Fallback to current time if parsing fails
+                create_date = current_time
+            
+        last_update_date = row_dict.get('last_update_date')
+        if last_update_date is None:
+            last_update_date = current_time
+            
+        return cls(
+            game_id=row_dict.get('game_id', str(uuid.uuid4())),
+            team_a=row_dict.get('team_a', 'Team A'),
+            team_b=row_dict.get('team_b', 'Team B'),
+            sport=row_dict.get('sport', 'Unknown'),
+            league=row_dict.get('league', 'Unknown'),
+            create_date=create_date,
+            last_update_date=last_update_date,
+            event_start_date=event_start_date,
+            active=bool(row_dict.get('active', True)),
+            outcome=str(row_dict.get('outcome', '3')),
+            team_a_odds=float(row_dict.get('team_a_odds', 0)),
+            team_b_odds=float(row_dict.get('team_b_odds', 0)),
+            tie_odds=float(row_dict.get('tie_odds', 0)),
+            can_tie=bool(row_dict.get('can_tie', False))
+        )
 
 
 class GameData(bt.Synapse):

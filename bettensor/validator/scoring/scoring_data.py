@@ -164,7 +164,7 @@ class ScoringData:
         return structured_predictions, closing_line_odds, results
 
     async def _fetch_closed_game_data(self, date_str):
-        """Fetch closed game data for a specific date."""
+        """Fetch closed game data started within the 48 hours preceding the end of the specified date."""
         try:
             # Parse the input date
             target_date = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')
@@ -175,7 +175,7 @@ class ScoringData:
             
             # Modified query to handle outcome as integer
             query = """
-                SELECT 
+                SELECT
                     external_id,
                     event_start_date,
                     team_a_odds,
@@ -192,7 +192,7 @@ class ScoringData:
                         ELSE 3
                     END as outcome
                 FROM game_data
-                WHERE event_start_date BETWEEN :start_date AND :end_date
+                WHERE event_start_date BETWEEN :start_iso AND :end_iso
                 AND outcome IS NOT NULL
                 AND (
                     (outcome::text ~ '^[0-9]+$' AND outcome::integer != 3)
@@ -200,14 +200,14 @@ class ScoringData:
                 )
                 ORDER BY event_start_date ASC
             """
-            
+
             params = {
-                "start_date": formatted_start,
-                "end_date": formatted_end
+                "start_iso": formatted_start_iso,
+                "end_iso": formatted_end_iso
             }
-            
+
             games = await self.db_manager.fetch_all(query, params)
-            
+
             if not games:
                 bt.logging.warning(f"No closed games found for date {date_str}")
                 return []

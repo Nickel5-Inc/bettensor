@@ -6,7 +6,7 @@ import math
 import bittensor as bt
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from scipy.spatial.distance import euclidean
 import os
 import asyncio
@@ -48,6 +48,10 @@ class EntropySystem:
         self.closed_games = set()
         self.game_close_times = {}
         self.db_manager = db_manager  # Store db_manager reference
+
+        # Initialize final_scores and daily_contributions
+        self.final_scores = defaultdict(lambda: defaultdict(float))
+        self.daily_contributions = defaultdict(lambda: defaultdict(float))
 
         # Add tracking for changes since last save
         self._changes_since_save = {
@@ -1196,4 +1200,56 @@ class EntropySystem:
         """Clear the delta tracking after successful save"""
         self._delta_games = {}
         self._delta_predictions = {}
+
+    def reset_miner_data(self, miner_uid: int):
+        """
+        Reset all entropy-related data for a specific miner.
+        Called when a miner is deregistered or when its hotkey changes.
+        
+        Args:
+            miner_uid (int): The UID of the miner to reset
+        """
+        bt.logging.info(f"Resetting entropy data for miner {miner_uid}")
+        
+        # Reset final scores for this miner across all days
+        for day in range(self.max_days):
+            self.final_scores[day][miner_uid] = 0.0
+            
+        # Reset the miner's predictions from all game pools
+        predictions_removed = 0
+        for game_id, outcomes in self.game_pools.items():
+            for outcome, pool in outcomes.items():
+                # Filter out this miner's predictions
+                miner_predictions = [p for p in pool["predictions"] if p["miner_uid"] == miner_uid]
+                predictions_removed += len(miner_predictions)
+                
+                # Remove this miner's predictions
+                pool["predictions"] = [p for p in pool["predictions"] if p["miner_uid"] != miner_uid]
+                
+                # Recalculate entropy score if predictions were removed
+                if miner_predictions:
+                    # Only recalculate if there are still predictions
+                    if pool["predictions"]:
+                        self._calculate_pool_entropy(pool)
+                    else:
+                        pool["entropy_score"] = 0.0
+        
+        bt.logging.info(f"Removed {predictions_removed} entropy predictions for miner {miner_uid}")
+        
+        # Reset miner's contribution totals
+        for day in range(self.max_days):
+            if miner_uid in self.daily_contributions[day]:
+                self.daily_contributions[day][miner_uid] = 0.0
+                
+        bt.logging.info(f"Successfully reset entropy data for miner {miner_uid}")
+
+    def initialize_from_data(self, data: Dict[str, Any]):
+        """
+        Initialize the entropy system from saved data.
+        
+        Args:
+            data (Dict[str, Any]): The saved data to restore from
+        """
+        # Method implementation will be added in the future
+        pass
 
