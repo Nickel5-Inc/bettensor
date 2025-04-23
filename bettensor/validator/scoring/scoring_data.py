@@ -202,8 +202,8 @@ class ScoringData:
             """
 
             params = {
-                "start_iso": formatted_start_iso,
-                "end_iso": formatted_end_iso
+                "start_iso": formatted_start,
+                "end_iso": formatted_end
             }
 
             games = await self.db_manager.fetch_all(query, params)
