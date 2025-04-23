@@ -24,7 +24,7 @@ async def check_and_install_dependencies():
         await process.wait() 
         if process.returncode == 0:
             psql_found = True
-            bt.logging.debug("PostgreSQL client ('psql') found.")
+            #bt.logging.debug("PostgreSQL client ('psql') found.")
         #else: psql not found, proceed to attempt install
             
     except Exception as e:

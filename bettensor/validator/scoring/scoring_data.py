@@ -472,13 +472,16 @@ class ScoringData:
             bt.logging.info(f"Updating miner stats for day {current_day}...")
             
             # Update miner_hotkey and miner_coldkey from metagraph
-            updates = []
-            column_names = ['miner_uid', 'miner_hotkey', 'miner_coldkey']
+            hotkey_coldkey_updates = []
             
             for miner_uid in range(min(256, len(self.validator.metagraph.hotkeys))):
                 hotkey = self.validator.metagraph.hotkeys[miner_uid]
                 coldkey = self.validator.metagraph.coldkeys[miner_uid]
-                updates.append((miner_uid, hotkey, coldkey))
+                hotkey_coldkey_updates.append({
+                    'miner_uid': miner_uid,
+                    'miner_hotkey': hotkey,
+                    'miner_coldkey': coldkey
+                })
 
             # First clear any existing hotkey/coldkey mappings that might conflict
             await self.db_manager.execute_query(
@@ -495,21 +498,20 @@ class ScoringData:
             # Then do the batch update with proper column names
             await self.db_manager.executemany(
                 """INSERT INTO miner_stats (miner_uid, miner_hotkey, miner_coldkey)
-                   VALUES (?, ?, ?)
+                   VALUES (:miner_uid, :miner_hotkey, :miner_coldkey)
                    ON CONFLICT(miner_uid) DO UPDATE SET
                    miner_hotkey = EXCLUDED.miner_hotkey,
                    miner_coldkey = EXCLUDED.miner_coldkey
                    WHERE (
-                       miner_hotkey IS NULL 
-                       OR miner_hotkey = EXCLUDED.miner_hotkey
+                       miner_stats.miner_hotkey IS NULL 
+                       OR miner_stats.miner_hotkey = EXCLUDED.miner_hotkey
                        OR NOT EXISTS (
                            SELECT 1 FROM miner_stats 
                            WHERE miner_hotkey = EXCLUDED.miner_hotkey 
                            AND miner_uid != EXCLUDED.miner_uid
                        )
                    )""",
-                updates,
-                column_names=column_names
+                hotkey_coldkey_updates,
             )
 
             # Continue with rest of the updates...
@@ -518,18 +520,19 @@ class ScoringData:
             
             # Update current tiers
             tier_updates = []
-            tier_column_names = ['tier', 'miner_uid']
             for miner_uid, current_tier in tiers_dict.items():
                 if miner_uid < 256:  # Only update valid UIDs
                     # Add 1 to tier value to match internal tier indexing
-                    tier_updates.append((int(current_tier + 1), int(miner_uid)))
+                    tier_updates.append({
+                        'tier': int(current_tier + 1),
+                        'miner_uid': int(miner_uid)
+                    })
             
             await self.db_manager.executemany(
                 """UPDATE miner_stats
                    SET miner_current_tier = CAST(:tier AS INTEGER)
                    WHERE miner_uid = CAST(:miner_uid AS INTEGER)""",
                 tier_updates,
-                column_names=tier_column_names
             )
             
             await self._update_current_daily_scores(current_day, tiers_dict)
@@ -738,24 +741,32 @@ class ScoringData:
         """
         bt.logging.info("Updating additional miner fields...")
 
-        # Placeholder for additional field updates
+        # Use named parameters for PostgreSQL
         update_additional_fields_query = """
             UPDATE miner_stats
             SET
-                miner_rank = ?,
-                miner_status = ?,
-                miner_cash = ?,
-                miner_current_incentive = ?
-            WHERE miner_uid = ?
+                miner_rank = :miner_rank,
+                miner_status = :miner_status,
+                miner_cash = :miner_cash,
+                miner_current_incentive = :miner_current_incentive
+            WHERE miner_uid = :miner_uid
         """
-        additional_records = []
+        additional_records = [] # List of dictionaries
         for miner_uid in range(len(self.validator.metagraph.hotkeys)-1):
             miner_rank = self.get_miner_rank(miner_uid)
             miner_status = self.get_miner_status(miner_uid)
             miner_cash = await self.calculate_miner_cash(miner_uid)
             miner_current_incentive = self.get_miner_current_incentive(miner_uid)
-            additional_records.append((miner_rank, miner_status, miner_cash, miner_current_incentive, miner_uid))
+            # Append a dictionary with named parameters
+            additional_records.append({
+                'miner_rank': miner_rank,
+                'miner_status': miner_status,
+                'miner_cash': miner_cash,
+                'miner_current_incentive': miner_current_incentive,
+                'miner_uid': miner_uid
+            })
         
+        # Pass query with named params and list of dicts
         await self.db_manager.executemany(update_additional_fields_query, additional_records)
         bt.logging.debug("Additional miner fields updated.")
 
@@ -819,11 +830,15 @@ class ScoringData:
         query = """
             SELECT SUM(wager) as total_wager
             FROM predictions
-            WHERE miner_uid = ?
-              AND prediction_date >= ?
+            WHERE miner_uid = :miner_uid
+              AND prediction_date >= :start_date
         """
-        result = await self.db_manager.fetch_one(query, (miner_uid, start_of_today))
-        total_wager = result['total_wager'] if result['total_wager'] is not None else 0.0
+        params = {
+            'miner_uid': miner_uid,
+            'start_date': start_of_today
+        }
+        result = await self.db_manager.fetch_one(query, params)
+        total_wager = result['total_wager'] if result and result['total_wager'] is not None else 0.0
 
         return 1000 - float(total_wager)
 

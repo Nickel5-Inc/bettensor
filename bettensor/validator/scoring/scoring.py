@@ -47,48 +47,67 @@ class ScoringSystem:
         min_stake_service = None,
     ):
         """
-        Initializes the scoring system.
-        
+        Initializes the ScoringSystem.
         Args:
-            db_manager: Instance of DatabaseManager for database access.
-            num_miners: Total number of miners in the subnet.
-            max_days: Number of days to store historical data.
-            current_date: Optional datetime object for the current date.
-            force_rebuild: Flag to force rebuilding of historical scores.
+            db_manager: Instance of PostgresDatabaseManager.
+            num_miners: The number of miners in the network.
+            max_days: The maximum number of days to store scores for.
+            current_date: Optional initial date.
+            force_rebuild: If True, forces a rebuild of historical scores.
             min_stake_service: Instance of MinStakeService.
         """
         self.db_manager = db_manager
         self.num_miners = num_miners
         self.max_days = max_days
-        self.current_date = self._ensure_datetime(current_date or datetime.now(timezone.utc))
+        self.validator = None # Will be set later via set_validator
+        self.scoring_data = None # Will be set later via set_validator
+        self.hotkey_map = {} # Will be populated in set_validator
         self.min_stake_service = min_stake_service
-        self.force_rebuild = force_rebuild # Store force_rebuild flag
+        self.init = True # Initialize init flag
 
-        # Initialize arrays
-        self.tiers = np.ones((num_miners, max_days), dtype=np.int8) # Track tier per miner per day
-        self.clv_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.roi_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.sortino_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.entropy_scores = np.zeros((num_miners, max_days), dtype=np.float32)
-        self.composite_scores = np.zeros((num_miners, max_days, 6), dtype=np.float32)  # 6 = daily + 5 tiers
-        self.amount_wagered = np.zeros((num_miners, max_days), dtype=np.float32)
-        
-        # Common attributes
-        self.validator = None
-        self.miner_data = None
-        self.incentives = []
-        self.last_update_date = None
-        self.scoring_data = None
-        self.entropy_system = EntropySystem(num_miners, max_days, db_manager=db_manager) # ADD THIS LINE
-        
-        self.num_tiers = 7  # 5 tiers + 2 for invalid UIDs (0) and empty network slots (-1)
+        # --- Score WEIGHT INITIALIZATION ---
+        self.clv_weight = 0.3
+        self.roi_weight = 0.3
+        self.sortino_weight = 0.3
+        self.entropy_weight = 0.1
+        # --- END ADDED ---
+
+        # --- ADDED UID SET INITIALIZATION ---
+        self.invalid_uids = set()
         self.valid_uids = set()
-        self.reference_date = datetime(year=2024, month=9, day=30, tzinfo=timezone.utc)
-        self.invalid_uids = []
-        self.epsilon = 1e-8  # Small constant to prevent division by zero
+        self.empty_uids = set(range(self.num_miners)) # Initialize empty UIDs as well
+        # --- END ADDED ---
 
-        # Initialize tier configurations
-        self.tier_configs = [
+        # Initialize score arrays
+        self.clv_scores = np.zeros((num_miners, max_days))
+        self.roi_scores = np.zeros((num_miners, max_days))
+        self.sortino_scores = np.zeros((num_miners, max_days))
+        self.entropy_scores = np.zeros((num_miners, max_days))
+        self.composite_scores = np.zeros((num_miners, max_days, 6))  # Added dimension for tiers
+        self.amount_wagered = np.zeros((num_miners, max_days))
+        self.tiers = np.full((num_miners, max_days), -1, dtype=int)
+
+        # --- ADDED MISSING INITIALIZATION --- 
+        self.current_day = 0 # Represents the current index in the circular buffer
+        # --- END ADDED --- 
+
+        # Initialize reference date and last update date
+        now = datetime.now(timezone.utc)
+        self.current_date = current_date if current_date else now
+        self.current_date = self.current_date.replace(
+             hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+        )
+        self.reference_date = self.current_date - timedelta(days=max_days - 1)
+        self.last_update_date = None # Will be set on first load or advance
+
+        # Store the force_rebuild flag
+        self.force_rebuild = force_rebuild
+
+        # Initialize the Entropy System, passing the db_manager
+        self.entropy_system = EntropySystem(num_miners, max_days, db_manager=self.db_manager)
+
+        # Tier definitions
+        self.tier_definitions = [
             {
                 "window": 0,
                 "min_wager": 0,
@@ -142,6 +161,9 @@ class ScoringSystem:
             4: "tier_4",
             5: "tier_5"
         }
+
+        # Calculate and store the number of tiers
+        self.num_tiers = len(self.tier_definitions)
 
         # numpy max integer setting
         max_int = np.iinfo(np.int64).max
@@ -394,7 +416,7 @@ class ScoringSystem:
         if tier <= 1:  # Tier 0 and 1 have no requirements
             return True
             
-        config = self.tier_configs[tier]
+        config = self.tier_definitions[tier]
         window = config["window"]
         min_wager = config["min_wager"]
         
@@ -483,7 +505,7 @@ class ScoringSystem:
             composite_scores_day = self.composite_scores[:, self.current_day, :]
             
             bt.logging.debug(f"Composite Scores Shape: {self.composite_scores.shape}")
-            bt.logging.info(f"Current tiers before management: {np.bincount(current_tiers, minlength=self.num_tiers)}")
+            bt.logging.info(f"Current tiers before management: {np.bincount(current_tiers[current_tiers >= 0], minlength=self.num_tiers)}")
 
             # Step 1: Check for and perform demotions (top-down)
             for tier in range(self.num_tiers - 1, 1, -1):
@@ -501,7 +523,7 @@ class ScoringSystem:
             # Set invalid UIDs to tier 0
             self.tiers[list(invalid_uids), self.current_day] = 0
 
-            bt.logging.info(f"Current tiers after management: {np.bincount(current_tiers, minlength=self.num_tiers)}")
+            bt.logging.info(f"Current tiers after management: {np.bincount(current_tiers[current_tiers >= 0], minlength=self.num_tiers)}")
             bt.logging.info("Tier management completed")
 
         except Exception as e:
@@ -518,7 +540,7 @@ class ScoringSystem:
             # Only consider valid miners from tier 2 and above
             lower_tier_miners = np.where((tiers <= tier - 1) & np.isin(np.arange(len(tiers)), list(valid_uids)))[0]
             # Calculate open slots based on tier capacity and current occupancy
-            tier_capacity = self.tier_configs[tier]["capacity"]
+            tier_capacity = self.tier_definitions[tier]["capacity"]
             current_occupancy = len(current_tier_miners)
             open_slots = max(0, tier_capacity - current_occupancy)
             eligible_miners = [
@@ -813,13 +835,13 @@ class ScoringSystem:
             
             # Create dictionary of populated tiers
             populated_tiers = {}
-            for tier in range(1, len(self.tier_configs) + 1):
+            for tier in range(1, len(self.tier_definitions) + 1):
                 miners = np.where(current_tiers == tier)[0]
                 if len(miners) > 0:
                     populated_tiers[tier] = {
                         'miners': miners,
-                        'base_incentive': self.tier_configs[tier-1]['incentive'],
-                        'adjusted_incentive': self.tier_configs[tier-1]['incentive']
+                        'base_incentive': self.tier_definitions[tier-1]['incentive'],
+                        'adjusted_incentive': self.tier_definitions[tier-1]['incentive']
                     }
             
             if not populated_tiers:
@@ -1005,7 +1027,7 @@ class ScoringSystem:
             current_tiers = self.tiers[:, self.current_day]
             tier_distribution = [
                 int(np.sum(current_tiers == tier))
-                for tier in range(0, len(self.tier_configs) + 1)
+                for tier in range(0, len(self.tier_definitions) + 1)
             ]
             bt.logging.info(f"Current tier distribution: {tier_distribution}")
 
@@ -1404,6 +1426,13 @@ class ScoringSystem:
 
         for miner in range(self.num_miners):
             hotkey = self.hotkey_map.get(miner) if hotkey_available else None
+
+            # <<< ADDED CHECK >>>
+            # If hotkey map is available but the specific hotkey is missing, skip this miner
+            if hotkey_available and hotkey is None:
+                bt.logging.warning(f"Missing hotkey for miner UID {miner} in hotkey_map. Skipping score saving for this miner.")
+                continue
+            # <<< END ADDED CHECK >>>
 
             # Daily scores - Create dictionary
             daily_record_dict = {
@@ -2016,7 +2045,7 @@ class ScoringSystem:
 
             # Calculate rolling averages for each tier
             for tier in range(2, 7):  # Tiers 2-6
-                window = self.tier_configs[tier]["window"]
+                window = self.tier_definitions[tier]["window"]
                 start_day = (day_index - window + 1) % self.max_days
                 
                 bt.logging.debug(f"\n=== Processing Tier {tier} ===")
@@ -2210,17 +2239,20 @@ class ScoringSystem:
         """Save scores for a specific day to the database."""
         try:
             # First ensure miner_stats entries exist for all miners
+            # Use ON CONFLICT DO NOTHING for PostgreSQL compatibility
             miner_stats_query = """
-            INSERT OR IGNORE INTO miner_stats (miner_uid)
-            VALUES (?)
+            INSERT INTO miner_stats (miner_uid)
+            VALUES (:miner_uid)
+            ON CONFLICT (miner_uid) DO NOTHING
             """
-            miner_stats_params = [(i,) for i in range(self.num_miners)]
+            # Prepare parameters as list of dictionaries for executemany with named params
+            miner_stats_params = [{'miner_uid': i} for i in range(self.num_miners)]
             await self.db_manager.executemany(miner_stats_query, miner_stats_params)
 
-            # Delete existing scores for this day
+            # Delete existing scores for this day using named parameters
             await self.db_manager.execute_query(
-                "DELETE FROM scores WHERE day_id = ?",
-                (day_id,)
+                "DELETE FROM scores WHERE day_id = :day_id",
+                {'day_id': day_id} # Pass params as a dictionary
             )
             
             # Prepare data as a list of dictionaries with string keys
@@ -2301,7 +2333,7 @@ class ScoringSystem:
     @property
     def tier_capacities(self):
         """Get the capacity for each tier."""
-        return [config["capacity"] for config in self.tier_configs]
+        return [config["capacity"] for config in self.tier_definitions]
 
     def check_tier_requirements(self, miner_uid, tier, window_size, min_wager, min_active_days_pct):
         """Check if a miner meets the requirements for a specific tier"""

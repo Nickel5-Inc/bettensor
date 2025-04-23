@@ -444,11 +444,16 @@ class PostgresDatabaseManager:
         Converts SQLite-style queries to PostgreSQL format.
         """
         # Convert query syntax to PostgreSQL format
-        postgres_query = self._convert_query_syntax(query)
+        # <<< REMOVED QUERY CONVERSION >>>
+        # postgres_query = self._convert_query_syntax(query)
+        postgres_query = query # Use original query
         
         async with self.get_session() as session:
             try:
-                result = await session.execute(text(postgres_query), self._convert_params(params))
+                # <<< MODIFIED to remove _convert_params >>>
+                # <<< ADDED WRAP for dict params >>>
+                execute_params = [params] if isinstance(params, dict) else params
+                result = await session.execute(text(postgres_query), execute_params)
                 
                 if postgres_query.strip().upper().startswith("SELECT"):
                     # For SELECT queries, fetch all rows
@@ -476,9 +481,12 @@ class PostgresDatabaseManager:
         try:
             async with self.get_session() as session:
                 # Convert query syntax and parameters if needed
-                postgres_query = self._convert_query_syntax(query)
+                # <<< REMOVED QUERY CONVERSION >>>
+                # postgres_query = self._convert_query_syntax(query)
+                postgres_query = query # Use original query
                 
                 # Handle parameters
+                # <<< KEPT PARAMETER HANDLING for now, might need adjustment if issues persist >>>
                 if params is not None:
                     if isinstance(params, (list, tuple)):
                         # If it's a single-element tuple/list containing a list of IDs
@@ -516,7 +524,10 @@ class PostgresDatabaseManager:
 
                 try:
                     # Execute query with parameters
-                    result = await session.execute(text(postgres_query), postgres_params)
+                    # <<< MODIFIED to remove _convert_params (already processed above) >>>
+                    # <<< ADDED WRAP for dict params >>>
+                    execute_params = [postgres_params] if isinstance(postgres_params, dict) else postgres_params
+                    result = await session.execute(text(postgres_query), execute_params)
                     rows = result.all()
                     if not rows:
                         return []
@@ -545,18 +556,16 @@ class PostgresDatabaseManager:
         try:
             async with self.get_session() as session:
                 # Convert query syntax and parameters if needed
-                postgres_query = self._convert_query_syntax(query)
-                postgres_params = self._convert_params(params) if params else None
-                
-                # Handle list parameters correctly
-                if isinstance(postgres_params, list):
-                    if postgres_params and isinstance(postgres_params[0], (dict, tuple)):
-                        postgres_params = postgres_params[0]
-                    else:
-                        postgres_params = tuple(postgres_params)
+                # <<< REMOVED QUERY CONVERSION >>>
+                # postgres_query = self._convert_query_syntax(query)
+                postgres_query = query # Use original query
+                # <<< MODIFIED to remove _convert_params >>>
+                postgres_params = params # Pass original dict/tuple/None
                 
                 # Execute query with parameters
-                result = await session.execute(text(postgres_query), postgres_params)
+                # <<< WRAP dict params in a list >>>
+                execute_params = [postgres_params] if isinstance(postgres_params, dict) else postgres_params
+                result = await session.execute(text(postgres_query), execute_params)
                 row = result.first()
                 if row is None:
                     return None
@@ -571,7 +580,8 @@ class PostgresDatabaseManager:
         if not self.engine:
             await self._initialize_engine()
             
-        postgres_query = self._convert_query_syntax(query)
+        # Use original query with :named parameters
+        postgres_query = query 
         bt.logging.trace(f"Executing many with query: {postgres_query}")
         # bt.logging.trace(f"Executing many with params (first 5): {params[:5]}") # Be careful logging sensitive data
 
@@ -586,7 +596,19 @@ class PostgresDatabaseManager:
             bt.logging.error(f"Error executing query: \n{query}")
             # Log parameters safely (avoid logging sensitive info)
             if params:
-                 log_params = params[0] if isinstance(params[0], dict) else {f'arg_{i}': v for i, v in enumerate(params[0])}
+                 first_param = params[0]
+                 if isinstance(first_param, dict):
+                     log_params = first_param
+                 elif isinstance(first_param, tuple):
+                     if column_names and len(column_names) == len(first_param):
+                         # Use column_names if available and length matches
+                         log_params = {column_names[i]: v for i, v in enumerate(first_param)}
+                     else:
+                         # Fallback to arg_i if column_names are missing or mismatched
+                         log_params = {f'arg_{i}': v for i, v in enumerate(first_param)}
+                 else:
+                     # Fallback for unexpected type
+                     log_params = {f'arg_0': first_param}
                  bt.logging.error(f"Sample Parameters: {log_params}") 
             else:
                  bt.logging.error("Parameters: []")
@@ -869,9 +891,15 @@ class PostgresDatabaseManager:
             bt.logging.info("Initializing database tables...")
             try:
                 async with self.engine.begin() as conn:
+                    # Re-introduce drop logic when force=True
+                    if force:
+                        bt.logging.warning("Force flag is True. Dropping all tables based on current metadata...")
+                        await conn.run_sync(metadata.drop_all)
+                        bt.logging.info("Tables dropped successfully.")
+                        
                     # NOTE: Drop logic now handled by MigrationManager based on setup.cfg
                     # Use run_sync for the synchronous metadata.create_all method
-                    bt.logging.info("Creating tables if they don't exist (or recreating if forced by MigrationManager)...")
+                    bt.logging.info("Creating tables if they don't exist (or recreating if forced)...")
                     await conn.run_sync(metadata.create_all)
                 bt.logging.info("Table creation/check completed.")
             except Exception as e:

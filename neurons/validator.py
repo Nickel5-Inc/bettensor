@@ -1102,51 +1102,51 @@ async def main():
         # This needs wallet and subtensor to be initialized
         _validator.serve_axon()
 
-        # --- Database Initialization and Migration ---
+        # --- Database Initialization --- 
+        # (Moved before StateSync and Migration)
         bt.logging.info("Initializing database manager...")
-        # Removed config argument from initialize call
         await _validator.db_manager.initialize()
         bt.logging.info("Database manager initialized.")
+        
+        # --- Initialize StateSync ---
+        # (Moved before MigrationManager)
+        # Needs db_manager
+        _validator.is_primary = os.environ.get("VALIDATOR_IS_PRIMARY") == "True"
+        _validator.state_sync = StateSync(
+             state_dir="./bettensor/validator/state", # Ensure correct path
+             db_manager=_validator.db_manager,
+             validator=_validator # Pass the validator instance
+        )
+        bt.logging.info("StateSyncManager initialized.")
 
         # --- Migration Handling --- 
-        # Instantiate MigrationManager (it reads setup.cfg internally for force flag)
+        # Now happens after DB and StateSync are initialized
         migration_manager = MigrationManager(
             sqlite_path=_validator.db_config.get('path', DEFAULT_SQLITE_PATH),
-            pg_config=_validator.db_config # pg_config comes from _validator.db_config
+            pg_config=_validator.db_config, 
+            db_manager=_validator.db_manager, 
+            state_sync_manager=_validator.state_sync 
         )
-        bt.logging.info("Checking and potentially running database migration (controlled by setup.cfg: force_db_reset and migration status)...")
+        bt.logging.info("Checking and potentially running database migration...")
         migration_action_taken = False
         try:
-            # migrate() now returns True if *any* action (forced drop or data migration) was taken
             migration_action_taken = await migration_manager.migrate()
             if migration_action_taken:
-                 bt.logging.info("Migration process completed (either forced drop or data transfer occurred).")
+                 bt.logging.info("Migration process completed.")
             else:
                  bt.logging.info("Migration process determined no action was required.")
                  
-            # Re-initialize DB manager only if migration action was taken (tables might have been dropped/recreated)
             if migration_action_taken:
                 bt.logging.info("Re-initializing database manager post-migration action...")
-                # Pass force=True, removed config argument
                 await _validator.db_manager.initialize(force=True) 
                 bt.logging.info("Database manager re-initialized.")
         except Exception as e:
             bt.logging.error(f"Database migration process failed: {e}")
             bt.logging.error(traceback.format_exc())
-            # Decide if you want to exit or continue if migration fails
             return # Exit if migration fails
-
-        # --- Initialize StateSync ---
-        # Needs db_manager, happens after migration and initial DB init
-        _validator.is_primary = os.environ.get("VALIDATOR_IS_PRIMARY") == "True"
-        _validator.state_sync = StateSync(
-             state_dir="./bettensor/validator/state", # Ensure correct path
-             db_manager=_validator.db_manager,
-             validator=_validator
-        )
-        bt.logging.info("StateSyncManager initialized.")
         
-        # --- Initialize Core Components (Corrected Order) --- 
+        # --- Initialize Core Components (Corrected Order) ---
+        # (StateSync is already initialized above)
         bt.logging.info("Initializing core validator components...")
         
         # 1. Instantiate components that don't depend on initialized ScoringSystem/State
@@ -1183,10 +1183,13 @@ async def main():
              _validator.init_default_scores() 
 
         # 3. Initialize scoring system internals 
+        bt.logging.info(f"DEBUG: Before initialize, hasattr entropy_system? {hasattr(_validator.scoring_system, 'entropy_system')}")
         await _validator.scoring_system.initialize()
+        bt.logging.info(f"DEBUG: After initialize, hasattr entropy_system? {hasattr(_validator.scoring_system, 'entropy_system')}")
         bt.logging.info("ScoringSystem initialized.")
 
         # 4. Instantiate SportsData 
+        bt.logging.info(f"DEBUG: Before SportsData check, hasattr entropy_system? {hasattr(_validator.scoring_system, 'entropy_system')}")
         if hasattr(_validator.scoring_system, 'entropy_system'):
             _validator.sports_data = SportsData(
                 db_manager=_validator.db_manager,

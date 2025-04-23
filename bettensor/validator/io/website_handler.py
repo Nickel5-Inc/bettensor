@@ -29,9 +29,8 @@ class WebsiteHandler:
         """
         Retrieves coldkey from metagraph if it doesn't exist in keys table
         """
-
-        query = "SELECT coldkey FROM keys WHERE hotkey = ?"
-        result = await self.validator.db_manager.fetch_one(query, (hotkey,))
+        query = "SELECT coldkey FROM keys WHERE hotkey = :hotkey"
+        result = await self.validator.db_manager.fetch_one(query, {'hotkey': hotkey})
 
         if result:
             return result['coldkey']
@@ -42,14 +41,14 @@ class WebsiteHandler:
             for neuron in self.validator.metagraph.neurons:
                 if neuron.hotkey == hotkey:
                     coldkey = neuron.coldkey
-                    insert_query = "INSERT INTO keys (hotkey, coldkey) VALUES (?, ?)"
-                    await self.validator.db_manager.execute_query(insert_query, (hotkey, coldkey))
+                    insert_query = "INSERT INTO keys (hotkey, coldkey) VALUES (:hotkey, :coldkey)"
+                    await self.validator.db_manager.execute_query(insert_query, {'hotkey': hotkey, 'coldkey': coldkey})
                     return coldkey  # Exit after finding and inserting the coldkey
 
             # If coldkey is not found after iterating through neurons
             coldkey = "dummy_coldkey"
-            insert_query = "INSERT INTO keys (hotkey, coldkey) VALUES (?, ?)"
-            await self.validator.db_manager.execute_query(insert_query, (hotkey, coldkey))
+            insert_query = "INSERT INTO keys (hotkey, coldkey) VALUES (:hotkey, :coldkey)"
+            await self.validator.db_manager.execute_query(insert_query, {'hotkey': hotkey, 'coldkey': coldkey})
             return coldkey
 
     async def fetch_predictions_from_db(self):
@@ -123,8 +122,8 @@ class WebsiteHandler:
                     
                     # Await the miner stats query
                     miner_stats = await self.validator.db_manager.fetch_one(
-                        "SELECT * FROM miner_stats WHERE miner_uid = ?", 
-                        (miner_uid,)
+                        "SELECT * FROM miner_stats WHERE miner_uid = :miner_uid", 
+                        {'miner_uid': miner_uid}
                     )
 
                     transformed_data = []
@@ -187,11 +186,20 @@ class WebsiteHandler:
                         #bt.logging.debug(f"Response content: {response.text}")
                         
                         # Mark these specific predictions as sent using IN clause instead of ANY
-                        prediction_ids = [p.get('prediction_id') for p in predictions]
-                        placeholders = ','.join('?' * len(prediction_ids))
+                        prediction_ids = [p.get('prediction_id') for p in predictions if p.get('prediction_id') is not None]
+                        if not prediction_ids:
+                             bt.logging.warning(f"No valid prediction IDs found for miner {miner_uid} to mark as sent.")
+                             continue # Skip update if no IDs
+                             
+                        # Dynamically generate named placeholders and the parameter dictionary
+                        named_placeholders = ", ".join([f':p_{i}' for i in range(len(prediction_ids))])
+                        params_dict = {f'p_{i}': pid for i, pid in enumerate(prediction_ids)}
+                        
+                        #bt.logging.debug(f"Updating sent_to_site for IDs: {prediction_ids} with placeholders: {named_placeholders} and params: {params_dict}")
+                        
                         await self.validator.db_manager.execute_query(
-                            f"UPDATE predictions SET sent_to_site = 1 WHERE prediction_id IN ({placeholders})",
-                            prediction_ids
+                            f"UPDATE predictions SET sent_to_site = 1 WHERE prediction_id IN ({named_placeholders})",
+                            params_dict # Pass the dictionary of named parameters
                         )
                     else:
                         bt.logging.error(f"Failed to send predictions for miner_uid {miner_uid}. Status code: {response.status_code}, Response: {response.text}")

@@ -151,6 +151,11 @@ predictions = Table(
     Column('miner_hotkey', Text, nullable=False),
     Column('game_id', Integer, nullable=False),
     Column('prediction_date', TIMESTAMP(timezone=True), nullable=False),
+    Column('team_a', Text, nullable=True),
+    Column('team_b', Text, nullable=True),
+    Column('team_a_odds', Float, nullable=True),
+    Column('team_b_odds', Float, nullable=True),
+    Column('tie_odds', Float, nullable=True),
     Column('model_name', Text, nullable=True),
     Column('confidence_score', Float, nullable=True),
     Column('prediction_type', Text, nullable=True),
@@ -190,10 +195,9 @@ entropy_predictions = Table(
 entropy_miner_scores = Table(
     'entropy_miner_scores', metadata,
     Column('miner_uid', Integer),
-    Column('miner_hotkey', Text),
     Column('day', Integer),
     Column('contribution', Float), # Use Float
-    PrimaryKeyConstraint('miner_uid', 'day', 'miner_hotkey', name='pk_entropy_miner_scores')
+    PrimaryKeyConstraint('miner_uid', 'day', name='pk_entropy_miner_scores')
 )
 
 entropy_system_state = Table(
