@@ -121,25 +121,25 @@ class ScoringSystem:
             },  # Tier 1
             {
                 "window": 7,
-                "min_wager": 0,#4000,
+                "min_wager": 4000,
                 "capacity": int(num_miners * 0.2),
                 "incentive": 0.05,
             },  # Tier 2
             {
                 "window": 15,
-                "min_wager": 5000,#10000,
+                "min_wager": 10000,
                 "capacity": int(num_miners * 0.2),
                 "incentive": 0.23,
             },  # Tier 3
             {
                 "window": 30,
-                "min_wager": 15000,#20000,
+                "min_wager": 20000,
                 "capacity": int(num_miners * 0.1),
                 "incentive": 0.27,
             },  # Tier 4
             {
                 "window": 45,
-                "min_wager": 30000,#35000,
+                "min_wager": 35000,
                 "capacity": int(num_miners * 0.05),
                 "incentive": 0.43,
             },  # Tier 5
