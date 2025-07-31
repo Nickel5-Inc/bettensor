@@ -942,20 +942,6 @@ class MinerDataMixin:
                                     except ValueError:
                                         game_outcome = 3 if game_outcome == 'Unfinished' else -1
                                 
-                                # Handle unfinished games (outcome 3)
-                                if game_outcome == 3:
-                                    game_start = datetime.fromisoformat(game['event_start_date'])
-                                    current_time = datetime.now(timezone.utc)
-                                    
-                                    if current_time < game_start:
-                                        # Game hasn't started yet, keep prediction
-                                        pass
-                                    elif current_time - game_start > timedelta(hours=24):
-                                        # Only delete if it's been more than 24 hours since game start
-                                        bt.logging.info(f"Deleting prediction {prediction_id} for unfinished game {game_id} that started over 24 hours ago")
-                                        predictions_to_delete.append(prediction_id)
-                                        continue
-                                
                                 # For current day predictions, use stricter validation
                                 if is_current_day:
                                     is_valid, message, validation_type, numeric_outcome = await self.validate_prediction(
@@ -981,9 +967,6 @@ class MinerDataMixin:
                                         bt.logging.warning(f"Current day prediction {prediction_id} failed validation: {message}")
                                         predictions_to_delete.append(prediction_id)
                                         continue
-                                
-                                # Update running total since this prediction will be valid
-                                current_total += wager
                                 
                                 # Add to valid predictions
                                 valid_predictions.append(prediction)

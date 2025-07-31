@@ -337,36 +337,6 @@ class ScoringSystem:
         sortino_scores = self._calculate_risk_scores(predictions, results)
         self.sortino_scores[:, self.current_day] = sortino_scores
 
-        # Reset daily wagers for all miners
-        daily_wagers = np.zeros(self.num_miners)
-
-        # Group predictions by miner_id and sum their wagers
-        miner_predictions = defaultdict(list)
-        for pred in predictions:
-            miner_id = int(pred[0])
-            miner_predictions[miner_id].append(pred)
-
-        # Process wagers for each miner
-        for miner_id, miner_preds in miner_predictions.items():
-            daily_wager = 0.0
-            for pred in miner_preds: 
-                try:
-                    wager = float(pred[5])
-                    daily_wager += wager
-                except (IndexError, ValueError) as e:
-                    bt.logging.error(f"Error extracting wager for miner {miner_id}: {e}")
-            daily_wagers[miner_id] = daily_wager
-
-        # Update amount_wagered array with daily wagers
-        self.amount_wagered[:, self.current_day] = daily_wagers
-
-        bt.logging.info(f"Updated daily wagers for day {self.current_day}")
-        bt.logging.info(f"Total daily wager: {np.sum(daily_wagers):.2f}")
-        bt.logging.info(f"Number of miners with wagers: {np.count_nonzero(daily_wagers)}")
-        bt.logging.debug(f"Daily wager summary - min: {daily_wagers.min():.2f}, "
-                        f"max: {daily_wagers.max():.2f}, "
-                        f"mean: {daily_wagers.mean():.2f}")
-
         # Update entropy scores - now returns full array
         entropy_scores = self.entropy_system.get_current_ebdr_scores(
             self.current_date, self.current_day, external_ids
