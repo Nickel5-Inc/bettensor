@@ -894,6 +894,13 @@ class MinerDataMixin:
                                 'full_pred': pred
                             })
                         
+                        # Grab the game informations
+                        game_ids = list(set([
+                            pred['full_pred']['game_id']
+                            for pred in all_predictions
+                        ]))
+                        self._batch_load_games(game_ids)
+                        
                         # Sort all predictions by timestamp
                         all_predictions.sort(key=lambda x: x['timestamp'])
                         
