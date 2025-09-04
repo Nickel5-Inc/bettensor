@@ -36,6 +36,9 @@ class StateSync:
             db_manager: Database manager instance
             validator: Validator instance for task management
         """
+        # Record validator initialize time
+        self.initialize_time = datetime.utcnow().isoformat()
+                     
         # Load environment variables
         load_dotenv()
         
@@ -688,44 +691,6 @@ class StateSync:
             bt.logging.error(traceback.format_exc())
             return False
 
-    async def _update_metadata_file(self):
-        """Update metadata file with current state information"""
-        try:
-            metadata = {
-                "last_update": datetime.now(timezone.utc).isoformat(),
-                "files": {}
-            }
-            
-            for file in self.state_files:
-                if file != "state_metadata.json":
-                    filepath = self.state_dir / file
-                    if filepath.exists():
-                        if file == "validator.db":
-                            metadata["files"][file] = self._get_db_metadata(filepath)
-                        else:
-                            metadata["files"][file] = self._get_file_metadata(filepath)
-
-            # Ensure directory exists
-            self.metadata_file.parent.mkdir(parents=True, exist_ok=True)
-            
-            # Write metadata atomically using a temporary file
-            temp_metadata = self.metadata_file.with_suffix('.tmp')
-            try:
-                async with aiofiles.open(temp_metadata, 'w') as f:
-                    await f.write(json.dumps(metadata, indent=2))
-                temp_metadata.replace(self.metadata_file)
-                bt.logging.debug("Metadata file updated successfully")
-            finally:
-                # Clean up temp file if it still exists
-                if temp_metadata.exists():
-                    temp_metadata.unlink()
-                    
-            return True
-        except Exception as e:
-            bt.logging.error(f"Error updating metadata: {e}")
-            bt.logging.error(traceback.format_exc())
-            return False
-
     async def push_state(self):
         """Push state with proper SQLAlchemy async handling and other state files."""
         if not self.azure_enabled:
@@ -822,6 +787,7 @@ class StateSync:
         """Update metadata file after successful upload."""
         metadata_path = self.state_dir / "state_metadata.json"
         metadata = {
+            "initialize_time": self.initialize_time,
             "last_update": datetime.utcnow().isoformat(),
             "files": {file: self._get_file_metadata(self.state_dir / file) 
                      for file in self.state_files 

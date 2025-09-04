@@ -472,7 +472,7 @@ class BettensorValidator(BaseNeuron, MinerDataMixin):
             try:
                 bt.logging.info("Loading validator state")
                 # Remove weights_only since we trust our own state file
-                state = torch.load(state_path, map_location='cpu')
+                state = torch.load(state_path, map_location='cpu', weights_only=False)
                 bt.logging.debug(f"Loaded the following state from file: {state}")
                 
                 # Safely load each state component
